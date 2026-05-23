@@ -4,6 +4,14 @@ All notable changes to `delegate-local` are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.1] — 2026-05-23
+
+### Changed
+- `docs/CONFIGURATION.md` example frontmatter now uses `model: claude-sonnet-4-6` (explicit) instead of `model: sonnet` (alias), with an inline explainer about why. Avoids accidentally guiding users into the Claude Code alias inheritance bug.
+
+### Added
+- `docs/TROUBLESHOOTING.md` new section: **"Sub-agent fails with `Usage credits required for 1M context`"**. Documents the [anthropic/claude-code#57249](https://github.com/anthropics/claude-code/issues/57249) bug where Claude Code sub-agents inherit the parent's `[1m]` tier through `model: sonnet` alias, resulting in `claude-sonnet-4-6[1m]` which is not included in Max plans. Includes a one-liner bulk-fix bash command. Note: this is a Claude Code issue, not a `delegate-local` issue, but documented here because most users of this MCP also use Claude Code's native `Agent` tool.
+
 ## [0.3.0] — 2026-05-23
 
 ### Added

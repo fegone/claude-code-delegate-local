@@ -8,6 +8,46 @@ If you're an AI agent helping a user configure this MCP cold, **read the "For AI
 
 ## Common errors and fixes
 
+### Sub-agent fails with `Usage credits required for 1M context`
+
+**Symptom**: A Claude Code sub-agent (`.md` with `model: sonnet` in frontmatter) fails with an error mentioning "Usage credits required for 1M context" or similar billing-related blocker — typically after the parent Claude Code session was launched at the 1M-context tier (`claude-opus-4-7[1m]`).
+
+**Note**: This is a Claude Code (orchestrator) issue, **not** a `delegate-local` issue. But many users of this MCP also use Claude Code's native `Agent` tool, so the fix is worth documenting here. The `model` field in frontmatter is informational when dispatched through `delegate-local` (the caller passes the real model via `delegate_to_local_agent(model="...")`), so this bug doesn't affect MCP dispatches.
+
+**Cause** (officially documented in [anthropic/claude-code#57249](https://github.com/anthropics/claude-code/issues/57249)):
+
+1. The parent Claude Code session runs at the 1M-context tier (`claude-opus-4-7[1m]`). On Max plans, Opus + 1M is included automatically.
+2. A sub-agent declares `model: sonnet` (alias) in its frontmatter.
+3. The sub-agent **inherits the parent's `[1m]` tier**, so the alias resolves to `claude-sonnet-4-6[1m]`.
+4. Sonnet 4.6 + 1M is a **separate SKU** that is **NOT included in Max** — it requires `/extra-usage` opt-in.
+5. Without that opt-in, the sub-agent dispatch fails with the billing error.
+
+**Fix** (in the sub-agent `.md`):
+
+```diff
+---
+name: webdev
+- model: sonnet
++ model: claude-sonnet-4-6
+---
+```
+
+Specifying the model ID **without the `[1m]` suffix** blocks the tier inheritance from the parent. The sub-agent runs with Sonnet 4.6 + 200K base context (included in Max, no extra-usage required). 200K is plenty for most sub-agent tasks (~150K words / ~500-800 average code files).
+
+**Bulk fix across all your `.md` files** (one-liner):
+
+```bash
+find ~/.claude/agents ~/projects -type f \( -path "*/.claude/agents/*.md" -o -path "*/.claude/skills/*/SKILL.md" \) \
+  | xargs grep -l "^model: sonnet$" 2>/dev/null \
+  | xargs sed -i.bak 's/^model: sonnet$/model: claude-sonnet-4-6/'
+```
+
+The fix takes effect on next sub-agent dispatch — **no Claude Code restart needed** in most cases (some older Claude Desktop versions may cache configs at boot; restart resolves it).
+
+**Why Opus alias `model: opus` is less affected**: Opus 4.7 + 1M **is** included in Max automatically, so even though the alias inherits the parent's `[1m]` tier, the resulting `claude-opus-4-7[1m]` is covered. But for consistency, use `model: claude-opus-4-7` explicit anyway.
+
+---
+
 ### `400 Bad Request: reasoning_content in the thinking mode must be passed back to the API`
 
 **Symptom**: First turn against a `deepseek-*` model works, second turn errors out with this message.

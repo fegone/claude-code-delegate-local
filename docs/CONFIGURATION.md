@@ -297,7 +297,7 @@ Agents are `.md` files with optional YAML frontmatter:
 ---
 name: webdev
 description: Frontend + backend implementer for web projects
-model: sonnet
+model: claude-sonnet-4-6
 ---
 
 You are an expert web developer specializing in...
@@ -306,6 +306,8 @@ You are an expert web developer specializing in...
 ```
 
 The frontmatter is parsed by simple line-based YAML (`key: value`, no nested objects). Only `name` and `description` are surfaced in `list_local_agents()` output; `model` is informational (the actual model used is whatever the caller passes to `delegate_to_local_agent`).
+
+> ⚠️ **Why the explicit `claude-sonnet-4-6` instead of `model: sonnet`?** When the same `.md` is dispatched as a Claude Code native sub-agent (not through this MCP), the alias `sonnet` may resolve to `claude-sonnet-4-6[1m]` (1M context tier) inheriting from an Opus 4.7[1m] parent, which is **not included in Max plans** without `/extra-usage` opt-in. Using the explicit model ID without the `[1m]` suffix avoids this. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#sub-agent-fails-with-usage-credits-required-for-1m-context) and [anthropic/claude-code#57249](https://github.com/anthropics/claude-code/issues/57249).
 
 The body (after the second `---`) becomes the agent's system prompt body. Anything that works in Claude Code subagent .md files works here.
 
