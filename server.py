@@ -1,16 +1,16 @@
 """
-delegate-local — MCP server para Felix Gonzalez.
+delegate-local — MCP server.
 
-Despacha agentes definidos en ~/.claude/agents/*.md a un backend OpenAI/Anthropic-compatible
-(default: Mac Studio Qwen3.6 35B vía LiteLLM en Tailscale 100.123.88.91:4000) con tool calling
-completo (read_file / write_file / run_bash), preservando el plan Anthropic Max del orquestador.
+Despacha agentes definidos en ~/.claude/agents/*.md (o equivalentes por proyecto) a un backend
+OpenAI/Anthropic-compatible (LiteLLM, vLLM, llama.cpp server, DeepSeek API, AWS Bedrock, etc.)
+con tool calling completo (read_file / write_file / run_bash), preservando el plan/sesión del
+orquestador Claude Code que lo invoca.
 
-Filosofía: Mario (Claude Opus 4.7, OAuth Max) decide qué agentes delegar a local cuando Felix
-diga "este sprint con local: X, Y, Z". Los agentes elegibles se ejecutan vía esta tool. Los
-demás siguen vía Agent() normal de Claude Code (Anthropic Max).
+Filosofía: el orquestador (Claude Code via OAuth, API key, o cualquier setup) decide qué
+agentes delegar a backends alternativos cuando el usuario lo pida. Los agentes elegibles se
+ejecutan vía esta tool. Los demás siguen vía Agent() normal.
 
-Autor: Mario (Claude Opus 4.7) — Neola Dental
-Creado: 2026-05-22
+License: MIT
 """
 from __future__ import annotations
 
@@ -30,8 +30,8 @@ from fastmcp import Context, FastMCP
 AGENTS_DIR = pathlib.Path(
     os.getenv("DELEGATE_LOCAL_AGENTS_DIR", str(pathlib.Path.home() / ".claude" / "agents"))
 )
-LITELLM_URL = os.getenv("DELEGATE_LOCAL_URL", "http://100.123.88.91:4000/v1/messages")
-LITELLM_KEY = os.getenv("DELEGATE_LOCAL_KEY", "")  # se inyecta vía env desde settings.json
+LITELLM_URL = os.getenv("DELEGATE_LOCAL_URL", "http://localhost:4000/v1/messages")
+LITELLM_KEY = os.getenv("DELEGATE_LOCAL_KEY", "")  # inyectado vía env desde Claude Code MCP config
 DEFAULT_MODEL = os.getenv("DELEGATE_LOCAL_MODEL", "local-qwen-3-6-35b")
 MODE_TAG = "MODE:LOCAL"
 DEFAULT_MAX_TURNS = 15
@@ -198,10 +198,13 @@ def _anthropic_to_openai_request(
         elif role == "assistant" and isinstance(content, list):
             text_parts: list[str] = []
             tool_calls: list[dict] = []
+            reasoning_parts: list[str] = []
             for block in content:
                 btype = block.get("type")
                 if btype == "text":
                     text_parts.append(block.get("text", ""))
+                elif btype == "thinking":
+                    reasoning_parts.append(block.get("thinking", ""))
                 elif btype == "tool_use":
                     tool_calls.append({
                         "id": block.get("id", ""),
@@ -214,6 +217,9 @@ def _anthropic_to_openai_request(
             asst: dict[str, Any] = {"role": "assistant"}
             text_joined = "\n".join(t for t in text_parts if t)
             asst["content"] = text_joined or None
+            reasoning_joined = "\n".join(r for r in reasoning_parts if r)
+            if reasoning_joined:
+                asst["reasoning_content"] = reasoning_joined
             if tool_calls:
                 asst["tool_calls"] = tool_calls
             openai_messages.append(asst)
@@ -239,10 +245,17 @@ def _anthropic_to_openai_request(
 
 
 def _openai_to_anthropic_response(openai_resp: dict) -> dict:
-    """Convierte respuesta OpenAI chat → estructura Anthropic-like (content blocks + stop_reason + usage)."""
+    """Convierte respuesta OpenAI chat → estructura Anthropic-like (content blocks + stop_reason + usage).
+
+    Preserva reasoning_content (DeepSeek/o1 thinking mode) como block tipo 'thinking'
+    para que el loop principal lo reincluya en el siguiente request.
+    """
     choice = openai_resp.get("choices", [{}])[0]
     msg = choice.get("message", {})
     content: list[dict] = []
+    reasoning = msg.get("reasoning_content")
+    if reasoning:
+        content.append({"type": "thinking", "thinking": reasoning})
     text = msg.get("content")
     if text:
         content.append({"type": "text", "text": text})
@@ -276,7 +289,7 @@ async def _call_backend(
     system: str,
     model: str,
     tools: list[dict] | None = None,
-    max_tokens: int = 4096,
+    max_tokens: int = 32768,
 ) -> dict:
     """
     Llama al backend LiteLLM. Detecta formato según modelo:
@@ -328,11 +341,12 @@ async def delegate_to_local_agent(
     ctx: Context | None = None,
 ) -> dict:
     """
-    Despacha un agente (cargado desde ~/.claude/agents/<agent_name>.md) al backend local
-    (Mac Studio Qwen via LiteLLM) con tool calling completo. Devuelve resultado consolidado.
+    Despacha un agente (cargado desde un .md con frontmatter) a un backend OpenAI/Anthropic-
+    compatible con tool calling completo (read_file / write_file / run_bash). Devuelve
+    resultado consolidado.
 
-    USAR cuando Felix diga "este sprint con local: X, Y, Z" o equivalente, para los agentes
-    identificados como elegibles para correr local. Mario (Claude Opus 4.7) sigue intacto.
+    USAR cuando el usuario quiera ejecutar un agente específico en un backend alternativo
+    (local, cloud, etc.) en vez del default del orquestador. El orquestador sigue intacto.
 
     Args:
         agent_name: Nombre del agente sin .md. Ej: 'seo-content', 'security-engineer',
@@ -542,9 +556,9 @@ async def delegate_to_provider(
     ctx: Context | None = None,
 ) -> dict:
     """
-    Versión genérica: despacha un agente a CUALQUIER endpoint Anthropic-compatible.
-    Usar cuando se quiera rutear explícitamente a DeepSeek/MiniMax/Alibaba (cuando estén
-    configurados) en vez del default Mac Studio.
+    Versión genérica: despacha un agente a CUALQUIER endpoint OpenAI/Anthropic-compatible.
+    Usar para rutear explícitamente a providers no configurados como default (DeepSeek,
+    MiniMax, Alibaba, OpenRouter, etc.).
 
     Args:
         provider_url: URL completa al endpoint /v1/messages (o equivalente)
