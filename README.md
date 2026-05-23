@@ -1,22 +1,58 @@
 # delegate-local
 
+> 🇬🇧 English · [🇪🇸 Español](README.es.md)
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
+
 **MCP server that delegates Claude Code subagents to alternative backends** — local models (LM Studio, llama.cpp, Ollama, vLLM, LiteLLM), DeepSeek, AWS Bedrock, or any OpenAI/Anthropic-compatible endpoint — without losing your Claude Code orchestrator session.
 
-Built for users who want to keep their main Claude Code session on Anthropic (Max/API) for orchestration, while offloading specific subagents to cheaper, faster, or HIPAA-safe local backends.
+Built for users who want to keep their main Claude Code session on Anthropic (Max plan or API) for orchestration, while offloading specific subagents to cheaper, faster, or HIPAA-safe local backends.
 
-## Why
+---
 
-- **Anthropic Max plan stays intact.** No need to launch a separate CLI like `ccr code` or swap commands.
-- **3-tier agent lookup.** Same command works in any project — finds `.claude/agents/<name>.md` in the project first, then `.claude/skills/<name>/SKILL.md`, then global `~/.claude/agents/<name>.md`.
-- **Dual-format backend.** Auto-routes to `/v1/messages` (Anthropic format) or `/v1/chat/completions` (OpenAI format) based on model prefix. Works with DeepSeek's `reasoning_content` thinking mode out of the box.
-- **Full tool calling.** Delegated agents get `read_file`, `write_file`, and `run_bash` with the same loop semantics as Claude Code's native subagents.
+## Table of contents
+
+- [What it solves](#what-it-solves)
+- [Features](#features)
+- [Quick install](#quick-install)
+- [Configuration](#configuration)
+- [Tools exposed](#tools-exposed)
+- [3-tier agent lookup](#3-tier-agent-lookup)
+- [Dual-format backend routing](#dual-format-backend-routing)
+- [Thinking-mode support](#thinking-mode-support)
+- [Example: LiteLLM proxy](#example-litellm-proxy)
+- [Tested with](#tested-with)
+- [Further reading](#further-reading)
+- [Caveats](#caveats)
+- [License](#license)
+
+---
+
+## What it solves
+
+You're working with Claude Code on a project and you want to:
+
+- Send a specific subagent (e.g., `security-engineer`) to a **local model** to save tokens from your Max plan, or because you're handling sensitive data that can't leave your machine.
+- Route another subagent to **DeepSeek** because it's 10× cheaper and faster for large tasks.
+- Keep your main Claude Code session **exactly as it is** — no swapping commands, no separate CLI, no losing the Max plan.
+
+That's what `delegate-local` does. It's an MCP server you install once that exposes tools the orchestrator can invoke to route specific subagents to whatever backend you've configured.
+
+## Features
+
+- ✅ **Your Anthropic Max plan stays intact.** No need to launch a separate CLI like `ccr code` or swap commands.
+- ✅ **3-tier agent lookup.** Same command works in any project — finds `.claude/agents/<name>.md` in the project first, then `.claude/skills/<name>/SKILL.md`, then global `~/.claude/agents/<name>.md`.
+- ✅ **Dual-format backend.** Auto-routes to `/v1/messages` (Anthropic format) or `/v1/chat/completions` (OpenAI format) based on model prefix. Works with DeepSeek's `reasoning_content` thinking mode out of the box.
+- ✅ **Full tool calling.** Delegated agents get `read_file`, `write_file`, and `run_bash` with the same loop semantics as Claude Code's native subagents.
 
 ## Quick install
 
 Requires [uv](https://github.com/astral-sh/uv) and Claude Code.
 
 ```bash
-git clone https://github.com/<you>/delegate-local.git
+git clone https://github.com/fegone/delegate-local.git
 cd delegate-local
 uv sync
 
@@ -41,6 +77,8 @@ All env vars are optional; defaults assume a LiteLLM proxy on `localhost:4000`.
 | `DELEGATE_LOCAL_KEY` | `""` | Bearer token / API key. Sent as both `x-api-key` and `Authorization: Bearer`. |
 | `DELEGATE_LOCAL_MODEL` | `local-qwen-3-6-35b` | Default model alias if the caller doesn't specify one. |
 | `DELEGATE_LOCAL_AGENTS_DIR` | `~/.claude/agents` | Where to look for global agent definitions. |
+
+See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for full details and example setups with LiteLLM, llama.cpp, Ollama, DeepSeek direct, and AWS Bedrock.
 
 ## Tools exposed
 
@@ -72,11 +110,11 @@ Models with these prefixes are routed to OpenAI-format `/v1/chat/completions`:
 
 All other models go to Anthropic-format `/v1/messages`. Inside the server everything is normalized to Anthropic-style content blocks (text / tool_use / thinking) so the agent loop stays uniform.
 
-### Thinking mode support
+## Thinking-mode support
 
 For models that emit `reasoning_content` (DeepSeek V4, OpenAI o1-style), the server preserves it as a `{"type": "thinking", "thinking": "..."}` content block between turns. This is required by LiteLLM and most providers — if you drop `reasoning_content` from the assistant message in multi-turn, the next request fails with `400 Bad Request`.
 
-`max_tokens` defaults to 32768 to give thinking-mode models enough budget for both reasoning and content output.
+`max_tokens` defaults to **32768** to give thinking-mode models enough budget for both reasoning and content output, and to support large monolithic outputs.
 
 ## Example: LiteLLM proxy
 
@@ -114,26 +152,19 @@ Then run `litellm --config config.yaml --port 4000` and point this MCP at it.
 
 Validation tasks: SQL injection review (security-engineer agent), HTML calculator (creative agent, 500-800 LOC monolithic), Pac-Man game (884 LOC monolithic single-shot).
 
-## Development
+## Further reading
 
-```bash
-uv sync                                                    # install deps
-DELEGATE_LOCAL_KEY=xxx uv run python server.py             # smoke test (stdio MCP)
-
-# Test tools standalone from Python REPL:
-python -c "
-import asyncio, server
-server.LITELLM_KEY = 'xxx'
-print(asyncio.run(server.local_backend_status()))
-"
-```
+- 📐 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how it works internally, diagrams, design decisions
+- ⚙️ [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — all env vars, backend setups (LiteLLM, llama.cpp, Ollama, DeepSeek, Bedrock)
+- 💡 [docs/EXAMPLES.md](docs/EXAMPLES.md) — end-to-end use cases with code
+- 🤝 [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute
+- 📝 [CHANGELOG.md](CHANGELOG.md) — version history
 
 ## Caveats
 
 - **`run_bash` runs shell commands inside `workdir` without sandboxing.** Trust the agents you delegate. If you delegate to an unvetted public agent, the tool can read/write anywhere the calling user has access. There is no Docker isolation by default.
-- **8KB read cap, 4KB stdout cap, 2KB stderr cap, 120s timeout** on `run_bash`. Tune in `_execute_tool` if needed.
+- **Caps**: `read_file` returns the first 8KB, `run_bash` truncates stdout to 4KB and stderr to 2KB, timeout 120s.
 - **`max_turns` hard cap is 40.** Long-running orchestrations should be designed as multiple delegate calls rather than one huge loop.
-- **Tool calling semantics assume Anthropic-style content blocks internally.** OpenAI responses are converted on the fly via `_openai_to_anthropic_response`.
 
 ## License
 
