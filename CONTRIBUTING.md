@@ -1,12 +1,12 @@
-# Contributing to delegate-local
+# Contributing to claude-code-delegate-local
 
 Thanks for considering a contribution! This project is small and pragmatic — issues, PRs, and discussions are all welcome.
 
 ## Quick start for developers
 
 ```bash
-git clone https://github.com/fegone/delegate-local.git
-cd delegate-local
+git clone https://github.com/fegone/claude-code-delegate-local.git
+cd claude-code-delegate-local
 uv sync
 ```
 

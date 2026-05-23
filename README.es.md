@@ -1,4 +1,4 @@
-# delegate-local
+# claude-code-delegate-local
 
 > 🇪🇸 Español · [🇬🇧 English](README.md)
 
@@ -52,8 +52,8 @@ Eso es lo que hace `delegate-local`. Es un servidor MCP que se instala una sola 
 Requiere [uv](https://github.com/astral-sh/uv) y Claude Code.
 
 ```bash
-git clone https://github.com/fegone/delegate-local.git
-cd delegate-local
+git clone https://github.com/fegone/claude-code-delegate-local.git
+cd claude-code-delegate-local
 uv sync
 
 # Registrar como MCP de Claude Code (scope user = global en todos los proyectos)
