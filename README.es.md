@@ -114,7 +114,7 @@ Todo lo demás va a Anthropic `/v1/messages`. Internamente todo se normaliza a c
 
 Para modelos que emiten `reasoning_content` (DeepSeek V4, OpenAI estilo o1), el servidor lo preserva como un content block `{"type": "thinking", "thinking": "..."}` entre turns. Esto es **requerido** por LiteLLM y la mayoría de providers — si descartas el `reasoning_content` del mensaje del assistant en multi-turn, el siguiente request falla con `400 Bad Request`.
 
-`max_tokens` está en 32768 por defecto para darle al modo thinking suficiente espacio tanto para razonar como para emitir contenido.
+`max_tokens` está en **65536** por defecto (es parámetro de la tool — el caller lo puede sobrescribir). El default alto es intencional para que los modelos en thinking mode tengan presupuesto para razonar y emitir contenido, y para que outputs grandes monolíticos (ej. archivos HTML completos con JS embebido) no se trunquen. Bájalo solo si tu backend tiene un cap más estricto.
 
 ## Ejemplo: proxy LiteLLM
 
@@ -155,8 +155,10 @@ Tareas de validación: revisión de SQL injection (agente security-engineer), ca
 ## Documentación adicional
 
 - 📐 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — cómo funciona internamente, diagramas, decisiones de diseño
-- ⚙️ [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — todas las variables, setups de LiteLLM/llama.cpp/Ollama/DeepSeek/Bedrock
-- 💡 [docs/EXAMPLES.md](docs/EXAMPLES.md) — casos de uso end-to-end con código
+- ⚙️ [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — todas las variables, setup LiteLLM desde cero, **cómo añadir providers nuevos**
+- 💡 [docs/EXAMPLES.md](docs/EXAMPLES.md) — 7 casos de uso end-to-end con código copy-pasteable
+- 🔧 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — errores comunes, **lecciones aprendidas**, y una sección dedicada para IAs que ayudan con la configuración
+- 📋 [examples/litellm.example.yaml](examples/litellm.example.yaml) — config LiteLLM lista para usar con 9 providers (local + cloud)
 - 🤝 [CONTRIBUTING.md](CONTRIBUTING.md) — cómo contribuir
 - 📝 [CHANGELOG.md](CHANGELOG.md) — historial de versiones
 

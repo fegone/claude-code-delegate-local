@@ -4,6 +4,17 @@ All notable changes to `delegate-local` are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] — 2026-05-23
+
+### Added
+- `max_tokens` is now a parameter of `delegate_to_local_agent` and `delegate_to_provider`. Default raised to **65536** (doubled from 32768). Pass a higher value for very large outputs; lower if your backend has a stricter cap.
+- `examples/litellm.example.yaml` — ready-to-use LiteLLM config with 9 providers (local llama.cpp, Ollama, DeepSeek Pro/Flash, OpenAI, OpenRouter, Bedrock Sonnet/Llama, Anthropic direct). Copy, replace `sk-CHANGE-ME` and required env vars, run.
+- `docs/TROUBLESHOOTING.md` — common errors and fixes, lessons learned from real bugs we hit during development, and a dedicated **"For AI agents"** section with setup checklist for AI assistants helping users configure this MCP cold on a new machine.
+
+### Changed
+- Internal `_call_backend` default `max_tokens` raised from 32768 to 65536 to match the new public default.
+- `docs/CONFIGURATION.md` expanded with "Setting up LiteLLM from scratch" walkthrough and "Adding a new provider" step-by-step.
+
 ## [0.2.0] — 2026-05-23
 
 First public release.

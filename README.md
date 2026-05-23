@@ -114,7 +114,7 @@ All other models go to Anthropic-format `/v1/messages`. Inside the server everyt
 
 For models that emit `reasoning_content` (DeepSeek V4, OpenAI o1-style), the server preserves it as a `{"type": "thinking", "thinking": "..."}` content block between turns. This is required by LiteLLM and most providers — if you drop `reasoning_content` from the assistant message in multi-turn, the next request fails with `400 Bad Request`.
 
-`max_tokens` defaults to **32768** to give thinking-mode models enough budget for both reasoning and content output, and to support large monolithic outputs.
+`max_tokens` defaults to **65536** (parameter of the tool — caller can override). High default is intentional so thinking-mode models have budget for both reasoning and content output, and so large monolithic outputs (e.g., complete HTML files with embedded JS) don't get truncated. Lower it explicitly only if your backend has a stricter cap.
 
 ## Example: LiteLLM proxy
 
@@ -155,8 +155,10 @@ Validation tasks: SQL injection review (security-engineer agent), HTML calculato
 ## Further reading
 
 - 📐 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how it works internally, diagrams, design decisions
-- ⚙️ [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — all env vars, backend setups (LiteLLM, llama.cpp, Ollama, DeepSeek, Bedrock)
-- 💡 [docs/EXAMPLES.md](docs/EXAMPLES.md) — end-to-end use cases with code
+- ⚙️ [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — full env var reference, LiteLLM setup from scratch, **how to add new providers**
+- 💡 [docs/EXAMPLES.md](docs/EXAMPLES.md) — 7 end-to-end use cases with copy-pasteable code
+- 🔧 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — common errors, **lessons learned**, and a dedicated section for AI agents helping with setup
+- 📋 [examples/litellm.example.yaml](examples/litellm.example.yaml) — ready-to-use LiteLLM config with 9 providers (local + cloud)
 - 🤝 [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute
 - 📝 [CHANGELOG.md](CHANGELOG.md) — version history
 

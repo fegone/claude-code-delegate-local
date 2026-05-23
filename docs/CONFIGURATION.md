@@ -31,6 +31,162 @@ Scope options:
 - `--scope project` — only the current project sees this MCP
 - `--scope local` — local untracked project config
 
+## Setting up LiteLLM from scratch
+
+If you don't have a backend yet, LiteLLM is the simplest path — one proxy in front of any provider.
+
+### 1. Install LiteLLM
+
+```bash
+pip install 'litellm[proxy]'
+# or with uv:
+uv tool install 'litellm[proxy]'
+```
+
+### 2. Get the example config
+
+This repo ships a ready-to-use config at [`examples/litellm.example.yaml`](../examples/litellm.example.yaml). Copy it to your preferred location:
+
+```bash
+mkdir -p ~/litellm
+cp examples/litellm.example.yaml ~/litellm/config.yaml
+```
+
+Open it and:
+- Replace `sk-CHANGE-ME` with a secret of your choice (this becomes your `DELEGATE_LOCAL_KEY`).
+- Comment out any provider block you won't use.
+- Note the env vars listed at the bottom — you need to export them before launching LiteLLM.
+
+### 3. Set provider env vars
+
+In the same shell where you'll run LiteLLM:
+
+```bash
+export DEEPSEEK_API_KEY=sk-...
+export OPENAI_API_KEY=sk-...
+# etc — only the ones you actually use
+```
+
+Or put them in `~/litellm/.env` and `set -a; source ~/litellm/.env; set +a` before launching.
+
+### 4. Launch LiteLLM
+
+```bash
+litellm --config ~/litellm/config.yaml --port 4000
+```
+
+Verify it's alive:
+
+```bash
+curl http://localhost:4000/health/liveliness
+# → "I'm alive!"
+
+curl -H "Authorization: Bearer sk-CHANGE-ME" http://localhost:4000/v1/models | jq '.data[].id'
+# → lists your configured model aliases
+```
+
+### 5. Point delegate-local at it
+
+```bash
+claude mcp add delegate-local \
+  --scope user \
+  --env DELEGATE_LOCAL_URL=http://localhost:4000/v1/messages \
+  --env DELEGATE_LOCAL_KEY=sk-CHANGE-ME \
+  --env DELEGATE_LOCAL_MODEL=local-qwen-3-6-35b \
+  -- uv run --directory $(pwd) python server.py
+```
+
+Restart Claude Code. From your orchestrator session, call `local_backend_status()` and you should see your model aliases listed.
+
+### 6. Optional: run LiteLLM as a service
+
+For LiteLLM to come up automatically at boot, set up a systemd unit (Linux) or launchd plist (macOS). Example launchd plist:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key><string>com.user.litellm</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/usr/local/bin/litellm</string>
+      <string>--config</string><string>/Users/you/litellm/config.yaml</string>
+      <string>--port</string><string>4000</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>DEEPSEEK_API_KEY</key><string>sk-...</string>
+    </dict>
+  </dict>
+</plist>
+```
+
+Save as `~/Library/LaunchAgents/com.user.litellm.plist` and `launchctl load` it.
+
+---
+
+## Adding a new provider to LiteLLM
+
+LiteLLM supports 100+ providers. To add one not in the example config:
+
+### 1. Find the provider docs
+
+Browse https://docs.litellm.ai/docs/providers and find your provider (Anthropic, Mistral, Cohere, Groq, Together, Fireworks, Replicate, Cerebras, etc.). Each page shows the exact `model:` string and required env vars.
+
+### 2. Add a model_list entry
+
+In your `config.yaml`:
+
+```yaml
+- model_name: my-alias            # what you'll reference from delegate-local
+  litellm_params:
+    model: <provider>/<model-id>  # e.g. mistral/mistral-large-latest
+    api_key: os.environ/MY_API_KEY  # NEVER hardcode the key
+    # optional: api_base, region, version, etc.
+```
+
+### 3. Export the env var, restart LiteLLM
+
+```bash
+export MY_API_KEY=sk-...
+# restart LiteLLM (Ctrl+C and re-launch, or `launchctl unload && load`)
+```
+
+### 4. Verify and choose routing
+
+```bash
+curl -H "Authorization: Bearer sk-CHANGE-ME" http://localhost:4000/v1/models | jq '.data[].id'
+# → "my-alias" should appear
+```
+
+If your provider uses OpenAI-format API (`/v1/chat/completions`), make sure your alias starts with `deepseek-`, `openai-`, `gpt-`, or `qwen-` so this MCP routes correctly. Otherwise the alias goes via `/v1/messages` (Anthropic format) — which works if LiteLLM bridges to it.
+
+If the alias prefix doesn't fit any of those, you have two options:
+- Rename it (`openai-mistral-large`)
+- Edit `_OPENAI_FORMAT_PREFIXES` in `server.py` to include your custom prefix
+
+### 5. Test from Claude Code
+
+Restart Claude Code so the MCP picks up new models. Then:
+
+```python
+mcp__delegate-local__local_backend_status()
+# → available_models should include "my-alias"
+
+mcp__delegate-local__delegate_to_local_agent(
+    agent_name="security-engineer",
+    model="my-alias",
+    max_turns=3,
+    task="say hello"
+)
+# → should return success: true
+```
+
+---
+
 ## Supported backends
 
 ### LiteLLM proxy (recommended for multi-provider)

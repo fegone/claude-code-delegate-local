@@ -289,7 +289,7 @@ async def _call_backend(
     system: str,
     model: str,
     tools: list[dict] | None = None,
-    max_tokens: int = 32768,
+    max_tokens: int = 65536,
 ) -> dict:
     """
     Llama al backend LiteLLM. Detecta formato según modelo:
@@ -338,6 +338,7 @@ async def delegate_to_local_agent(
     workdir: str = ".",
     max_turns: int = DEFAULT_MAX_TURNS,
     model: str = DEFAULT_MODEL,
+    max_tokens: int = 65536,
     ctx: Context | None = None,
 ) -> dict:
     """
@@ -357,6 +358,10 @@ async def delegate_to_local_agent(
         max_turns: Tope de iteraciones (default 15, hard cap 40). Bajar para tareas cortas.
         model: Modelo en LiteLLM. Default 'local-qwen-3-6-35b' (Mac Studio).
                Otros válidos: 'local-qwen-3-6-35b-think', 'bedrock-sonnet-4-6' (requiere AWS BAA).
+        max_tokens: Tope de tokens por turno del modelo. Default 65536, ajustar si el
+               backend tiene un cap menor o si necesitas más para outputs muy grandes.
+               Modelos en thinking mode (DeepSeek V4, o1-style) consumen 2-8K solo para
+               reasoning antes de emitir contenido, por eso el default es alto.
 
     Returns:
         dict con keys: success, final_response, turns, tool_calls, malformed_calls,
@@ -412,7 +417,7 @@ async def delegate_to_local_agent(
             )
 
         try:
-            resp = await _call_backend(messages, full_system, model, tools=AGENT_TOOLS)
+            resp = await _call_backend(messages, full_system, model, tools=AGENT_TOOLS, max_tokens=max_tokens)
         except httpx.HTTPStatusError as e:
             return {
                 "success": False,
@@ -552,6 +557,7 @@ async def delegate_to_provider(
     task: str,
     workdir: str = ".",
     max_turns: int = DEFAULT_MAX_TURNS,
+    max_tokens: int = 65536,
     mode_tag: str = "MODE:LOCAL",
     ctx: Context | None = None,
 ) -> dict:
@@ -576,7 +582,7 @@ async def delegate_to_provider(
         MODE_TAG = mode_tag
         return await delegate_to_local_agent(
             agent_name=agent_name, task=task, workdir=workdir,
-            max_turns=max_turns, model=model, ctx=ctx,
+            max_turns=max_turns, model=model, max_tokens=max_tokens, ctx=ctx,
         )
     finally:
         LITELLM_URL, LITELLM_KEY, DEFAULT_MODEL, MODE_TAG = saved

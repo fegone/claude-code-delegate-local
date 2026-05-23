@@ -1,0 +1,107 @@
+# LiteLLM example config for claude-code-delegate-local
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Copy this file to wherever you want (e.g. ~/litellm/config.yaml)
+# 2. Replace `sk-CHANGE-ME` below with a secret of your choice
+# 3. Set the required env vars (see bottom of file)
+# 4. Run: litellm --config config.yaml --port 4000
+# 5. Point this MCP at it:
+#       DELEGATE_LOCAL_URL=http://localhost:4000/v1/messages
+#       DELEGATE_LOCAL_KEY=sk-CHANGE-ME
+#
+# Comment out any provider block you don't use — LiteLLM will skip it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+litellm_settings:
+  set_verbose: false
+  drop_params: true     # silently drop params a provider doesn't support
+
+general_settings:
+  master_key: sk-CHANGE-ME   # ← this is what you pass to DELEGATE_LOCAL_KEY
+
+model_list:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # LOCAL MODELS — via llama.cpp / vLLM / LM Studio / Ollama
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # llama.cpp server or LM Studio (OpenAI-compatible endpoint on :8000)
+  - model_name: local-qwen-3-6-35b
+    litellm_params:
+      model: openai/Qwen3-6-35B   # name as reported by your local server
+      api_base: http://localhost:8000/v1
+      api_key: sk-no-key-required
+
+  # Ollama
+  - model_name: local-llama-3-3-70b
+    litellm_params:
+      model: ollama_chat/llama3.3:70b
+      api_base: http://localhost:11434
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # DEEPSEEK — cloud, needs API key from platform.deepseek.com
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  - model_name: deepseek-v4-flash     # fast, non-thinking, ~$0.01/test
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+  - model_name: deepseek-v4-pro       # thinking mode, more capable, ~$0.013/test
+    litellm_params:
+      model: deepseek/deepseek-reasoner
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # OPENAI / OPENROUTER
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: openrouter-claude-sonnet
+    litellm_params:
+      model: openrouter/anthropic/claude-3.5-sonnet
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # AWS BEDROCK — Claude, Llama, Nova via your AWS account
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  - model_name: bedrock-sonnet
+    litellm_params:
+      model: bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0
+      aws_region_name: us-east-1
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY
+
+  - model_name: bedrock-llama-3-3-70b
+    litellm_params:
+      model: bedrock/meta.llama3-3-70b-instruct-v1:0
+      aws_region_name: us-east-1
+      aws_access_key_id: os.environ/AWS_ACCESS_KEY_ID
+      aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ANTHROPIC DIRECT — if you don't use Bedrock
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  - model_name: anthropic-sonnet
+    litellm_params:
+      model: anthropic/claude-3-5-sonnet-20241022
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REQUIRED ENV VARS — set these in your shell before launching litellm:
+# ─────────────────────────────────────────────────────────────────────────────
+# export DEEPSEEK_API_KEY=sk-...
+# export OPENAI_API_KEY=sk-...
+# export OPENROUTER_API_KEY=sk-or-v1-...
+# export ANTHROPIC_API_KEY=sk-ant-...
+# export AWS_ACCESS_KEY_ID=AKIA...
+# export AWS_SECRET_ACCESS_KEY=...
+#
+# Tip: put them in a `.env` file and run `litellm --config config.yaml --port 4000`
+# from a shell that has them loaded (e.g. `set -a; source .env; set +a`).
+# ─────────────────────────────────────────────────────────────────────────────
