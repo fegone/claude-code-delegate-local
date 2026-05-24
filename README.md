@@ -24,6 +24,7 @@ Built for users who want to keep their main Claude Code session on Anthropic (Ma
 - [Thinking-mode support](#thinking-mode-support)
 - [Example: LiteLLM proxy](#example-litellm-proxy)
 - [Tested with](#tested-with)
+- [Best practices](#best-practices)
 - [Further reading](#further-reading)
 - [Caveats](#caveats)
 - [License](#license)
@@ -84,7 +85,7 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for full details and example 
 
 | Tool | Purpose |
 |---|---|
-| `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Run a `.md`-defined agent on the default backend with full tool calling |
+| `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Run a `.md`-defined agent on the default backend with full tool calling. `max_turns` defaults to **25** (hard cap 40). |
 | `delegate_to_provider(provider_url, api_key, model, agent_name, task, ...)` | Run an agent on any arbitrary endpoint (DeepSeek, OpenRouter, etc.) |
 | `list_local_agents()` | List agents found in `DELEGATE_LOCAL_AGENTS_DIR` with their frontmatter metadata |
 | `local_backend_status()` | Health check + list of models available on the configured backend |
@@ -151,6 +152,12 @@ Then run `litellm --config config.yaml --port 4000` and point this MCP at it.
 | LiteLLM + AWS Bedrock | `bedrock-sonnet-4-6`, `bedrock-llama4-*` | ✅ | ✅ |
 
 Validation tasks: SQL injection review (security-engineer agent), HTML calculator (creative agent, 500-800 LOC monolithic), Pac-Man game (884 LOC monolithic single-shot).
+
+## Best practices
+
+⚠️ **If you dispatch multi-file sprints to local backends, read this first.** Naive single-dispatch of 6+ files at once causes `ReadTimeout` at high turn counts as context saturates the slot. Splitting the work and reusing the same agent name across parallel workers can cut wall-clock time by ~60% and tokens by ~78%.
+
+- 🎯 [docs/BEST-PRACTICES.md](docs/BEST-PRACTICES.md) — empirical thresholds for when to split work, KV-cache prefix reuse for parallel dispatches, scope-bounded prompts, estimated savings table
 
 ## Further reading
 

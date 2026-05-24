@@ -34,8 +34,24 @@ LITELLM_URL = os.getenv("DELEGATE_LOCAL_URL", "http://localhost:4000/v1/messages
 LITELLM_KEY = os.getenv("DELEGATE_LOCAL_KEY", "")  # inyectado vía env desde Claude Code MCP config
 DEFAULT_MODEL = os.getenv("DELEGATE_LOCAL_MODEL", "local-qwen-3-6-35b")
 MODE_TAG = "MODE:LOCAL"
-DEFAULT_MAX_TURNS = 15
+DEFAULT_MAX_TURNS = 25
 HARD_MAX_TURNS = 40
+
+# Hint preventivo inyectado en el system prompt del agente delegado.
+# Reduce ReadTimeouts y context overflow en backends locales con techo de ctx por slot.
+# Se aprendió empíricamente: sprints con >3 archivos en un solo agente acumulan contexto
+# rápidamente con cada turno de tool calling, y se acercan al techo del slot del backend
+# (e.g., 262K tokens en llama-server con --parallel 4 sobre 1M total).
+CONTEXT_SCOPE_HINT = (
+    "IMPORTANT — backend context-window awareness:\n"
+    "If your task references more than 3 files or more than 300 lines of code total, "
+    "DO NOT load everything into context at once. Split the task mentally into sub-steps "
+    "of ≤3 files each. For each sub-step: read what you need, write/validate the change, "
+    "then move on. Do NOT keep accumulating files in context across turns — earlier file "
+    "contents are no longer needed once you've made the related change.\n"
+    "If the task list is long (≥4 distinct items), tell the user it should be split into "
+    "separate dispatches before you start, and stop.\n"
+)
 
 mcp = FastMCP("delegate-local")
 
@@ -63,7 +79,7 @@ def _load_agent(name: str, workdir: str | None = None) -> tuple[dict, str, str] 
     """
     Carga la definición de un agente buscando en este orden:
       1° <workdir>/.claude/agents/<name>.md       (project AGENT)
-      2° <workdir>/.claude/skills/<name>/SKILL.md (project SKILL — BufetOs/ArmorPass)
+      2° <workdir>/.claude/skills/<name>/SKILL.md (project SKILL — alternative location)
       3° AGENTS_DIR/<name>.md                     (global fallback ~/.claude/agents/)
 
     Devuelve (frontmatter_dict, body_text, source) o None.
@@ -159,7 +175,7 @@ def _execute_tool(workdir: str, name: str, args: dict[str, Any]) -> str:
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Cliente HTTP al backend (LiteLLM Mac Studio) — dual format
+# Cliente HTTP al backend (LiteLLM proxy) — dual format
 # ────────────────────────────────────────────────────────────────────────────────
 # Modelos que requieren formato OpenAI (NO Anthropic-compatible vía /v1/messages
 # de LiteLLM). DeepSeek y similares deben ir directo a /v1/chat/completions.
@@ -307,7 +323,7 @@ async def _call_backend(
         base = LITELLM_URL.rsplit("/v1/", 1)[0]
         url = f"{base}/v1/chat/completions"
         payload = _anthropic_to_openai_request(messages, system, tools, model, max_tokens)
-        async with httpx.AsyncClient(timeout=240.0) as client:
+        async with httpx.AsyncClient(timeout=1800.0) as client:
             r = await client.post(url, json=payload, headers=headers)
             r.raise_for_status()
             return _openai_to_anthropic_response(r.json())
@@ -322,7 +338,7 @@ async def _call_backend(
         }
         if tools:
             payload["tools"] = tools
-        async with httpx.AsyncClient(timeout=240.0) as client:
+        async with httpx.AsyncClient(timeout=1800.0) as client:
             r = await client.post(LITELLM_URL, json=payload, headers=headers)
             r.raise_for_status()
             return r.json()
@@ -355,9 +371,9 @@ async def delegate_to_local_agent(
         task: Tarea concreta para el agente. Sé específico, el agente leerá ese prompt.
         workdir: Directorio de trabajo del agente (default: '.' del MCP). Recomendado pasar
                  ruta absoluta al proyecto donde trabajará.
-        max_turns: Tope de iteraciones (default 15, hard cap 40). Bajar para tareas cortas.
-        model: Modelo en LiteLLM. Default 'local-qwen-3-6-35b' (Mac Studio).
-               Otros válidos: 'local-qwen-3-6-35b-think', 'bedrock-sonnet-4-6' (requiere AWS BAA).
+        max_turns: Tope de iteraciones (default 25, hard cap 40). Bajar para tareas cortas.
+        model: Model alias as configured in your LiteLLM proxy (or direct provider).
+               Default 'local-qwen-3-6-35b'. Override via DELEGATE_LOCAL_MODEL env var.
         max_tokens: Tope de tokens por turno del modelo. Default 65536, ajustar si el
                backend tiene un cap menor o si necesitas más para outputs muy grandes.
                Modelos en thinking mode (DeepSeek V4, o1-style) consumen 2-8K solo para
@@ -387,13 +403,14 @@ async def delegate_to_local_agent(
         }
     frontmatter, body, agent_source = agent
 
-    # System prompt: tag de routing + frontmatter info + body original del agente
+    # System prompt: tag de routing + context-window hint + frontmatter info + body original del agente
     full_system = (
         f"{MODE_TAG}\n\n"
         f"You are running as the '{agent_name}' agent.\n"
         f"Workdir: {workdir_abs} (use relative paths or absolute).\n"
         f"You have 3 tools: read_file, write_file, run_bash. Use them iteratively.\n"
         f"When the task is complete, respond with a final text message WITHOUT tool_use.\n\n"
+        f"{CONTEXT_SCOPE_HINT}\n"
         f"--- AGENT DEFINITION ---\n{body}"
     )
 
@@ -518,9 +535,9 @@ async def list_local_agents() -> dict:
 @mcp.tool()
 async def local_backend_status() -> dict:
     """
-    Health check del backend configurado (LiteLLM Mac Studio por default). Devuelve
+    Health check del backend configurado (LiteLLM proxy por default). Devuelve
     estado, modelos disponibles y latencia básica. Útil antes de delegar para validar
-    que el Mac Studio está alcanzable.
+    que el backend está alcanzable.
     """
     base = LITELLM_URL.rsplit("/v1/", 1)[0]
     out: dict[str, Any] = {

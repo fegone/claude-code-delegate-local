@@ -4,6 +4,21 @@ All notable changes to `delegate-local` are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] — 2026-05-24
+
+### Added
+- `docs/BEST-PRACTICES.md` — new guide for orchestrators dispatching multi-file sprints. Covers empirical thresholds for when to split work (>25K tokens initial prompt, >3 files, >300 LOC, >20 projected turns), KV-cache prefix reuse for parallel dispatches (~30-50% prompt processing savings when the same agent name is reused across parallel workers), scope-bounded prompts (~15-25% context savings), and an estimated-savings table from a real incident.
+- Built-in **context-scope hint** automatically injected into every delegated agent's system prompt (`CONTEXT_SCOPE_HINT` constant in `server.py`). Tells the agent: "if your task references more than 3 files or more than 300 lines, split mentally into sub-steps of ≤3 files each; don't keep accumulating files in context across turns." Mitigates the symptom that triggered this release.
+- README.md / README.es.md: new "Best practices" / "Buenas prácticas" section linking to the new doc.
+
+### Changed
+- `httpx.AsyncClient(timeout=...)` raised from **240s → 1800s** (4 min → 30 min). Real-world incident: a 6-task sprint with 1 SQL migration (355 LOC) + 5 TypeScript files dispatched to a 35B-A3B MoE local backend hit ReadTimeout at turn 25 as the slot's 262K-token ceiling approached. The HTTP client cut the request before the model finished generating. A higher default gives breathing room for legitimate large tasks; the real fix is splitting work (see BEST-PRACTICES.md).
+- `DEFAULT_MAX_TURNS` raised from **15 → 25**. Hard cap unchanged at 40. Multi-step sprints with tool calling commonly need >15 turns; 25 is a more honest default. Lower it explicitly for known-short tasks.
+- `pyproject.toml` version field corrected from `0.1.0` (which had been stale since initial bootstrap) to `0.4.0`. Matches the CHANGELOG.
+
+### Fixed
+- Removed personal/proprietary references from `server.py` comments and docstrings (project-specific names, vendor-specific hardware mentions). Replaced with generic descriptions. No functional change.
+
 ## [0.3.1] — 2026-05-23
 
 ### Changed

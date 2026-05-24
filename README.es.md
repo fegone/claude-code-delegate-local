@@ -24,6 +24,7 @@ Pensado para usuarios que quieren mantener su sesión principal de Claude Code e
 - [Soporte para modo "thinking"](#soporte-para-modo-thinking)
 - [Ejemplo: proxy LiteLLM](#ejemplo-proxy-litellm)
 - [Modelos validados](#modelos-validados)
+- [Buenas prácticas](#buenas-prácticas)
 - [Documentación adicional](#documentación-adicional)
 - [Advertencias](#advertencias)
 - [Licencia](#licencia)
@@ -84,7 +85,7 @@ Ver [docs/CONFIGURATION.md](docs/CONFIGURATION.md) para detalles completos y eje
 
 | Herramienta | Para qué sirve |
 |---|---|
-| `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Ejecuta un agente definido en un `.md` contra el backend default, con tool calling completo |
+| `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Ejecuta un agente definido en un `.md` contra el backend default, con tool calling completo. `max_turns` default ahora es **25** (hard cap 40). |
 | `delegate_to_provider(provider_url, api_key, model, agent_name, task, ...)` | Ejecuta un agente contra un endpoint arbitrario (DeepSeek, OpenRouter, etc.) |
 | `list_local_agents()` | Lista los agentes en `DELEGATE_LOCAL_AGENTS_DIR` con su metadata |
 | `local_backend_status()` | Health check + lista de modelos disponibles en el backend |
@@ -151,6 +152,12 @@ Luego corre `litellm --config config.yaml --port 4000` y apunta este MCP ahí.
 | LiteLLM + AWS Bedrock | `bedrock-sonnet-4-6`, `bedrock-llama4-*` | ✅ | ✅ |
 
 Tareas de validación: revisión de SQL injection (agente security-engineer), calculadora HTML (agente creative, 500-800 LOC monolítico), juego de Pac-Man (884 LOC monolítico de un solo shot).
+
+## Buenas prácticas
+
+⚠️ **Si despachás sprints multi-archivo a backends locales, leé esto antes.** Despachar 6+ archivos juntos en un solo dispatch produce `ReadTimeout` cuando el contexto satura el slot tras muchos turnos de tool calling. Dividir el trabajo y reusar el mismo agente en workers paralelos reduce ~60% del wall-clock y ~78% de los tokens.
+
+- 🎯 [docs/BEST-PRACTICES.md](docs/BEST-PRACTICES.md) — umbrales empíricos para dividir, reuse de KV-cache prefix en paralelo, prompts con scope acotado, tabla de ahorro estimado (en inglés)
 
 ## Documentación adicional
 
