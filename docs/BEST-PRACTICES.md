@@ -21,7 +21,7 @@ The lesson is not "the model can't handle big context." It's that **accumulated 
 `delegate-local` v0.4.0 mitigates this in three ways:
 
 1. **Larger default HTTP timeout** (1800s) so the proxy/client doesn't cut requests prematurely.
-2. **Higher default `max_turns`** (25) so legitimate multi-step tasks aren't truncated by an artificially low cap.
+2. **Per-backend `max_turns` default** (15 for MoE local, validated; pass 25-30 explicit for cloud) so multi-step tasks aren't truncated by an artificially low cap on cloud, but local-backend users don't hit the saturation incident described above on first use.
 3. **Built-in context-scope hint** injected into every delegated agent's system prompt, telling it to split mentally when work is large.
 
 Those defaults handle the symptoms. The orchestrator still has to handle the cause: **don't dispatch monolithic sprints to a single agent**.
@@ -155,7 +155,7 @@ For multi-phase sprints projected to take more than 15 minutes total: report par
 
 | Knob | Default | When to change |
 |---|---|---|
-| `max_turns` parameter | 25 | Lower for known-short tasks (5-10). Raise toward 40 only when you've verified the task genuinely needs it. |
+| `max_turns` parameter | 15 (MoE local sweet spot, validated) | **For cloud backends (Sonnet/Opus, DeepSeek), pass 25-30 explicit** — cloud has more context headroom. For known-short tasks, lower to 5-10. Raise toward 40 only when verified necessary. |
 | `max_tokens` parameter | 65536 | Raise to 96K-131K only for thinking-mode models doing very long single-response generation. Default is fine for most coding work. |
 | HTTP client timeout | 1800s (in code) | If you're hitting timeouts, the problem is usually context saturation, not the timeout. Split the work instead of raising the timeout. |
 | Context-scope hint | always on | Disable by overriding `CONTEXT_SCOPE_HINT` in your fork if you have a backend with effectively unlimited context (rare). |

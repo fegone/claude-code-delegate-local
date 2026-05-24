@@ -34,7 +34,13 @@ LITELLM_URL = os.getenv("DELEGATE_LOCAL_URL", "http://localhost:4000/v1/messages
 LITELLM_KEY = os.getenv("DELEGATE_LOCAL_KEY", "")  # inyectado vía env desde Claude Code MCP config
 DEFAULT_MODEL = os.getenv("DELEGATE_LOCAL_MODEL", "local-qwen-3-6-35b")
 MODE_TAG = "MODE:LOCAL"
-DEFAULT_MAX_TURNS = 25
+# Default lowered from 25 (v0.4.0) to 15 (v0.4.1) after empirical validation:
+# MoE-A3B local backends with strict per-slot context (e.g., Qwen3.6 35B-A3B
+# with 262K per slot) hit context saturation at ~25 turns × ~10K tokens/turn.
+# 15 is the validated sweet spot for these backends.
+# For cloud backends (Sonnet/Opus, DeepSeek API), 25-30 is also safe and may
+# speed up complex sprints — pass max_turns=25 explicitly when calling.
+DEFAULT_MAX_TURNS = 15
 HARD_MAX_TURNS = 40
 
 # Hint preventivo inyectado en el system prompt del agente delegado.
@@ -371,7 +377,11 @@ async def delegate_to_local_agent(
         task: Tarea concreta para el agente. Sé específico, el agente leerá ese prompt.
         workdir: Directorio de trabajo del agente (default: '.' del MCP). Recomendado pasar
                  ruta absoluta al proyecto donde trabajará.
-        max_turns: Tope de iteraciones (default 25, hard cap 40). Bajar para tareas cortas.
+        max_turns: Tope de iteraciones de tool-calling (default 15, hard cap 40).
+               Default 15 es el sweet spot validado para backends MoE-A3B locales
+               (Qwen3.6 35B-A3B, etc.) con techo de contexto por slot ~262K.
+               Para backends cloud (Sonnet/Opus, DeepSeek API): pasar 25-30 explícito.
+               Para tareas conocidas como cortas: bajar a 5-10.
         model: Model alias as configured in your LiteLLM proxy (or direct provider).
                Default 'local-qwen-3-6-35b'. Override via DELEGATE_LOCAL_MODEL env var.
         max_tokens: Tope de tokens por turno del modelo. Default 65536, ajustar si el

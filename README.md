@@ -85,7 +85,7 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for full details and example 
 
 | Tool | Purpose |
 |---|---|
-| `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Run a `.md`-defined agent on the default backend with full tool calling. `max_turns` defaults to **25** (hard cap 40). |
+| `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Run a `.md`-defined agent on the default backend with full tool calling. `max_turns` defaults to **15** (validated sweet spot for MoE-A3B local backends; pass 25-30 explicit for cloud). Hard cap 40. |
 | `delegate_to_provider(provider_url, api_key, model, agent_name, task, ...)` | Run an agent on any arbitrary endpoint (DeepSeek, OpenRouter, etc.) |
 | `list_local_agents()` | List agents found in `DELEGATE_LOCAL_AGENTS_DIR` with their frontmatter metadata |
 | `local_backend_status()` | Health check + list of models available on the configured backend |

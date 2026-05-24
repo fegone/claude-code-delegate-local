@@ -4,6 +4,18 @@ All notable changes to `delegate-local` are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.1] — 2026-05-24
+
+### Changed
+- `DEFAULT_MAX_TURNS` lowered back from **25 → 15** based on a same-day follow-up validation. v0.4.0 raised this to 25 reasoning that "multi-step sprints commonly need >15 turns" — that reasoning is correct for cloud backends, but **MoE-A3B local backends** (e.g., Qwen3.6 35B-A3B) with strict per-slot context (~262K) hit context saturation around turn 25 with realistic ~10K-token-per-turn accumulation. The original v0.4.0 incident (real-world: 6-task sprint with 5 TS files + 355-line SQL migration) timed out **exactly at turn 25**. 15 is the validated sweet spot for MoE-A3B local backends and protects new users with default backends. Cloud users should pass `max_turns=25` (or higher, up to 40) explicitly when calling.
+- Docstring on `delegate_to_local_agent.max_turns` updated with per-backend guidance (MoE local = 15, cloud = 25-30, short tasks = 5-10).
+- Inline comment above `DEFAULT_MAX_TURNS` documents the rationale of the change for future maintainers.
+
+### Notes
+- `HARD_MAX_TURNS = 40` unchanged. Callers can still request up to 40 turns.
+- Other v0.4.0 features (1800s timeout, `CONTEXT_SCOPE_HINT` in system prompt, `docs/BEST-PRACTICES.md`) are unchanged and continue applying.
+- If you adopted v0.4.0 and want to preserve the higher default for your cloud usage, pass `max_turns=25` (or whatever you prefer) in your delegate calls.
+
 ## [0.4.0] — 2026-05-24
 
 ### Added

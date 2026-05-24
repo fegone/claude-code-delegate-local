@@ -85,7 +85,7 @@ Ver [docs/CONFIGURATION.md](docs/CONFIGURATION.md) para detalles completos y eje
 
 | Herramienta | Para qué sirve |
 |---|---|
-| `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Ejecuta un agente definido en un `.md` contra el backend default, con tool calling completo. `max_turns` default ahora es **25** (hard cap 40). |
+| `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Ejecuta un agente definido en un `.md` contra el backend default, con tool calling completo. `max_turns` default es **15** (sweet spot validado para backends MoE-A3B locales; pasar 25-30 explícito para cloud). Hard cap 40. |
 | `delegate_to_provider(provider_url, api_key, model, agent_name, task, ...)` | Ejecuta un agente contra un endpoint arbitrario (DeepSeek, OpenRouter, etc.) |
 | `list_local_agents()` | Lista los agentes en `DELEGATE_LOCAL_AGENTS_DIR` con su metadata |
 | `local_backend_status()` | Health check + lista de modelos disponibles en el backend |
