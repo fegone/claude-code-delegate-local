@@ -86,9 +86,14 @@ Ver [docs/CONFIGURATION.md](docs/CONFIGURATION.md) para detalles completos y eje
 | Herramienta | Para qué sirve |
 |---|---|
 | `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Ejecuta un agente definido en un `.md` contra el backend default, con tool calling completo. `max_turns` default es **15** (sweet spot validado para backends MoE-A3B locales; pasar 25-30 explícito para cloud). Hard cap 40. |
+| `delegate_batch(tasks)` | **NUEVO v0.5.0** — Despacha hasta 4 tareas de agente en paralelo via `asyncio.gather`. Cada task es un dict `{agent_name, task, workdir?, max_turns?, model?, max_tokens?}`. Devuelve resultados por-task en orden de entrada. Reusar el mismo agent_name aprovecha KV-cache prefix reuse (~30-50% ahorro en prompt processing en llama.cpp local). |
 | `delegate_to_provider(provider_url, api_key, model, agent_name, task, ...)` | Ejecuta un agente contra un endpoint arbitrario (DeepSeek, OpenRouter, etc.) |
 | `list_local_agents()` | Lista los agentes en `DELEGATE_LOCAL_AGENTS_DIR` con su metadata |
 | `local_backend_status()` | Health check + lista de modelos disponibles en el backend |
+
+### Nota sobre `delegate_batch` y sub-agentes
+
+Los sub-agentes de Claude Code lanzados con el tool nativo `Agent`/`Task` **NO heredan los MCP servers de la sesión padre**. Esto significa que `delegate_batch` (y cualquier otro tool MCP) solo se puede invocar desde la **sesión orquestadora principal**. Los sub-agentes que necesiten despacho paralelo al backend local deben usar `httpx.AsyncClient` + `asyncio.gather` directo contra el endpoint LiteLLM. Es una limitación arquitectónica de Claude Code, no del `delegate-local`.
 
 ## Búsqueda de agentes en 3 niveles
 

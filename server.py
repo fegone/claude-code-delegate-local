@@ -14,6 +14,7 @@ License: MIT
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import pathlib
@@ -351,10 +352,9 @@ async def _call_backend(
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Tool principal: delegate_to_local_agent
+# Internal implementation — shared by delegate_to_local_agent and delegate_batch
 # ────────────────────────────────────────────────────────────────────────────────
-@mcp.tool()
-async def delegate_to_local_agent(
+async def _delegate_one_impl(
     agent_name: str,
     task: str,
     workdir: str = ".",
@@ -364,34 +364,11 @@ async def delegate_to_local_agent(
     ctx: Context | None = None,
 ) -> dict:
     """
-    Despacha un agente (cargado desde un .md con frontmatter) a un backend OpenAI/Anthropic-
-    compatible con tool calling completo (read_file / write_file / run_bash). Devuelve
-    resultado consolidado.
+    Internal implementation of a single agent dispatch loop. Not exposed as an MCP tool —
+    used by both delegate_to_local_agent (public tool) and delegate_batch (parallel wrapper).
 
-    USAR cuando el usuario quiera ejecutar un agente específico en un backend alternativo
-    (local, cloud, etc.) en vez del default del orquestador. El orquestador sigue intacto.
-
-    Args:
-        agent_name: Nombre del agente sin .md. Ej: 'seo-content', 'security-engineer',
-                    'database-optimizer'. Debe existir en ~/.claude/agents/
-        task: Tarea concreta para el agente. Sé específico, el agente leerá ese prompt.
-        workdir: Directorio de trabajo del agente (default: '.' del MCP). Recomendado pasar
-                 ruta absoluta al proyecto donde trabajará.
-        max_turns: Tope de iteraciones de tool-calling (default 15, hard cap 40).
-               Default 15 es el sweet spot validado para backends MoE-A3B locales
-               (Qwen3.6 35B-A3B, etc.) con techo de contexto por slot ~262K.
-               Para backends cloud (Sonnet/Opus, DeepSeek API): pasar 25-30 explícito.
-               Para tareas conocidas como cortas: bajar a 5-10.
-        model: Model alias as configured in your LiteLLM proxy (or direct provider).
-               Default 'local-qwen-3-6-35b'. Override via DELEGATE_LOCAL_MODEL env var.
-        max_tokens: Tope de tokens por turno del modelo. Default 65536, ajustar si el
-               backend tiene un cap menor o si necesitas más para outputs muy grandes.
-               Modelos en thinking mode (DeepSeek V4, o1-style) consumen 2-8K solo para
-               reasoning antes de emitir contenido, por eso el default es alto.
-
-    Returns:
-        dict con keys: success, final_response, turns, tool_calls, malformed_calls,
-        elapsed_s, tokens_in, tokens_out, stop_reason, agent_name, model, workdir
+    Same arguments and return shape as delegate_to_local_agent. `ctx` is optional and only
+    used when present (skipped in batch mode where nested progress reporting gets messy).
     """
     max_turns = max(1, min(max_turns, HARD_MAX_TURNS))
 
@@ -510,6 +487,196 @@ async def delegate_to_local_agent(
         "tokens_out": total_out,
         "stop_reason": stop_reason,
         "hit_turn_limit": turn >= max_turns and bool(tool_uses),
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Tool principal: delegate_to_local_agent (thin wrapper around _delegate_one_impl)
+# ────────────────────────────────────────────────────────────────────────────────
+@mcp.tool()
+async def delegate_to_local_agent(
+    agent_name: str,
+    task: str,
+    workdir: str = ".",
+    max_turns: int = DEFAULT_MAX_TURNS,
+    model: str = DEFAULT_MODEL,
+    max_tokens: int = 65536,
+    ctx: Context | None = None,
+) -> dict:
+    """
+    Despacha un agente (cargado desde un .md con frontmatter) a un backend OpenAI/Anthropic-
+    compatible con tool calling completo (read_file / write_file / run_bash). Devuelve
+    resultado consolidado.
+
+    USAR cuando el usuario quiera ejecutar un agente específico en un backend alternativo
+    (local, cloud, etc.) en vez del default del orquestador. El orquestador sigue intacto.
+
+    Para despachar VARIOS agentes en paralelo en una sola llamada, ver `delegate_batch`.
+
+    Args:
+        agent_name: Nombre del agente sin .md. Ej: 'seo-content', 'security-engineer',
+                    'database-optimizer'. Debe existir en ~/.claude/agents/
+        task: Tarea concreta para el agente. Sé específico, el agente leerá ese prompt.
+        workdir: Directorio de trabajo del agente (default: '.' del MCP). Recomendado pasar
+                 ruta absoluta al proyecto donde trabajará.
+        max_turns: Tope de iteraciones de tool-calling (default 15, hard cap 40).
+               Default 15 es el sweet spot validado para backends MoE-A3B locales
+               (Qwen3.6 35B-A3B, etc.) con techo de contexto por slot ~262K.
+               Para backends cloud (Sonnet/Opus, DeepSeek API): pasar 25-30 explícito.
+               Para tareas conocidas como cortas: bajar a 5-10.
+        model: Model alias as configured in your LiteLLM proxy (or direct provider).
+               Default 'local-qwen-3-6-35b'. Override via DELEGATE_LOCAL_MODEL env var.
+        max_tokens: Tope de tokens por turno del modelo. Default 65536, ajustar si el
+               backend tiene un cap menor o si necesitas más para outputs muy grandes.
+               Modelos en thinking mode (DeepSeek V4, o1-style) consumen 2-8K solo para
+               reasoning antes de emitir contenido, por eso el default es alto.
+
+    Returns:
+        dict con keys: success, final_response, turns, tool_calls, malformed_calls,
+        elapsed_s, tokens_in, tokens_out, stop_reason, agent_name, model, workdir
+    """
+    return await _delegate_one_impl(
+        agent_name=agent_name,
+        task=task,
+        workdir=workdir,
+        max_turns=max_turns,
+        model=model,
+        max_tokens=max_tokens,
+        ctx=ctx,
+    )
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Tool batch: delegate_batch — N tasks en paralelo via asyncio.gather
+# ────────────────────────────────────────────────────────────────────────────────
+MAX_BATCH_SIZE = 4  # match typical local backend parallel slot count
+
+
+@mcp.tool()
+async def delegate_batch(
+    tasks: list[dict],
+    ctx: Context | None = None,
+) -> dict:
+    """
+    Despacha hasta N agentes EN PARALELO en una sola llamada, usando asyncio.gather.
+    Útil cuando el orquestador quiere ejecutar N sub-tareas independientes simultáneamente
+    en backends que soportan paralelismo nativo (e.g., llama.cpp con --parallel 4).
+
+    USE WHEN you have multiple independent sub-tasks and your backend has parallel slots
+    available (typical local llama.cpp setup = 4 parallel slots). With same agent_name
+    reused across tasks, you also benefit from KV cache prefix reuse on the shared system
+    prompt (~30-50% prompt-processing savings).
+
+    LIMITATION: Sub-agents launched via Claude Code's Agent/Task tool do NOT inherit
+    parent's MCP servers, so this tool cannot be called from within a sub-agent. It only
+    works from the main orchestrator session. Sub-agents that need parallelism should use
+    httpx.AsyncClient + asyncio.gather directly against your LiteLLM endpoint.
+
+    Args:
+        tasks: List of task dicts. Each dict has the same keys as delegate_to_local_agent's
+               parameters: {agent_name, task, workdir?, max_turns?, model?, max_tokens?}.
+               agent_name and task are required; rest use defaults.
+               Hard cap MAX_BATCH_SIZE (4) tasks per call. For more, split into multiple
+               calls or use sequential delegate_to_local_agent calls.
+
+    Returns:
+        dict with keys:
+            success (bool): True only if ALL tasks succeeded
+            batch_size (int): number of tasks dispatched
+            successes (int): how many returned success=True
+            failures (int): how many returned success=False (failed task results still in 'results')
+            elapsed_s (float): wall-clock total — close to time of slowest task, not sum
+            results (list[dict]): per-task results in same order as input tasks. Each has
+                                  the same shape as delegate_to_local_agent's return value,
+                                  plus 'task_index' if the task itself raised an exception.
+
+    Example:
+        tasks = [
+            {"agent_name": "devops-automator", "task": "Set up CI for repo X"},
+            {"agent_name": "devops-automator", "task": "Set up CI for repo Y"},
+            {"agent_name": "devops-automator", "task": "Set up CI for repo Z"},
+        ]
+        # All 3 run concurrently; same agent_name → KV cache reuse on system prompt
+        result = await delegate_batch(tasks=tasks)
+        # result["elapsed_s"] ≈ max(task_times), not sum
+    """
+    if not isinstance(tasks, list) or len(tasks) == 0:
+        return {
+            "success": False,
+            "error": "tasks must be a non-empty list",
+            "batch_size": 0,
+            "results": [],
+        }
+
+    if len(tasks) > MAX_BATCH_SIZE:
+        return {
+            "success": False,
+            "error": (
+                f"Max {MAX_BATCH_SIZE} tasks per batch call (got {len(tasks)}). "
+                f"Split into multiple delegate_batch calls or call sequentially. "
+                f"The cap matches typical local backend parallel slot count."
+            ),
+            "batch_size": len(tasks),
+            "results": [],
+        }
+
+    async def _run_one_with_isolation(t: dict, idx: int) -> dict:
+        """Wrap _delegate_one_impl so an exception in one task doesn't fail the gather."""
+        if not isinstance(t, dict):
+            return {
+                "success": False,
+                "error": f"task {idx} is not a dict (got {type(t).__name__})",
+                "task_index": idx,
+            }
+        agent_name = t.get("agent_name", "").strip()
+        task_str = t.get("task", "").strip()
+        if not agent_name or not task_str:
+            return {
+                "success": False,
+                "error": f"task {idx} missing required field(s): agent_name and task are required",
+                "task_index": idx,
+            }
+        try:
+            return await _delegate_one_impl(
+                agent_name=agent_name,
+                task=task_str,
+                workdir=t.get("workdir", "."),
+                max_turns=t.get("max_turns", DEFAULT_MAX_TURNS),
+                model=t.get("model", DEFAULT_MODEL),
+                max_tokens=t.get("max_tokens", 65536),
+                ctx=None,  # nested per-task progress reporting omitted in batch
+            )
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"batch task {idx} crashed: {type(e).__name__}: {e}",
+                "task_index": idx,
+                "agent_name": agent_name,
+            }
+
+    if ctx:
+        await ctx.report_progress(
+            progress=0,
+            total=len(tasks),
+            message=f"dispatching {len(tasks)} tasks in parallel via asyncio.gather",
+        )
+
+    t0 = time.time()
+    results = await asyncio.gather(
+        *[_run_one_with_isolation(t, i) for i, t in enumerate(tasks)]
+    )
+    elapsed = time.time() - t0
+
+    successes = sum(1 for r in results if r.get("success"))
+    failures = len(results) - successes
+
+    return {
+        "success": failures == 0,
+        "batch_size": len(tasks),
+        "successes": successes,
+        "failures": failures,
+        "elapsed_s": round(elapsed, 1),
+        "results": results,
     }
 
 

@@ -4,6 +4,21 @@ All notable changes to `delegate-local` are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] — 2026-05-24
+
+### Added
+- **New tool `delegate_batch(tasks)`** — dispatch up to 4 agent tasks in parallel via `asyncio.gather`. Each task is a dict with the same fields as `delegate_to_local_agent`'s parameters: `{agent_name, task, workdir?, max_turns?, model?, max_tokens?}`. Returns per-task results in input order with aggregate `success`, `batch_size`, `successes`, `failures`, and `elapsed_s` (close to time of slowest task, not sum). Hard cap matches typical local backend parallel slot count (4); for more, split into multiple calls. When the same `agent_name` is reused across tasks, the call benefits from KV-cache prefix reuse on shared system prompt (~30-50% prompt-processing savings on llama.cpp local backends).
+- Documentation: new "Parallel batch dispatch" section in `docs/BEST-PRACTICES.md` covering the new tool, the limitation with Claude Code sub-agents, and the direct-HTTP `asyncio.gather` workaround for sub-agents that can't use MCP.
+- README + README.es: tools table includes `delegate_batch` with rationale; new "Note on `delegate_batch` and sub-agents" subsection clarifies the Claude Code architectural constraint.
+
+### Changed
+- Internal refactor: extracted the single-agent dispatch loop from `delegate_to_local_agent` into `_delegate_one_impl`, shared by both `delegate_to_local_agent` (public tool, unchanged signature/behavior) and `delegate_batch` (new tool). No behavior change for existing callers.
+
+### Notes
+- `delegate_batch` is only callable from the **main orchestrator session** that has the MCP registered. Claude Code sub-agents launched via the native `Agent`/`Task` tool do not inherit parent MCP servers. Sub-agents needing parallel local dispatch should use `httpx.AsyncClient` + `asyncio.gather` directly against the LiteLLM endpoint (example in `docs/BEST-PRACTICES.md`).
+- All other v0.4.x defaults preserved: HTTP timeout 1800s, `DEFAULT_MAX_TURNS = 15`, `CONTEXT_SCOPE_HINT` auto-injected, `max_tokens` default 65536.
+- Failed tasks within a batch do not abort the batch — each task is isolated with `try/except`, and the failed result dict lands in `results[i]` with `success: False` and an `error` field so the caller can decide what to do.
+
 ## [0.4.1] — 2026-05-24
 
 ### Changed

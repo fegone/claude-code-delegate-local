@@ -47,6 +47,63 @@ These thresholds assume a 262K-per-slot backend (typical for llama.cpp with `--p
 
 ---
 
+## Parallel batch dispatch (v0.5.0+)
+
+If you're an orchestrator with multiple independent sub-tasks to dispatch, use `delegate_batch` instead of multiple sequential `delegate_to_local_agent` calls:
+
+```python
+# Sequential (old way) — total time = sum of tasks
+result_a = delegate_to_local_agent("devops-automator", "set up CI for repo X")
+result_b = delegate_to_local_agent("devops-automator", "set up CI for repo Y")
+result_c = delegate_to_local_agent("devops-automator", "set up CI for repo Z")
+
+# Parallel (v0.5.0+) — total time ≈ time of slowest task
+batch_result = delegate_batch(tasks=[
+    {"agent_name": "devops-automator", "task": "set up CI for repo X"},
+    {"agent_name": "devops-automator", "task": "set up CI for repo Y"},
+    {"agent_name": "devops-automator", "task": "set up CI for repo Z"},
+])
+# batch_result["results"] is a list in input order
+# batch_result["elapsed_s"] ≈ max(individual times), not sum
+```
+
+**Hard cap: 4 tasks per `delegate_batch` call**, matching typical local backend parallel slot count. For more, split into multiple sequential `delegate_batch` calls.
+
+**`delegate_batch` automatically benefits from KV-cache prefix reuse** (see below) when you pass the same `agent_name` across tasks. That's why the example above uses `devops-automator` for all three — the system prompt is cached after the first request.
+
+### ⚠️ Important limitation — sub-agents
+
+Claude Code sub-agents launched via the native `Agent`/`Task` tool **do not inherit the parent session's MCP servers**. `delegate_batch` (like any MCP tool) is only callable from the **main orchestrator session**, never from inside a `Task()`-launched sub-agent.
+
+If you're a sub-agent and need parallel local-backend dispatch, use direct HTTP with `asyncio.gather` against your LiteLLM endpoint:
+
+```python
+import asyncio, httpx
+
+async def call_local(prompt: str, key: str, url: str = "http://localhost:4000/v1/chat/completions"):
+    async with httpx.AsyncClient(timeout=1800) as client:
+        r = await client.post(
+            url,
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "local-qwen-3-6-35b",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 8192, "temperature": 0.3}
+        )
+        return r.json()["choices"][0]["message"]["content"]
+
+# All 4 hit the local backend simultaneously, occupy 4 parallel slots
+results = await asyncio.gather(
+    call_local("task A", KEY),
+    call_local("task B", KEY),
+    call_local("task C", KEY),
+    call_local("task D", KEY),
+)
+```
+
+This is a Claude Code architecture constraint, not a `delegate-local` limitation.
+
+---
+
 ## KV-cache prefix reuse — pay the system prompt cost once
 
 `llama.cpp` and most modern inference engines support **prefix caching**: when two requests share the start of their system prompt, the second request reuses the cached KV state for that prefix instead of recomputing it.
