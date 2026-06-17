@@ -4,6 +4,19 @@ All notable changes to `delegate-local` are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] — 2026-06-17
+
+### Fixed
+- **`read_file` ya no atrapa a los agentes en un loop de truncado.** Antes cortaba a 8.000 chars sin forma de leer el resto → archivos grandes (controllers de 600-900 líneas) eran ilegibles y el agente quemaba turnos re-leyendo lo mismo (caso real: 538K tok IN / 1.8K OUT en una tarea multi-archivo con MiniMax M3). Ahora `read_file` acepta `offset`/`limit` (rangos de línea), devuelve contenido **con números de línea** y un encabezado `[líneas N-M de TOTAL]`; al cortar (~50KB, `MAX_READ_CHARS`) indica `read_file(path, offset=…)` para continuar sin re-leer.
+
+### Changed
+- **`max_turns` por defecto ahora es AUTO según el backend.** `max_turns=0` (nuevo default) resuelve a **15 para modelos locales** (`local-*`, MoE-A3B con techo de ctx ~262K) y **25 para cloud** (MiniMax M3 512K, DeepSeek, Sonnet/Opus). Un valor explícito sigue mandando. Reemplaza el viejo default fijo de 15 que era muy bajo para review multi-archivo en cloud.
+- **`run_bash`**: tope de stdout 4.000→12.000 y stderr 2.000→4.000 chars (para que `grep -n` sobre archivos grandes no se corte).
+- **`CONTEXT_SCOPE_HINT`** ampliado: regla anti-loop — leer archivos grandes por rangos dirigidos con `offset/limit`, preferir `grep` para localizar, NUNCA re-leer un rango, y **sintetizar temprano** antes de agotar el presupuesto de turnos.
+
+### Notes
+- El problema NO era prompt caching (lo que el agente pidió como #1): `minimax-m3` es cloud (`api.minimax.io`), no hay KV-reuse local que activar, y el caching solo habría abaratado un loop que de todos modos no convergía. La causa raíz era el truncado sin rangos de `read_file`.
+
 ## [0.5.0] — 2026-05-24
 
 ### Added
