@@ -42,7 +42,15 @@ MODE_TAG = "MODE:LOCAL"
 # For cloud backends (Sonnet/Opus, DeepSeek API), 25-30 is also safe and may
 # speed up complex sprints — pass max_turns=25 explicitly when calling.
 DEFAULT_MAX_TURNS = 15
+# Cloud backends (MiniMax M3, DeepSeek API, Sonnet/Opus) tienen contextos grandes
+# (M3 = 512K) y aguantan más turnos de análisis multi-archivo sin saturar.
+# Se resuelve por modelo en _delegate_one_impl cuando max_turns no se pasa explícito.
+CLOUD_MAX_TURNS = 25
 HARD_MAX_TURNS = 40
+# read_file: tope de chars devueltos por lectura. Por encima, el agente debe paginar
+# con offset/limit (NO re-leer lo mismo). Subido de 8000 para que archivos grandes
+# (controllers de 600-900 líneas) se puedan leer por rangos de verdad.
+MAX_READ_CHARS = 50000
 
 # Hint preventivo inyectado en el system prompt del agente delegado.
 # Reduce ReadTimeouts y context overflow en backends locales con techo de ctx por slot.
@@ -58,6 +66,16 @@ CONTEXT_SCOPE_HINT = (
     "contents are no longer needed once you've made the related change.\n"
     "If the task list is long (≥4 distinct items), tell the user it should be split into "
     "separate dispatches before you start, and stop.\n"
+    "\n"
+    "READING LARGE FILES — avoid the truncation loop:\n"
+    "read_file returns at most ~50KB and shows '[line N-M of TOTAL]'. For a big file, "
+    "read it in DIRECTED ranges with read_file(path, offset=N, limit=K) — never re-read a "
+    "range you already saw. To find what matters fast, prefer run_bash with grep/sed "
+    "(e.g. grep -n 'pattern' file) and then read only the relevant line range. "
+    "Each file/range should be read ONCE.\n"
+    "SYNTHESIZE EARLY: you have a limited turn budget. Reach a verdict/output well before "
+    "the last turn — do not spend every turn reading. If you've gathered enough to answer, "
+    "stop reading and produce the final result.\n"
 )
 
 mcp = FastMCP("delegate-local")
@@ -112,10 +130,18 @@ def _load_agent(name: str, workdir: str | None = None) -> tuple[dict, str, str] 
 AGENT_TOOLS = [
     {
         "name": "read_file",
-        "description": "Lee un archivo. Path relativo al workdir o absoluto.",
+        "description": (
+            "Lee un archivo con números de línea. Path relativo al workdir o absoluto. "
+            "Para archivos grandes usa offset/limit para leer por rangos (paginar) en vez "
+            "de re-leer; la respuesta indica 'línea N-M de TOTAL' y cómo continuar."
+        ),
         "input_schema": {
             "type": "object",
-            "properties": {"path": {"type": "string", "description": "Ruta del archivo"}},
+            "properties": {
+                "path": {"type": "string", "description": "Ruta del archivo"},
+                "offset": {"type": "integer", "description": "Línea inicial (1-based). Default 1."},
+                "limit": {"type": "integer", "description": "Cantidad de líneas a leer desde offset. Default: hasta el tope de tamaño."},
+            },
             "required": ["path"],
         },
     },
@@ -152,10 +178,31 @@ def _execute_tool(workdir: str, name: str, args: dict[str, Any]) -> str:
     try:
         if name == "read_file":
             with open(_resolve(workdir, args["path"]), encoding="utf-8", errors="replace") as f:
-                content = f.read()
-            if len(content) > 8000:
-                return content[:8000] + f"\n\n[... truncado, {len(content) - 8000} chars más ...]"
-            return content
+                lines = f.readlines()
+            total = len(lines)
+            try:
+                offset = max(1, int(args.get("offset") or 1))
+            except (TypeError, ValueError):
+                offset = 1
+            limit = args.get("limit")
+            try:
+                limit = int(limit) if limit is not None else None
+            except (TypeError, ValueError):
+                limit = None
+            sel = lines[offset - 1: (offset - 1 + limit) if limit else None]
+            out, chars, last = [], 0, offset - 1
+            for idx, ln in enumerate(sel, start=offset):
+                piece = f"{idx}\t{ln.rstrip(chr(10))}\n"
+                if chars + len(piece) > MAX_READ_CHARS:
+                    nxt = idx
+                    body = "".join(out)
+                    return (
+                        f"[file {args['path']} | líneas {offset}-{idx - 1} de {total}]\n{body}"
+                        f"[... cortado en ~{MAX_READ_CHARS} chars. Continúa con "
+                        f"read_file(path, offset={nxt}) — NO re-leas líneas anteriores ...]"
+                    )
+                out.append(piece); chars += len(piece); last = idx
+            return f"[file {args['path']} | líneas {offset}-{last} de {total}]\n" + "".join(out)
         elif name == "write_file":
             path = _resolve(workdir, args["path"])
             parent = os.path.dirname(path)
@@ -171,8 +218,8 @@ def _execute_tool(workdir: str, name: str, args: dict[str, Any]) -> str:
             )
             return (
                 f"exit_code: {r.returncode}\n"
-                f"--- stdout ---\n{r.stdout[:4000]}\n"
-                f"--- stderr ---\n{r.stderr[:2000]}"
+                f"--- stdout ---\n{r.stdout[:12000]}\n"
+                f"--- stderr ---\n{r.stderr[:4000]}"
             )
         return f"ERROR: unknown tool {name}"
     except subprocess.TimeoutExpired:
@@ -191,6 +238,10 @@ _OPENAI_FORMAT_PREFIXES: tuple[str, ...] = (
     "openai-",
     "gpt-",
     "qwen-",  # qwen externos vía API (qwen local-* va por messages, ya funciona)
+    "minimax-",   # MiniMax M3 — OpenAI-compatible; ruta nativa /v1/chat/completions
+    "moonshot-",  # Kimi
+    "glm-",       # Zhipu GLM
+    "kimi-",
 )
 
 
@@ -330,7 +381,7 @@ async def _call_backend(
         base = LITELLM_URL.rsplit("/v1/", 1)[0]
         url = f"{base}/v1/chat/completions"
         payload = _anthropic_to_openai_request(messages, system, tools, model, max_tokens)
-        async with httpx.AsyncClient(timeout=1800.0) as client:
+        async with httpx.AsyncClient(timeout=600.0) as client:
             r = await client.post(url, json=payload, headers=headers)
             r.raise_for_status()
             return _openai_to_anthropic_response(r.json())
@@ -345,7 +396,7 @@ async def _call_backend(
         }
         if tools:
             payload["tools"] = tools
-        async with httpx.AsyncClient(timeout=1800.0) as client:
+        async with httpx.AsyncClient(timeout=600.0) as client:
             r = await client.post(LITELLM_URL, json=payload, headers=headers)
             r.raise_for_status()
             return r.json()
@@ -358,7 +409,7 @@ async def _delegate_one_impl(
     agent_name: str,
     task: str,
     workdir: str = ".",
-    max_turns: int = DEFAULT_MAX_TURNS,
+    max_turns: int = 0,
     model: str = DEFAULT_MODEL,
     max_tokens: int = 65536,
     ctx: Context | None = None,
@@ -370,6 +421,9 @@ async def _delegate_one_impl(
     Same arguments and return shape as delegate_to_local_agent. `ctx` is optional and only
     used when present (skipped in batch mode where nested progress reporting gets messy).
     """
+    # max_turns=0 (sentinel) => resolver por modelo: local 15, cloud 25.
+    if not max_turns or max_turns <= 0:
+        max_turns = DEFAULT_MAX_TURNS if str(model).startswith("local-") else CLOUD_MAX_TURNS
     max_turns = max(1, min(max_turns, HARD_MAX_TURNS))
 
     workdir_abs = os.path.abspath(workdir)
@@ -498,7 +552,7 @@ async def delegate_to_local_agent(
     agent_name: str,
     task: str,
     workdir: str = ".",
-    max_turns: int = DEFAULT_MAX_TURNS,
+    max_turns: int = 0,
     model: str = DEFAULT_MODEL,
     max_tokens: int = 65536,
     ctx: Context | None = None,
@@ -519,11 +573,11 @@ async def delegate_to_local_agent(
         task: Tarea concreta para el agente. Sé específico, el agente leerá ese prompt.
         workdir: Directorio de trabajo del agente (default: '.' del MCP). Recomendado pasar
                  ruta absoluta al proyecto donde trabajará.
-        max_turns: Tope de iteraciones de tool-calling (default 15, hard cap 40).
-               Default 15 es el sweet spot validado para backends MoE-A3B locales
-               (Qwen3.6 35B-A3B, etc.) con techo de contexto por slot ~262K.
-               Para backends cloud (Sonnet/Opus, DeepSeek API): pasar 25-30 explícito.
-               Para tareas conocidas como cortas: bajar a 5-10.
+        max_turns: Tope de iteraciones de tool-calling (hard cap 40). Default 0 = AUTO:
+               15 para backends locales (local-*, MoE-A3B con techo de ctx ~262K),
+               25 para backends cloud (MiniMax M3 512K, DeepSeek API, Sonnet/Opus).
+               Pasar un valor explícito lo fuerza. Para tareas cortas conocidas: 5-10.
+               Para review/análisis multi-archivo pesado en cloud: 25-30.
         model: Model alias as configured in your LiteLLM proxy (or direct provider).
                Default 'local-qwen-3-6-35b'. Override via DELEGATE_LOCAL_MODEL env var.
         max_tokens: Tope de tokens por turno del modelo. Default 65536, ajustar si el
@@ -641,7 +695,7 @@ async def delegate_batch(
                 agent_name=agent_name,
                 task=task_str,
                 workdir=t.get("workdir", "."),
-                max_turns=t.get("max_turns", DEFAULT_MAX_TURNS),
+                max_turns=t.get("max_turns", 0),
                 model=t.get("model", DEFAULT_MODEL),
                 max_tokens=t.get("max_tokens", 65536),
                 ctx=None,  # nested per-task progress reporting omitted in batch
