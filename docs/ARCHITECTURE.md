@@ -91,7 +91,7 @@ Tools available to the delegated agent:
 
 | Tool | Behavior | Limits |
 |---|---|---|
-| `read_file(path)` | Read file content (relative to workdir or absolute) | First 8KB returned, rest truncated |
+| `read_file(path, offset?, limit?)` | Read file content with line numbers (relative to workdir or absolute). `offset`/`limit` for line-range pagination | Up to ~50KB per call; header `[lines N-M of TOTAL]` + continuation hint when capped |
 | `write_file(path, content)` | Write/overwrite file, create parent dirs | No size limit |
 | `run_bash(command)` | Execute shell command in workdir | 120s timeout, stdout truncated to 4KB, stderr to 2KB |
 

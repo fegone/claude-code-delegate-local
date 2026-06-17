@@ -315,7 +315,7 @@ The body (after the second `---`) becomes the agent's system prompt body. Anythi
 
 | Caller param | Default | Hard cap | When to change |
 |---|---|---|---|
-| `max_turns` | 15 | 40 | Lower for short single-shot tasks (3-5). Raise for complex multi-step debugging (20-30). |
+| `max_turns` | auto: 15 local / 25 cloud | 40 | Auto-resolved by backend (`local-*` → 15, cloud → 25). Lower for short single-shot tasks (3-5). Raise for complex multi-step debugging (20-30). |
 | `max_tokens` | 32768 (in code) | provider-dependent | Lower if your backend errors out. Raise if you see `stop_reason=max_tokens` truncating output. |
 
 `max_tokens` is set inside `_call_backend()` and isn't currently exposed as a tool parameter — if you need per-call control, modify the tool signature.
