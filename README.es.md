@@ -85,7 +85,7 @@ Ver [docs/CONFIGURATION.md](docs/CONFIGURATION.md) para detalles completos y eje
 
 | Herramienta | Para qué sirve |
 |---|---|
-| `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Ejecuta un agente definido en un `.md` contra el backend default, con tool calling completo. `max_turns` default es **15** (sweet spot validado para backends MoE-A3B locales; pasar 25-30 explícito para cloud). Hard cap 40. |
+| `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Ejecuta un agente definido en un `.md` contra el backend default, con tool calling completo. `max_turns` default es **automático (v0.6.0)**: 15 para backends locales (`local-*`, MoE-A3B), 25 para cloud (MiniMax M3, DeepSeek, Sonnet/Opus). Pasar un valor explícito lo fuerza. Hard cap 40. |
 | `delegate_batch(tasks)` | **NUEVO v0.5.0** — Despacha hasta 4 tareas de agente en paralelo via `asyncio.gather`. Cada task es un dict `{agent_name, task, workdir?, max_turns?, model?, max_tokens?}`. Devuelve resultados por-task en orden de entrada. Reusar el mismo agent_name aprovecha KV-cache prefix reuse (~30-50% ahorro en prompt processing en llama.cpp local). |
 | `delegate_to_provider(provider_url, api_key, model, agent_name, task, ...)` | Ejecuta un agente contra un endpoint arbitrario (DeepSeek, OpenRouter, etc.) |
 | `list_local_agents()` | Lista los agentes en `DELEGATE_LOCAL_AGENTS_DIR` con su metadata |
@@ -177,7 +177,7 @@ Tareas de validación: revisión de SQL injection (agente security-engineer), ca
 ## Advertencias
 
 - **`run_bash` corre comandos shell dentro de `workdir` sin sandbox.** Confía en los agentes que delegues. Si delegas a un agente público no auditado, la herramienta puede leer/escribir donde el usuario que invoca tenga acceso. No hay aislamiento Docker por defecto.
-- **Caps**: `read_file` devuelve los primeros 8KB, `run_bash` corta stdout a 4KB y stderr a 2KB, timeout 120s.
+- **Caps (v0.6.0)**: `read_file` acepta `offset`/`limit` (rangos de línea) y devuelve hasta ~50KB por llamada con números de línea y un encabezado `[líneas N-M de TOTAL]` — pagina archivos grandes en vez de re-leer. `run_bash` corta stdout a 12KB y stderr a 4KB, timeout 120s.
 - **`max_turns` hard cap es 40.** Orquestaciones largas deberían diseñarse como múltiples llamadas delegate en vez de un loop único.
 
 ## Licencia

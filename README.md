@@ -85,7 +85,7 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for full details and example 
 
 | Tool | Purpose |
 |---|---|
-| `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Run a `.md`-defined agent on the default backend with full tool calling. `max_turns` defaults to **15** (validated sweet spot for MoE-A3B local backends; pass 25-30 explicit for cloud). Hard cap 40. |
+| `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Run a `.md`-defined agent on the default backend with full tool calling. `max_turns` defaults to **auto (v0.6.0)**: 15 for local backends (`local-*`, MoE-A3B), 25 for cloud (MiniMax M3, DeepSeek, Sonnet/Opus). Pass an explicit value to override. Hard cap 40. |
 | `delegate_batch(tasks)` | **NEW v0.5.0** — Dispatch up to 4 agent tasks in parallel via `asyncio.gather`. Each task is a dict `{agent_name, task, workdir?, max_turns?, model?, max_tokens?}`. Returns per-task results in input order. Reuses same agent_name across tasks for KV-cache prefix benefit (~30-50% prompt savings on local llama.cpp). |
 | `delegate_to_provider(provider_url, api_key, model, agent_name, task, ...)` | Run an agent on any arbitrary endpoint (DeepSeek, OpenRouter, etc.) |
 | `list_local_agents()` | List agents found in `DELEGATE_LOCAL_AGENTS_DIR` with their frontmatter metadata |
@@ -177,7 +177,7 @@ Validation tasks: SQL injection review (security-engineer agent), HTML calculato
 ## Caveats
 
 - **`run_bash` runs shell commands inside `workdir` without sandboxing.** Trust the agents you delegate. If you delegate to an unvetted public agent, the tool can read/write anywhere the calling user has access. There is no Docker isolation by default.
-- **Caps**: `read_file` returns the first 8KB, `run_bash` truncates stdout to 4KB and stderr to 2KB, timeout 120s.
+- **Caps (v0.6.0)**: `read_file` supports `offset`/`limit` (line ranges) and returns up to ~50KB per call with line numbers and a `[lines N-M of TOTAL]` header — paginate large files instead of re-reading. `run_bash` truncates stdout to 12KB and stderr to 4KB, timeout 120s.
 - **`max_turns` hard cap is 40.** Long-running orchestrations should be designed as multiple delegate calls rather than one huge loop.
 
 ## License

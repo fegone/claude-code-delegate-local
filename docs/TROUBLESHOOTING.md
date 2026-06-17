@@ -83,7 +83,7 @@ mcp__delegate-local__delegate_to_local_agent(
 1. **`max_tokens` was too low** in an earlier version — model output got truncated mid-Write, agent tried append strategy, never finished. Fixed by raising `max_tokens` to 32K+.
 2. **Task prompt didn't force single-shot Write** — the agent decided it needed multiple passes. Add explicit instruction:
    > "Write the COMPLETE file in a single Write call. NO append. NO chunks."
-3. **Genuinely a multi-step task** — raise `max_turns` (default 15, hard cap 40).
+3. **Genuinely a multi-step task** — raise `max_turns` (auto default: 15 local / 25 cloud; hard cap 40).
 
 ### `backend HTTP 401` or `403`
 
