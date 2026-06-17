@@ -52,6 +52,23 @@ model_list:
       api_key: os.environ/DEEPSEEK_API_KEY
 
   # ═══════════════════════════════════════════════════════════════════════════
+  # Z.AI — GLM CODING PLAN (flat-rate subscription, Anthropic-compatible endpoint)
+  # Plan: https://z.ai/model-api  ·  Docs: https://docs.z.ai/devpack/tool/claude
+  # Flat-rate coding plan → use the Anthropic endpoint below. Prompt caching is
+  # automatic server-side (no config needed). To activate: export ZAI_API_KEY and
+  # restart LiteLLM. The alias has no openai/gpt/deepseek/qwen prefix, so this MCP
+  # routes it via /v1/messages (Anthropic format) — which matches this endpoint.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  - model_name: glm-coding-plan
+    litellm_params:
+      model: "anthropic/glm-5.2[1m]"      # 1M context. Drop [1m] for the 200K variant.
+      api_base: https://api.z.ai/api/anthropic
+      api_key: os.environ/ZAI_API_KEY
+      input_cost_per_token: 0.0           # coding plan = flat rate, not per-token
+      output_cost_per_token: 0.0
+
+  # ═══════════════════════════════════════════════════════════════════════════
   # OPENAI / OPENROUTER
   # ═══════════════════════════════════════════════════════════════════════════
 
@@ -96,6 +113,7 @@ model_list:
 # REQUIRED ENV VARS — set these in your shell before launching litellm:
 # ─────────────────────────────────────────────────────────────────────────────
 # export DEEPSEEK_API_KEY=sk-...
+# export ZAI_API_KEY=...            # Z.ai GLM Coding Plan key — from https://z.ai/model-api
 # export OPENAI_API_KEY=sk-...
 # export OPENROUTER_API_KEY=sk-or-v1-...
 # export ANTHROPIC_API_KEY=sk-ant-...

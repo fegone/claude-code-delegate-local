@@ -4,6 +4,13 @@ All notable changes to `delegate-local` are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.1] — 2026-06-17
+
+### Added
+- **GLM Coding Plan (Z.ai) preconfigurado** en `examples/litellm.example.yaml` como alias `glm-coding-plan` (modelo `glm-5.2[1m]`, 1M de contexto) vía el endpoint Anthropic-compatible `https://api.z.ai/api/anthropic`. Tarifa plana, **prompt-caching automático server-side** (igual que MiniMax M3 / DeepSeek, sin configurar nada). El alias no lleva prefijo `openai/gpt/deepseek/qwen`, así que el MCP lo rutea por `/v1/messages` (formato Anthropic), que es lo que ese endpoint espera.
+- **Nueva sección "Activating the GLM Coding Plan (Z.ai)"** en `docs/CONFIGURATION.md`: pasos exactos para activarlo (solo `export ZAI_API_KEY` + reiniciar LiteLLM), nota sobre el routing por prefijo, y la variante de 200K (`glm-5.2` sin `[1m]`).
+- `ZAI_API_KEY` añadida a la lista de env vars del config de ejemplo.
+
 ## [0.6.0] — 2026-06-17
 
 ### Fixed

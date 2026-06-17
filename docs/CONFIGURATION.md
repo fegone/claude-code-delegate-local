@@ -187,6 +187,40 @@ mcp__delegate-local__delegate_to_local_agent(
 
 ---
 
+## Activating the GLM Coding Plan (Z.ai)
+
+The [Z.ai GLM Coding Plan](https://z.ai/model-api) is a flat-rate subscription exposed through an **Anthropic-compatible** endpoint (`https://api.z.ai/api/anthropic`). It ships preconfigured in [`examples/litellm.example.yaml`](../examples/litellm.example.yaml) as the alias `glm-coding-plan` (model `glm-5.2[1m]`, 1M context). Prompt caching is **automatic server-side** — nothing to configure, same as DeepSeek/MiniMax.
+
+The block is already in the config; the **only** thing missing is your key:
+
+```bash
+# 1. Get a key from https://z.ai/model-api (Coding Plan)
+# 2. Export it in the shell/launchd environment that runs LiteLLM:
+export ZAI_API_KEY=...
+
+# 3. Restart LiteLLM so it picks up the model + env var:
+#    - foreground:  Ctrl+C and relaunch
+#    - launchd:     launchctl kickstart -k gui/$(id -u)/<your-litellm-label>
+
+# 4. Verify the alias is live:
+curl -H "Authorization: Bearer $LITELLM_MASTER_KEY" http://localhost:4000/v1/models | jq '.data[].id' | grep glm
+```
+
+Then delegate to it from the orchestrator:
+
+```python
+mcp__delegate-local__delegate_to_local_agent(
+    agent_name="webdev", model="glm-coding-plan", max_turns=25, task="implement X"
+)
+```
+
+**Notes:**
+- The alias `glm-coding-plan` has no `openai/gpt/deepseek/qwen` prefix, so this MCP routes it via `/v1/messages` (Anthropic format) — which matches Z.ai's Anthropic endpoint. Don't rename it with one of those prefixes or routing breaks.
+- For the 200K-context variant (cheaper on tokens, but the coding plan is flat-rate anyway), use `model: "anthropic/glm-5.2"` without the `[1m]` suffix.
+- Coding plan = flat rate, so `input/output_cost_per_token` are set to `0.0` to keep spend logs clean.
+
+---
+
 ## Supported backends
 
 ### LiteLLM proxy (recommended for multi-provider)
