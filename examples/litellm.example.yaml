@@ -62,7 +62,7 @@ model_list:
 
   - model_name: glm-coding-plan
     litellm_params:
-      model: "anthropic/glm-5.2[1m]"      # 1M context. Drop [1m] for the 200K variant.
+      model: "anthropic/glm-5.2"          # verified live in LiteLLM. The [1m] (1M) suffix errors against the Z.ai Anthropic endpoint here — use plain glm-5.2.
       api_base: https://api.z.ai/api/anthropic
       api_key: os.environ/ZAI_API_KEY
       input_cost_per_token: 0.0           # coding plan = flat rate, not per-token
