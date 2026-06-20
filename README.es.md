@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
-**Servidor MCP que delega subagentes de Claude Code a backends alternativos** — modelos locales (LM Studio, llama.cpp, Ollama, vLLM, LiteLLM), DeepSeek, AWS Bedrock, o cualquier endpoint compatible con OpenAI/Anthropic — sin perder tu sesión de orquestador en Claude Code.
+**Servidor MCP que delega subagentes de Claude Code a backends alternativos** — modelos locales (LM Studio, llama.cpp, Ollama, vLLM, LiteLLM), DeepSeek, MiniMax M3, GLM Coding Plan (Z.ai), AWS Bedrock, o cualquier endpoint compatible con OpenAI/Anthropic — sin perder tu sesión de orquestador en Claude Code.
 
 Pensado para usuarios que quieren mantener su sesión principal de Claude Code en Anthropic (plan Max o API) para orquestación, mientras descargan subagentes específicos a backends más baratos, más rápidos o que cumplen requisitos de privacidad (HIPAA, datos sensibles, offline).
 
@@ -115,6 +115,8 @@ Los modelos con estos prefijos se enrutan a OpenAI `/v1/chat/completions`:
 - `qwen-*` (APIs externas de Qwen — los alias `local-qwen-*` van por Anthropic `/v1/messages`)
 
 Todo lo demás va a Anthropic `/v1/messages`. Internamente todo se normaliza a content blocks estilo Anthropic (text / tool_use / thinking) para que el loop del agente sea uniforme.
+
+> **GLM Coding Plan (Z.ai):** el alias `glm-coding-plan` **no** lleva prefijo `openai/gpt/deepseek/qwen`, así que va por Anthropic `/v1/messages` — que es lo que espera el endpoint compatible con Anthropic de Z.ai (`https://api.z.ai/api/anthropic`). Suscripción de tarifa plana con prompt-caching automático server-side. En LiteLLM usa el model code plano `anthropic/glm-5.2` — el sufijo `[1m]` (1M de contexto) da error contra ese endpoint aquí; solo vale cuando Claude Code apunta directo a Z.ai (ver [`examples/claude-glm.sh`](examples/claude-glm.sh)). Configuración: [docs/CONFIGURATION.md](docs/CONFIGURATION.md#activating-the-glm-coding-plan-zai).
 
 ## Soporte para modo "thinking"
 
