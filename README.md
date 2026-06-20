@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
-**MCP server that delegates Claude Code subagents to alternative backends** — local models (LM Studio, llama.cpp, Ollama, vLLM, LiteLLM), DeepSeek, AWS Bedrock, or any OpenAI/Anthropic-compatible endpoint — without losing your Claude Code orchestrator session.
+**MCP server that delegates Claude Code subagents to alternative backends** — local models (LM Studio, llama.cpp, Ollama, vLLM, LiteLLM), DeepSeek, MiniMax M3, GLM Coding Plan (Z.ai), AWS Bedrock, or any OpenAI/Anthropic-compatible endpoint — without losing your Claude Code orchestrator session.
 
 Built for users who want to keep their main Claude Code session on Anthropic (Max plan or API) for orchestration, while offloading specific subagents to cheaper, faster, or HIPAA-safe local backends.
 
@@ -115,6 +115,8 @@ Models with these prefixes are routed to OpenAI-format `/v1/chat/completions`:
 - `qwen-*` (external Qwen APIs — note that `local-qwen-*` aliases route via Anthropic `/v1/messages`)
 
 All other models go to Anthropic-format `/v1/messages`. Inside the server everything is normalized to Anthropic-style content blocks (text / tool_use / thinking) so the agent loop stays uniform.
+
+> **GLM Coding Plan (Z.ai):** the `glm-coding-plan` alias has **no** `openai/gpt/deepseek/qwen` prefix, so it routes via Anthropic `/v1/messages` — which is what Z.ai's Anthropic-compatible endpoint (`https://api.z.ai/api/anthropic`) expects. Flat-rate subscription with automatic server-side prompt caching. In LiteLLM use the plain model code `anthropic/glm-5.2` — the `[1m]` (1M-context) suffix errors against this endpoint there; it only works when Claude Code points directly at Z.ai (see [`examples/claude-glm.sh`](examples/claude-glm.sh)). Setup: [docs/CONFIGURATION.md](docs/CONFIGURATION.md#activating-the-glm-coding-plan-zai).
 
 ## Thinking-mode support
 
