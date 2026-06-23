@@ -348,12 +348,18 @@ def _openai_to_anthropic_response(openai_resp: dict) -> dict:
     stop_map = {"stop": "end_turn", "tool_calls": "tool_use", "length": "max_tokens"}
     finish = choice.get("finish_reason", "")
     usage = openai_resp.get("usage", {})
+    prompt_toks = usage.get("prompt_tokens", 0)
+    cached_toks = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
     return {
         "content": content,
         "stop_reason": stop_map.get(finish, finish or "unknown"),
         "usage": {
-            "input_tokens": usage.get("prompt_tokens", 0),
+            # input_tokens = entrada FRESCA (sin cache), para que sea consistente con el
+            # formato Anthropic donde cache_read viene aparte. OpenAI mete los cacheados
+            # dentro de prompt_tokens, así que los restamos y los exponemos como cache_read.
+            "input_tokens": max(prompt_toks - cached_toks, 0),
             "output_tokens": usage.get("completion_tokens", 0),
+            "cache_read_input_tokens": cached_toks,
         },
     }
 
@@ -461,6 +467,8 @@ async def _delegate_one_impl(
     malformed = 0
     total_in = 0
     total_out = 0
+    total_cache_read = 0
+    total_cache_creation = 0
     final_text = ""
     stop_reason = "unknown"
     t0 = time.time()
@@ -494,6 +502,11 @@ async def _delegate_one_impl(
         usage = resp.get("usage", {})
         total_in += usage.get("input_tokens", 0)
         total_out += usage.get("output_tokens", 0)
+        # Métricas de prompt-cache. En formato Anthropic (GLM-5.2, M3, etc. con caching
+        # automático) cache_read/creation vienen APARTE de input_tokens; mide el ahorro de
+        # cuota. Para el path OpenAI ya los normalizamos en _openai_to_anthropic_response.
+        total_cache_read += usage.get("cache_read_input_tokens", 0)
+        total_cache_creation += usage.get("cache_creation_input_tokens", 0)
 
         tool_uses = [b for b in content if b.get("type") == "tool_use"]
         texts = [b.get("text", "") for b in content if b.get("type") == "text"]
@@ -539,6 +552,11 @@ async def _delegate_one_impl(
         "elapsed_s": round(elapsed, 1),
         "tokens_in": total_in,
         "tokens_out": total_out,
+        "cache_read_tokens": total_cache_read,
+        "cache_creation_tokens": total_cache_creation,
+        "cache_hit_pct": round(
+            100 * total_cache_read / (total_in + total_cache_read + total_cache_creation), 1
+        ) if (total_in + total_cache_read + total_cache_creation) else 0.0,
         "stop_reason": stop_reason,
         "hit_turn_limit": turn >= max_turns and bool(tool_uses),
     }
