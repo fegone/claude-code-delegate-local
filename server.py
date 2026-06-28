@@ -621,7 +621,7 @@ async def delegate_to_local_agent(
 # ────────────────────────────────────────────────────────────────────────────────
 # Tool batch: delegate_batch — N tasks en paralelo via asyncio.gather
 # ────────────────────────────────────────────────────────────────────────────────
-MAX_BATCH_SIZE = 4  # match typical local backend parallel slot count
+MAX_BATCH_SIZE = 4  # throughput sweet-spot for heavy coding (M1 Ultra GPU time-slices; >4 tanks per-agent tok/s). oMLX itself allows 8 concurrent so role services (Nicole/bot/pipeline) never queue behind the delegate's 4.
 
 
 @mcp.tool()
@@ -635,7 +635,7 @@ async def delegate_batch(
     en backends que soportan paralelismo nativo (e.g., llama.cpp con --parallel 4).
 
     USE WHEN you have multiple independent sub-tasks and your backend has parallel slots
-    available (typical local llama.cpp setup = 4 parallel slots). With same agent_name
+    available (delegate cap = 4 = heavy-coding throughput sweet-spot; oMLX allows 8). With same agent_name
     reused across tasks, you also benefit from KV cache prefix reuse on the shared system
     prompt (~30-50% prompt-processing savings).
 
