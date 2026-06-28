@@ -41,12 +41,14 @@ CODING_AGENTS = {"coder", "webdev", "backend", "devops", "frontend", "fullstack"
 CODING_MODEL = os.getenv("DELEGATE_LOCAL_CODING_MODEL", "ornith-coder")
 MODE_TAG = "MODE:LOCAL"
 # Default lowered from 25 (v0.4.0) to 15 (v0.4.1) after empirical validation:
-# MoE-A3B local backends with strict per-slot context (e.g., Qwen3.6 35B-A3B
-# with 262K per slot) hit context saturation at ~25 turns × ~10K tokens/turn.
-# 15 is the validated sweet spot for these backends.
-# For cloud backends (Sonnet/Opus, DeepSeek API), 25-30 is also safe and may
-# speed up complex sprints — pass max_turns=25 explicitly when calling.
-DEFAULT_MAX_TURNS = 15
+# MoE-A3B local backends with strict per-slot context (e.g., Ornith / Qwen3.6
+# 35B-A3B, 262K per slot). 15 was the old sweet spot, but coding agents with
+# thinking ON that must run tests and iterate (run jest -> fix mocks -> re-run)
+# burned all 15 turns generating and never reached the verify/fix phase.
+# 25 validated 2026-06-28 (TuFacturaRD miCpaController: 24/30 -> 36/36 green,
+# coder used only 12/25 turns, no context saturation).
+# For cloud backends (Sonnet/Opus, DeepSeek API), 25-30 is also safe.
+DEFAULT_MAX_TURNS = 25
 # Cloud backends (MiniMax M3, DeepSeek API, Sonnet/Opus) tienen contextos grandes
 # (M3 = 512K) y aguantan más turnos de análisis multi-archivo sin saturar.
 # Se resuelve por modelo en _delegate_one_impl cuando max_turns no se pasa explícito.
