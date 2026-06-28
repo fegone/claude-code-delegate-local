@@ -34,6 +34,11 @@ AGENTS_DIR = pathlib.Path(
 LITELLM_URL = os.getenv("DELEGATE_LOCAL_URL", "http://localhost:4000/v1/messages")
 LITELLM_KEY = os.getenv("DELEGATE_LOCAL_KEY", "")  # inyectado vía env desde Claude Code MCP config
 DEFAULT_MODEL = os.getenv("DELEGATE_LOCAL_MODEL", "local-qwen-3-6-35b")
+# Auto-route coding agents to a coder-tuned model (thinking ON). Applies only when
+# the caller does NOT pass model explicitly (i.e., model still == DEFAULT_MODEL).
+# Override the alias via env: DELEGATE_LOCAL_CODING_MODEL=ornith-coder.
+CODING_AGENTS = {"coder", "webdev", "backend", "devops", "frontend", "fullstack", "security"}
+CODING_MODEL = os.getenv("DELEGATE_LOCAL_CODING_MODEL", "ornith-coder")
 MODE_TAG = "MODE:LOCAL"
 # Default lowered from 25 (v0.4.0) to 15 (v0.4.1) after empirical validation:
 # MoE-A3B local backends with strict per-slot context (e.g., Qwen3.6 35B-A3B
@@ -427,9 +432,13 @@ async def _delegate_one_impl(
     Same arguments and return shape as delegate_to_local_agent. `ctx` is optional and only
     used when present (skipped in batch mode where nested progress reporting gets messy).
     """
+    # Auto-route coding agents to CODING_MODEL when caller didn't override model.
+    if model == DEFAULT_MODEL and agent_name.lower() in CODING_AGENTS:
+        model = CODING_MODEL
+
     # max_turns=0 (sentinel) => resolver por modelo: local 15, cloud 25.
     if not max_turns or max_turns <= 0:
-        max_turns = DEFAULT_MAX_TURNS if str(model).startswith("local-") else CLOUD_MAX_TURNS
+        max_turns = DEFAULT_MAX_TURNS if str(model).startswith(("local-", "ornith")) else CLOUD_MAX_TURNS
     max_turns = max(1, min(max_turns, HARD_MAX_TURNS))
 
     workdir_abs = os.path.abspath(workdir)
