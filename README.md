@@ -77,6 +77,7 @@ All env vars are optional; defaults assume a LiteLLM proxy on `localhost:4000`.
 | `DELEGATE_LOCAL_URL` | `http://localhost:4000/v1/messages` | Anthropic-format endpoint. For OpenAI-format models, the server auto-converts the URL to `/v1/chat/completions`. |
 | `DELEGATE_LOCAL_KEY` | `""` | Bearer token / API key. Sent as both `x-api-key` and `Authorization: Bearer`. |
 | `DELEGATE_LOCAL_MODEL` | `local-qwen-3-6-35b` | Default model alias if the caller doesn't specify one. |
+| `DELEGATE_LOCAL_CODING_MODEL` | *(= `DELEGATE_LOCAL_MODEL`)* | Opt-in: coding agents (`coder`, `webdev`, `backend`, `devops`, `frontend`, `fullstack`, `security`) auto-route to this alias when the caller doesn't pass a model. Defaults to `DELEGATE_LOCAL_MODEL` (no rewrite). Set it to a coder-tuned alias to split coding onto a different model. **Must be an alias your backend actually serves** — otherwise coding agents fail with "model not found". |
 | `DELEGATE_LOCAL_AGENTS_DIR` | `~/.claude/agents` | Where to look for global agent definitions. |
 
 See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for full details and example setups with LiteLLM, llama.cpp, Ollama, DeepSeek direct, and AWS Bedrock.

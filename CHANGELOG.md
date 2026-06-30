@@ -4,6 +4,14 @@ All notable changes to `delegate-local` are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+- **Coding agents no longer fail with "model not found" on backends that don't serve a hardcoded coding alias.** The coding-agent auto-route previously defaulted to a fixed alias, which was sent to any backend (e.g. GLM/Z.ai via `/v1/messages`) and rejected.
+
+### Changed
+- **Coding-agent auto-route is now opt-in and provider-agnostic.** `DELEGATE_LOCAL_CODING_MODEL` defaults to `DELEGATE_LOCAL_MODEL` (no rewrite). Set it to a coder-tuned alias **that your backend actually serves** to split coding onto a different model. Removed vendor-specific defaults from `server.py`.
+
 ## [0.6.1] — 2026-06-17
 
 ### Added

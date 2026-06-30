@@ -34,20 +34,18 @@ AGENTS_DIR = pathlib.Path(
 LITELLM_URL = os.getenv("DELEGATE_LOCAL_URL", "http://localhost:4000/v1/messages")
 LITELLM_KEY = os.getenv("DELEGATE_LOCAL_KEY", "")  # inyectado vía env desde Claude Code MCP config
 DEFAULT_MODEL = os.getenv("DELEGATE_LOCAL_MODEL", "local-qwen-3-6-35b")
-# Auto-route coding agents to a coder-tuned model (thinking ON). Applies only when
-# the caller does NOT pass model explicitly (i.e., model still == DEFAULT_MODEL).
-# Override the alias via env: DELEGATE_LOCAL_CODING_MODEL=ornith-coder.
+# Optional: auto-route coding agents to a coder-tuned alias when the caller does
+# NOT pass model explicitly (i.e., model still == DEFAULT_MODEL). OPT-IN — defaults
+# to DEFAULT_MODEL, so nothing is rewritten unless you set a distinct alias via env:
+#   DELEGATE_LOCAL_CODING_MODEL=<your-coding-model>
 CODING_AGENTS = {"coder", "webdev", "backend", "devops", "frontend", "fullstack", "security"}
-CODING_MODEL = os.getenv("DELEGATE_LOCAL_CODING_MODEL", "ornith-coder")
+CODING_MODEL = os.getenv("DELEGATE_LOCAL_CODING_MODEL", DEFAULT_MODEL)
 MODE_TAG = "MODE:LOCAL"
-# Default lowered from 25 (v0.4.0) to 15 (v0.4.1) after empirical validation:
-# MoE-A3B local backends with strict per-slot context (e.g., Ornith / Qwen3.6
-# 35B-A3B, 262K per slot). 15 was the old sweet spot, but coding agents with
-# thinking ON that must run tests and iterate (run jest -> fix mocks -> re-run)
-# burned all 15 turns generating and never reached the verify/fix phase.
-# 25 validated 2026-06-28 (TuFacturaRD miCpaController: 24/30 -> 36/36 green,
-# coder used only 12/25 turns, no context saturation).
-# For cloud backends (Sonnet/Opus, DeepSeek API), 25-30 is also safe.
+# Empirically tuned: coding agents with thinking ON that must run tests and iterate
+# (run tests -> fix -> re-run) burn through a low turn budget generating and never
+# reach the verify/fix phase. 25 gives room without context saturation. Cloud
+# backends (large context, e.g. MiniMax M3 512K, DeepSeek API, Sonnet/Opus) are
+# also fine at 25-30.
 DEFAULT_MAX_TURNS = 25
 # Cloud backends (MiniMax M3, DeepSeek API, Sonnet/Opus) tienen contextos grandes
 # (M3 = 512K) y aguantan más turnos de análisis multi-archivo sin saturar.
@@ -440,7 +438,7 @@ async def _delegate_one_impl(
 
     # max_turns=0 (sentinel) => resolver por modelo: local 15, cloud 25.
     if not max_turns or max_turns <= 0:
-        max_turns = DEFAULT_MAX_TURNS if str(model).startswith(("local-", "ornith")) else CLOUD_MAX_TURNS
+        max_turns = DEFAULT_MAX_TURNS if str(model).startswith("local-") else CLOUD_MAX_TURNS
     max_turns = max(1, min(max_turns, HARD_MAX_TURNS))
 
     workdir_abs = os.path.abspath(workdir)
