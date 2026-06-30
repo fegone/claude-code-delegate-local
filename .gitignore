@@ -12,3 +12,9 @@ wheels/
 # Backups locales (no commitear)
 *.bak-*
 *.bak.*
+
+# Scratch: Ornith probe/calibration scripts (Felix 2026-06-28, leen keys en runtime)
+probe_ornith.py
+test_coder_ornith_seq.py
+delegate_results.json
+jest_final.txt

@@ -34,14 +34,21 @@ AGENTS_DIR = pathlib.Path(
 LITELLM_URL = os.getenv("DELEGATE_LOCAL_URL", "http://localhost:4000/v1/messages")
 LITELLM_KEY = os.getenv("DELEGATE_LOCAL_KEY", "")  # inyectado vía env desde Claude Code MCP config
 DEFAULT_MODEL = os.getenv("DELEGATE_LOCAL_MODEL", "local-qwen-3-6-35b")
+# Auto-route coding agents to a coder-tuned model (thinking ON). Applies only when
+# the caller does NOT pass model explicitly (i.e., model still == DEFAULT_MODEL).
+# Override the alias via env: DELEGATE_LOCAL_CODING_MODEL=ornith-coder.
+CODING_AGENTS = {"coder", "webdev", "backend", "devops", "frontend", "fullstack", "security"}
+CODING_MODEL = os.getenv("DELEGATE_LOCAL_CODING_MODEL", "ornith-coder")
 MODE_TAG = "MODE:LOCAL"
 # Default lowered from 25 (v0.4.0) to 15 (v0.4.1) after empirical validation:
-# MoE-A3B local backends with strict per-slot context (e.g., Qwen3.6 35B-A3B
-# with 262K per slot) hit context saturation at ~25 turns × ~10K tokens/turn.
-# 15 is the validated sweet spot for these backends.
-# For cloud backends (Sonnet/Opus, DeepSeek API), 25-30 is also safe and may
-# speed up complex sprints — pass max_turns=25 explicitly when calling.
-DEFAULT_MAX_TURNS = 15
+# MoE-A3B local backends with strict per-slot context (e.g., Ornith / Qwen3.6
+# 35B-A3B, 262K per slot). 15 was the old sweet spot, but coding agents with
+# thinking ON that must run tests and iterate (run jest -> fix mocks -> re-run)
+# burned all 15 turns generating and never reached the verify/fix phase.
+# 25 validated 2026-06-28 (TuFacturaRD miCpaController: 24/30 -> 36/36 green,
+# coder used only 12/25 turns, no context saturation).
+# For cloud backends (Sonnet/Opus, DeepSeek API), 25-30 is also safe.
+DEFAULT_MAX_TURNS = 25
 # Cloud backends (MiniMax M3, DeepSeek API, Sonnet/Opus) tienen contextos grandes
 # (M3 = 512K) y aguantan más turnos de análisis multi-archivo sin saturar.
 # Se resuelve por modelo en _delegate_one_impl cuando max_turns no se pasa explícito.
@@ -427,9 +434,13 @@ async def _delegate_one_impl(
     Same arguments and return shape as delegate_to_local_agent. `ctx` is optional and only
     used when present (skipped in batch mode where nested progress reporting gets messy).
     """
+    # Auto-route coding agents to CODING_MODEL when caller didn't override model.
+    if model == DEFAULT_MODEL and agent_name.lower() in CODING_AGENTS:
+        model = CODING_MODEL
+
     # max_turns=0 (sentinel) => resolver por modelo: local 15, cloud 25.
     if not max_turns or max_turns <= 0:
-        max_turns = DEFAULT_MAX_TURNS if str(model).startswith("local-") else CLOUD_MAX_TURNS
+        max_turns = DEFAULT_MAX_TURNS if str(model).startswith(("local-", "ornith")) else CLOUD_MAX_TURNS
     max_turns = max(1, min(max_turns, HARD_MAX_TURNS))
 
     workdir_abs = os.path.abspath(workdir)
@@ -621,7 +632,7 @@ async def delegate_to_local_agent(
 # ────────────────────────────────────────────────────────────────────────────────
 # Tool batch: delegate_batch — N tasks en paralelo via asyncio.gather
 # ────────────────────────────────────────────────────────────────────────────────
-MAX_BATCH_SIZE = 4  # match typical local backend parallel slot count
+MAX_BATCH_SIZE = 4  # throughput sweet-spot for heavy coding (M1 Ultra GPU time-slices; >4 tanks per-agent tok/s). oMLX itself allows 8 concurrent so role services (Nicole/bot/pipeline) never queue behind the delegate's 4.
 
 
 @mcp.tool()
@@ -635,7 +646,7 @@ async def delegate_batch(
     en backends que soportan paralelismo nativo (e.g., llama.cpp con --parallel 4).
 
     USE WHEN you have multiple independent sub-tasks and your backend has parallel slots
-    available (typical local llama.cpp setup = 4 parallel slots). With same agent_name
+    available (delegate cap = 4 = heavy-coding throughput sweet-spot; oMLX allows 8). With same agent_name
     reused across tasks, you also benefit from KV cache prefix reuse on the shared system
     prompt (~30-50% prompt-processing savings).
 
