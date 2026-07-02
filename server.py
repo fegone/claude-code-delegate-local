@@ -630,7 +630,7 @@ async def delegate_to_local_agent(
 # ────────────────────────────────────────────────────────────────────────────────
 # Tool batch: delegate_batch — N tasks en paralelo via asyncio.gather
 # ────────────────────────────────────────────────────────────────────────────────
-MAX_BATCH_SIZE = 4  # throughput sweet-spot for heavy coding (M1 Ultra GPU time-slices; >4 tanks per-agent tok/s). oMLX itself allows 8 concurrent so role services (Nicole/bot/pipeline) never queue behind the delegate's 4.
+MAX_BATCH_SIZE = 2  # Felix rule 2026-07-02: oMLX runs max-concurrent=3 (single instance, threadgroup patch); 1 slot stays reserved for day-to-day (Nicole/bot/pipeline) -> coding uses at most 2. A 3rd+ coding task queues at oMLX (safe) but discipline = 2.
 
 
 @mcp.tool()
