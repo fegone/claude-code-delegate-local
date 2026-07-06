@@ -113,14 +113,14 @@ model_list:
       input_cost_per_token: 0.0
       output_cost_per_token: 0.0
 
-  - model_name: glm-coding-plan-max    # thinking on, budget 32K — hard problems only (multi-system, concurrency, differential correctness)
+  - model_name: glm-coding-plan-max    # thinking on, budget 64K — hard problems only (multi-system, concurrency, differential correctness)
     litellm_params:
       model: "anthropic/glm-5.2"
       api_base: https://api.z.ai/api/anthropic
       api_key: os.environ/ZAI_API_KEY
       thinking:
         type: enabled
-        budget_tokens: 32000               # request must set max_tokens > budget_tokens
+        budget_tokens: 64000               # request must set max_tokens > budget_tokens (e.g. 90000) — the delegate's own 65536 default is NOT enough headroom at this budget
       input_cost_per_token: 0.0
       output_cost_per_token: 0.0
 
