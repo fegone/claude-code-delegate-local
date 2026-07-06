@@ -39,17 +39,40 @@ model_list:
 
   # ═══════════════════════════════════════════════════════════════════════════
   # DEEPSEEK — cloud, needs API key from platform.deepseek.com
+  # deepseek-chat/deepseek-reasoner are DEPRECATED (removed 2026-07-24) — use the
+  # v4 model ids below. Thinking is now a RUNTIME PARAMETER (extra_body.thinking +
+  # reasoning_effort), not a separate model. deepseek-v4-pro reasons even with no
+  # extra_body set, so pin reasoning_effort explicitly rather than relying on the
+  # implicit default. ⚠️ Use the `deepseek/` provider prefix, NOT `openai/` — with
+  # `openai/` LiteLLM 1.83.9 bridges /v1/messages (the Anthropic-format route this
+  # MCP uses) through the Responses API, which DeepSeek's endpoint doesn't
+  # implement → silent 404 with an empty message. `deepseek/` uses chat/completions
+  # under the hood and maps reasoning_content → an Anthropic `thinking` block
+  # correctly. Verified live 2026-07-06.
   # ═══════════════════════════════════════════════════════════════════════════
 
-  - model_name: deepseek-v4-flash     # fast, non-thinking, ~$0.01/test
+  - model_name: deepseek-v4-flash     # fast, non-thinking, cheapest
     litellm_params:
-      model: deepseek/deepseek-chat
+      model: deepseek/deepseek-v4-flash
       api_key: os.environ/DEEPSEEK_API_KEY
 
-  - model_name: deepseek-v4-pro       # thinking mode, more capable, ~$0.013/test
+  - model_name: deepseek-v4-pro       # reasoning_effort: high, explicit — no ambiguous "default" tier
     litellm_params:
-      model: deepseek/deepseek-reasoner
+      model: deepseek/deepseek-v4-pro
       api_key: os.environ/DEEPSEEK_API_KEY
+      extra_body:
+        thinking:
+          type: enabled
+        reasoning_effort: high
+
+  - model_name: deepseek-v4-pro-max   # deepest reasoning — only for genuinely hard problems (slower, more tokens)
+    litellm_params:
+      model: deepseek/deepseek-v4-pro
+      api_key: os.environ/DEEPSEEK_API_KEY
+      extra_body:
+        thinking:
+          type: enabled
+        reasoning_effort: max
 
   # ═══════════════════════════════════════════════════════════════════════════
   # Z.AI — GLM CODING PLAN (flat-rate subscription, Anthropic-compatible endpoint)
@@ -58,15 +81,71 @@ model_list:
   # automatic server-side (no config needed). To activate: export ZAI_API_KEY and
   # restart LiteLLM. The alias has no openai/gpt/deepseek/qwen prefix, so this MCP
   # routes it via /v1/messages (Anthropic format) — which matches this endpoint.
+  #
+  # Three reasoning tiers, ALL still inside the flat-rate plan ($0 extra token
+  # cost) — thinking is controlled with a real Anthropic-format `thinking` block +
+  # numeric `budget_tokens`, not `reasoning_effort` (that param only exists on
+  # Z.ai's separate pay-as-you-go /api/paas/v4 endpoint — don't route there for
+  # this, it defeats the point of the flat plan). Verified live 2026-07-06.
+  # ⚠️ TESTING GOTCHA: verify thinking via a request to `/v1/messages` (Anthropic
+  # format). LiteLLM's `drop_params: true` silently strips `thinking` when the
+  # request comes in via `/v1/chat/completions` (OpenAI format) and translates to
+  # this Anthropic-native endpoint — you'll get a false negative ("no thinking
+  # block") even though the config is correct.
   # ═══════════════════════════════════════════════════════════════════════════
 
-  - model_name: glm-coding-plan
+  - model_name: glm-coding-plan       # no thinking — fast, for mechanical/CRUD work
     litellm_params:
       model: "anthropic/glm-5.2"          # verified live in LiteLLM. The [1m] (1M) suffix errors against the Z.ai Anthropic endpoint here — use plain glm-5.2.
       api_base: https://api.z.ai/api/anthropic
       api_key: os.environ/ZAI_API_KEY
       input_cost_per_token: 0.0           # coding plan = flat rate, not per-token
       output_cost_per_token: 0.0
+
+  - model_name: glm-coding-plan-think  # thinking on, budget 16K — debugging / architecture / subtle correctness
+    litellm_params:
+      model: "anthropic/glm-5.2"
+      api_base: https://api.z.ai/api/anthropic
+      api_key: os.environ/ZAI_API_KEY
+      thinking:
+        type: enabled
+        budget_tokens: 16000
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+
+  - model_name: glm-coding-plan-max    # thinking on, budget 64K — hard problems only (multi-system, concurrency, differential correctness)
+    litellm_params:
+      model: "anthropic/glm-5.2"
+      api_base: https://api.z.ai/api/anthropic
+      api_key: os.environ/ZAI_API_KEY
+      thinking:
+        type: enabled
+        budget_tokens: 64000               # request must set max_tokens > budget_tokens (e.g. 90000) — the delegate's own 65536 default is NOT enough headroom at this budget
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # MINIMAX M3 — cloud, 1M context, native multimodal. Needs api.minimax.io key.
+  # M3's thinking is a 3-way toggle (enabled/adaptive/disabled), not a 2-tier
+  # high/max effort like GLM/DeepSeek — and it's ON by default when omitted. Pin
+  # it explicitly rather than relying on the implicit default.
+  # ⚠️ GOTCHA: keep the `openai/` provider prefix here. Switching to the native
+  # `minimax/` provider (which DOES fix the same issue for DeepSeek) instead
+  # BREAKS the /v1/messages route entirely for M3 (hard 404) — verified live
+  # 2026-07-06, reverted immediately. Reasoning still happens with `openai/` (visible
+  # via reasoning_content over /v1/chat/completions), it just arrives inline inside
+  # the text block instead of a separate `thinking` block over /v1/messages —
+  # functionally fine, cosmetic only.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  - model_name: minimax-m3
+    litellm_params:
+      model: openai/MiniMax-M3
+      api_base: https://api.minimax.io/v1
+      api_key: os.environ/MINIMAX_API_KEY
+      extra_body:
+        thinking:
+          type: enabled
 
   # ═══════════════════════════════════════════════════════════════════════════
   # OPENAI / OPENROUTER
