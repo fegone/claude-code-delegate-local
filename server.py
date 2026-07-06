@@ -52,6 +52,26 @@ DEFAULT_MAX_TURNS = 25
 # Se resuelve por modelo en _delegate_one_impl cuando max_turns no se pasa explícito.
 CLOUD_MAX_TURNS = 25
 HARD_MAX_TURNS = 40
+# Real-world finding (2026-07-06 benchmark): a deep-reasoning "-max" tier alias
+# (e.g. deepseek-v4-pro-max, glm-coding-plan-max) can burn its ENTIRE max_tokens
+# budget on thinking before emitting any usable output — with DeepSeek this once
+# meant 0 tool calls and an empty final_response at the 65536 default. Callers
+# forgetting to pass a bigger max_tokens for a "-max" dispatch is a silent-failure
+# footgun, not a real capability gap (verified: both models solved the same task
+# fine once given enough budget). Auto-bump the default for any model alias whose
+# name signals maximum reasoning effort, so this doesn't depend on remembering.
+DEFAULT_MAX_TOKENS = 65536
+MAX_TIER_MAX_TOKENS = 150_000
+MAX_TIER_SUFFIXES = ("-max",)  # extend here if new "-max"-style aliases appear
+
+
+def _resolve_max_tokens(model: str, max_tokens: int | None) -> int:
+    """None (caller didn't pass one) => model-aware default; explicit value always wins."""
+    if max_tokens is not None:
+        return max_tokens
+    if isinstance(model, str) and model.lower().endswith(MAX_TIER_SUFFIXES):
+        return MAX_TIER_MAX_TOKENS
+    return DEFAULT_MAX_TOKENS
 # read_file: tope de chars devueltos por lectura. Por encima, el agente debe paginar
 # con offset/limit (NO re-leer lo mismo). Subido de 8000 para que archivos grandes
 # (controllers de 600-900 líneas) se puedan leer por rangos de verdad.
@@ -245,8 +265,17 @@ _OPENAI_FORMAT_PREFIXES: tuple[str, ...] = (
     "qwen-",  # qwen externos vía API (qwen local-* va por messages, ya funciona)
     "minimax-",   # MiniMax M3 — OpenAI-compatible; ruta nativa /v1/chat/completions
     "moonshot-",  # Kimi
-    "glm-",       # Zhipu GLM
     "kimi-",
+    # NOTA: "glm-" fue removido de esta lista (2026-07-06) — Z.ai's GLM Coding Plan
+    # está configurado en litellm_params contra el endpoint ANTHROPIC-NATIVO de Z.ai
+    # (api_base: https://api.z.ai/api/anthropic, model: anthropic/glm-5.2), no un
+    # endpoint OpenAI-compatible. Forzar glm-* por /v1/chat/completions hace que
+    # LiteLLM traduzca OpenAI->Anthropic con drop_params:true, que descarta
+    # silenciosamente el `thinking` configurado en el alias — glm-coding-plan-think
+    # y -max dejaban de razonar de verdad sin dar error (verificado: 211 vs 196
+    # completion_tokens entre think/plain, sin diferencia real). Sin el prefijo,
+    # glm-* cae en la rama /v1/messages (Anthropic-nativo) donde el thinking del
+    # alias SÍ se aplica (verificado: bloque `thinking` real, miles de chars).
 )
 
 
@@ -422,7 +451,7 @@ async def _delegate_one_impl(
     workdir: str = ".",
     max_turns: int = 0,
     model: str = DEFAULT_MODEL,
-    max_tokens: int = 65536,
+    max_tokens: int | None = None,
     ctx: Context | None = None,
 ) -> dict:
     """
@@ -440,6 +469,10 @@ async def _delegate_one_impl(
     if not max_turns or max_turns <= 0:
         max_turns = DEFAULT_MAX_TURNS if str(model).startswith("local-") else CLOUD_MAX_TURNS
     max_turns = max(1, min(max_turns, HARD_MAX_TURNS))
+
+    # max_tokens=None (sentinel) => resolver por alias: "-max" tiers get more headroom
+    # so deep reasoning doesn't eat the whole budget with nothing left to answer with.
+    max_tokens = _resolve_max_tokens(model, max_tokens)
 
     workdir_abs = os.path.abspath(workdir)
     if not os.path.isdir(workdir_abs):
@@ -581,7 +614,7 @@ async def delegate_to_local_agent(
     workdir: str = ".",
     max_turns: int = 0,
     model: str = DEFAULT_MODEL,
-    max_tokens: int = 65536,
+    max_tokens: int | None = None,
     ctx: Context | None = None,
 ) -> dict:
     """
@@ -607,10 +640,12 @@ async def delegate_to_local_agent(
                Para review/análisis multi-archivo pesado en cloud: 25-30.
         model: Model alias as configured in your LiteLLM proxy (or direct provider).
                Default 'local-qwen-3-6-35b'. Override via DELEGATE_LOCAL_MODEL env var.
-        max_tokens: Tope de tokens por turno del modelo. Default 65536, ajustar si el
-               backend tiene un cap menor o si necesitas más para outputs muy grandes.
-               Modelos en thinking mode (DeepSeek V4, o1-style) consumen 2-8K solo para
-               reasoning antes de emitir contenido, por eso el default es alto.
+        max_tokens: Tope de tokens por turno del modelo. Default = 65536, EXCEPTO si
+               `model` termina en "-max" (p.ej. glm-coding-plan-max, deepseek-v4-pro-max)
+               -> default sube a 150000 automático. Motivo: en deep-reasoning tiers el
+               modelo puede gastar TODO el budget pensando y no dejar nada para la
+               respuesta (verificado: deepseek-v4-pro-max con 32K devolvió 0 tool_calls,
+               respuesta vacía). Pasar un valor explícito siempre gana sobre el auto-bump.
 
     Returns:
         dict con keys: success, final_response, turns, tool_calls, malformed_calls,
@@ -724,7 +759,7 @@ async def delegate_batch(
                 workdir=t.get("workdir", "."),
                 max_turns=t.get("max_turns", 0),
                 model=t.get("model", DEFAULT_MODEL),
-                max_tokens=t.get("max_tokens", 65536),
+                max_tokens=t.get("max_tokens"),  # None sentinel -> _delegate_one_impl resolves by alias
                 ctx=None,  # nested per-task progress reporting omitted in batch
             )
         except Exception as e:
@@ -832,7 +867,7 @@ async def delegate_to_provider(
     task: str,
     workdir: str = ".",
     max_turns: int = DEFAULT_MAX_TURNS,
-    max_tokens: int = 65536,
+    max_tokens: int | None = None,
     mode_tag: str = "MODE:LOCAL",
     ctx: Context | None = None,
 ) -> dict:
