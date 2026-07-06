@@ -221,6 +221,28 @@ mcp__delegate-local__delegate_to_local_agent(
 
 ---
 
+## Reasoning tiers (GLM / DeepSeek / MiniMax) — dispatch by difficulty, not by default
+
+All three cloud coding providers support extended thinking, but the API shape differs per provider, and getting it wrong gives a **false negative** (looks off when it's actually configured right) or, worse, silently breaks routing. This section is the accumulated, live-verified truth (2026-07-06) — read it before touching any of these blocks.
+
+**Why tiers at all:** a plain/no-thinking model handles mechanical work (CRUD, renames, well-specified fixes) just as well as a thinking model, faster and cheaper. Thinking earns its cost on debugging root-cause, architecture/design tradeoffs, and correctness that's easy to get subtly wrong (backtracking, concurrency, differential logic). Route each sub-task to the cheapest tier that can actually solve it — don't default everything to max.
+
+### GLM (`examples/litellm.example.yaml` → `glm-coding-plan` / `-think` / `-max`)
+- Uses the **Anthropic-format `thinking` block** with a numeric `budget_tokens` (2000–32000+), same shape as Claude's own extended thinking — because it rides Z.ai's Anthropic-compatible endpoint.
+- All three tiers stay on the **same flat-rate Coding Plan endpoint** (`/api/anthropic`) — thinking does NOT cost extra tokens outside the plan. Do not be tempted to reach for Z.ai's separate pay-as-you-go `/api/paas/v4` endpoint (which uses `reasoning_effort: high|max` instead) thinking you need it for effort control — you don't, and it silently moves you off the flat plan.
+- ⚠️ **Test thinking via `/v1/messages`, never `/v1/chat/completions`.** LiteLLM's `drop_params: true` strips the `thinking` param when a request arrives in OpenAI format and gets translated to this Anthropic-native endpoint. You'll see zero `reasoning_tokens` and conclude thinking is broken — it isn't, you're testing the wrong route. `/v1/messages` (Anthropic-native, what this MCP actually uses) passes it through correctly, both from the request body and injected via the alias's `litellm_params`.
+
+### DeepSeek V4 (`deepseek-v4-pro` / `-max`, plus `deepseek-v4-flash`)
+- `deepseek-chat` / `deepseek-reasoner` are **deprecated, removed 2026-07-24** — use `deepseek-v4-flash` / `deepseek-v4-pro` model ids. Thinking moved from "pick a different model" to a runtime parameter: `extra_body: {thinking: {type: enabled}, reasoning_effort: high|max}`.
+- `deepseek-v4-pro` reasons even with nothing set (implicit default) — don't rely on that. Pin `reasoning_effort: high` explicitly on the base alias so there's no ambiguous tier, and add a `-max` alias for the hardest problems.
+- ⚠️ **Use the `deepseek/` provider prefix, not `openai/`.** With `openai/MODEL`, LiteLLM 1.83.9 bridges `/v1/messages` through the Responses API — which DeepSeek's endpoint doesn't implement, giving a silent 404 (`NotFoundError`, empty message) that's easy to misdiagnose as a config problem. `deepseek/` uses `/chat/completions` under the hood and correctly maps `reasoning_content` into an Anthropic `thinking` block on `/v1/messages`.
+
+### MiniMax M3 (`minimax-m3`)
+- Simpler API: `thinking: {type: enabled|adaptive|disabled}` (no high/max effort levels). Default when omitted is already ON (`adaptive`) — pin `enabled` explicitly anyway, for the same "no ambiguous default" reason as DeepSeek.
+- ⚠️ **Do NOT switch this one to the native `minimax/` provider prefix.** It seems like the natural fix (parallel to the DeepSeek `deepseek/` fix above), but it breaks `/v1/messages` entirely for M3 — hard 404, worse than the original problem. Keep `openai/MiniMax-M3`. Reasoning still happens (verifiable via `reasoning_content` over `/v1/chat/completions`) — over `/v1/messages` it just arrives inline in the text block instead of a separate `thinking` block. Cosmetic, not a functional loss.
+
+---
+
 ## Supported backends
 
 ### LiteLLM proxy (recommended for multi-provider)
@@ -242,16 +264,22 @@ model_list:
       api_base: http://localhost:8000/v1
       api_key: sk-no-key-required
 
-  # DeepSeek
+  # DeepSeek — deepseek-chat/deepseek-reasoner deprecated 2026-07-24, use v4 ids.
+  # Use the `deepseek/` prefix, not `openai/` (openai/ 404s on /v1/messages — see
+  # the Reasoning tiers section above).
   - model_name: deepseek-v4-flash
     litellm_params:
-      model: deepseek/deepseek-chat
+      model: deepseek/deepseek-v4-flash
       api_key: os.environ/DEEPSEEK_API_KEY
 
   - model_name: deepseek-v4-pro
     litellm_params:
-      model: deepseek/deepseek-reasoner
+      model: deepseek/deepseek-v4-pro
       api_key: os.environ/DEEPSEEK_API_KEY
+      extra_body:
+        thinking:
+          type: enabled
+        reasoning_effort: high
 
   # AWS Bedrock
   - model_name: bedrock-sonnet-4-6
@@ -311,7 +339,7 @@ If you want to skip LiteLLM and hit DeepSeek directly, use `delegate_to_provider
 mcp__delegate-local__delegate_to_provider(
     provider_url="https://api.deepseek.com/v1/messages",
     api_key="sk-your-deepseek-key",
-    model="deepseek-chat",
+    model="deepseek-v4-flash",  # or deepseek-v4-pro — deepseek-chat/deepseek-reasoner are deprecated (removed 2026-07-24)
     agent_name="webdev",
     task="implement X",
 )

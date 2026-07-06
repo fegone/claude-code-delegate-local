@@ -6,8 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Three-tier reasoning ladder for GLM, DeepSeek V4, and MiniMax M3** in `examples/litellm.example.yaml`, so you can dispatch by difficulty instead of defaulting everything to one setting: `glm-coding-plan` / `-think` (16K budget) / `-max` (32K budget) — all on the same flat-rate plan endpoint, thinking costs $0 extra; `deepseek-v4-pro` (reasoning_effort: high, explicit) / `-max` (effort: max); `minimax-m3` (thinking: enabled, explicit — M3 has no high/max tiers, just enabled/adaptive/disabled). New "Reasoning tiers" section in `docs/CONFIGURATION.md` documents the pattern and every gotcha found getting it working end-to-end.
+
 ### Fixed
+- **DeepSeek routing was silently broken for anyone testing/using it over `/v1/messages`** (the Anthropic-format route this MCP actually uses). With the `openai/` provider prefix, LiteLLM 1.83.9 bridges that route through the Responses API, which DeepSeek's endpoint doesn't implement — a silent 404 that looked like a config problem. Fixed by switching to the native `deepseek/` provider prefix. Also updated the deprecated `deepseek-chat`/`deepseek-reasoner` model ids (removed 2026-07-24) to `deepseek-v4-flash`/`deepseek-v4-pro`.
 - **Coding agents no longer fail with "model not found" on backends that don't serve a hardcoded coding alias.** The coding-agent auto-route previously defaulted to a fixed alias, which was sent to any backend (e.g. GLM/Z.ai via `/v1/messages`) and rejected.
+
+### Notes (gotchas worth knowing, no code change)
+- **Test GLM/DeepSeek thinking via `/v1/messages`, never `/v1/chat/completions`.** LiteLLM's `drop_params: true` silently strips the `thinking` param when a request comes in OpenAI-format and gets translated to an Anthropic-native endpoint — you'll see zero reasoning tokens and wrongly conclude thinking is broken.
+- **Don't apply the DeepSeek `deepseek/`-provider fix to MiniMax.** Switching `minimax-m3` to the native `minimax/` prefix (instead of `openai/`) breaks `/v1/messages` entirely for M3 (hard 404) — tried and reverted live, 2026-07-06.
 
 ### Changed
 - **Coding-agent auto-route is now opt-in and provider-agnostic.** `DELEGATE_LOCAL_CODING_MODEL` defaults to `DELEGATE_LOCAL_MODEL` (no rewrite). Set it to a coder-tuned alias **that your backend actually serves** to split coding onto a different model. Removed vendor-specific defaults from `server.py`.
