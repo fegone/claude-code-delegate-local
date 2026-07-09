@@ -316,6 +316,7 @@ _OPENAI_FORMAT_PREFIXES: tuple[str, ...] = (
     "minimax-",   # MiniMax M3 — OpenAI-compatible; ruta nativa /v1/chat/completions
     "moonshot-",  # Kimi
     "kimi-",
+    "grok-",      # xAI Grok — OpenAI-compatible (api.x.ai/v1); ruta nativa /v1/chat/completions
     # NOTA: "glm-" fue removido de esta lista (2026-07-06) — Z.ai's GLM Coding Plan
     # está configurado en litellm_params contra el endpoint ANTHROPIC-NATIVO de Z.ai
     # (api_base: https://api.z.ai/api/anthropic, model: anthropic/glm-5.2), no un
