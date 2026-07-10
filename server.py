@@ -64,14 +64,64 @@ DEFAULT_MAX_TOKENS = 65536
 MAX_TIER_MAX_TOKENS = 150_000
 MAX_TIER_SUFFIXES = ("-max",)  # extend here if new "-max"-style aliases appear
 
+# Hard per-provider output-token ceilings. A provider REJECTS a request whose
+# max_tokens exceeds its cap, so the "-max" auto-bump above (and any over-eager
+# explicit value) must be clamped to the target provider's limit. Verified live
+# 2026-07-08: GLM/Z.ai (Anthropic endpoint) returns error 1210 "range [1,131072]"
+# for max_tokens > 131072; DeepSeek V4 accepted 200000 without error → no cap here.
+# Keyed by alias prefix; models not listed are treated as unbounded/unknown.
+PROVIDER_MAX_TOKENS_CAP = {
+    "glm-": 131_072,  # GLM-5.2 via Z.ai Anthropic-native endpoint
+}
+
+
+def _provider_max_tokens_cap(model: str) -> int | None:
+    """The hard output-token ceiling for a model's provider, or None if unbounded/unknown."""
+    if not isinstance(model, str):
+        return None
+    m = model.lower()
+    for prefix, cap in PROVIDER_MAX_TOKENS_CAP.items():
+        if m.startswith(prefix):
+            return cap
+    return None
+
 
 def _resolve_max_tokens(model: str, max_tokens: int | None) -> int:
-    """None (caller didn't pass one) => model-aware default; explicit value always wins."""
-    if max_tokens is not None:
-        return max_tokens
-    if isinstance(model, str) and model.lower().endswith(MAX_TIER_SUFFIXES):
-        return MAX_TIER_MAX_TOKENS
-    return DEFAULT_MAX_TOKENS
+    """None (caller didn't pass one) => model-aware default; explicit value otherwise.
+    Either way the result is clamped to the provider's hard cap so a "-max" auto-bump
+    (or an over-eager explicit value) can't trigger a provider rejection (GLM 1210)."""
+    if max_tokens is None:
+        if isinstance(model, str) and model.lower().endswith(MAX_TIER_SUFFIXES):
+            max_tokens = MAX_TIER_MAX_TOKENS
+        else:
+            max_tokens = DEFAULT_MAX_TOKENS
+    cap = _provider_max_tokens_cap(model)
+    if cap is not None and max_tokens > cap:
+        max_tokens = cap
+    return max_tokens
+
+
+# Backend transient-error retry policy. Only RETRYABLE_STATUS + network timeouts get
+# retried; 4xx (bad payload/auth, incl. GLM's 1210 max_tokens error) are deterministic
+# config bugs and fail fast so retries don't burn time/quota. Backoff = per-attempt
+# seconds; a server Retry-After header (when present) overrides the backoff. Retries
+# matter most for the cloud externals (429 rate-limits, transient 5xx) where a single
+# blip would otherwise discard a whole multi-turn dispatch (and, for pay-per-token
+# providers, the thinking tokens already billed).
+BACKEND_MAX_RETRIES = 3
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+RETRY_BACKOFF = (1.0, 2.0, 4.0, 8.0)
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Parse a Retry-After header (seconds form) into a capped float, or None."""
+    val = response.headers.get("retry-after")
+    if not val:
+        return None
+    try:
+        return min(float(val), 30.0)
+    except (TypeError, ValueError):
+        return None
 # read_file: tope de chars devueltos por lectura. Por encima, el agente debe paginar
 # con offset/limit (NO re-leer lo mismo). Subido de 8000 para que archivos grandes
 # (controllers de 600-900 líneas) se puedan leer por rangos de verdad.
@@ -524,18 +574,47 @@ async def _delegate_one_impl(
                 message=f"agent '{agent_name}' turn {turn}/{max_turns}",
             )
 
-        try:
-            resp = await _call_backend(messages, full_system, model, tools=AGENT_TOOLS, max_tokens=max_tokens)
-        except httpx.HTTPStatusError as e:
+        resp = None
+        last_transient = None
+        for attempt in range(BACKEND_MAX_RETRIES + 1):
+            try:
+                resp = await _call_backend(messages, full_system, model, tools=AGENT_TOOLS, max_tokens=max_tokens)
+                break
+            except httpx.HTTPStatusError as e:
+                code = e.response.status_code
+                # Retry only transient statuses; other 4xx (bad payload/auth, incl. GLM's
+                # 1210 max_tokens error) are deterministic — retrying wastes time/quota.
+                if code in RETRYABLE_STATUS and attempt < BACKEND_MAX_RETRIES:
+                    delay = _retry_after_seconds(e.response) or RETRY_BACKOFF[attempt]
+                    last_transient = f"HTTP {code}"
+                    await asyncio.sleep(delay)
+                    continue
+                return {
+                    "success": False,
+                    "error": f"backend HTTP {code}: {e.response.text[:300]}",
+                    "turn_failed": turn,
+                }
+            except (httpx.TimeoutException, httpx.TransportError) as e:
+                # Network-level transient (connect/read timeout, dropped conn): retry.
+                if attempt < BACKEND_MAX_RETRIES:
+                    last_transient = f"{type(e).__name__}: {e}"
+                    await asyncio.sleep(RETRY_BACKOFF[attempt])
+                    continue
+                return {
+                    "success": False,
+                    "error": f"backend call failed after {attempt + 1} attempts: {type(e).__name__}: {e}",
+                    "turn_failed": turn,
+                }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"backend call failed: {type(e).__name__}: {e}",
+                    "turn_failed": turn,
+                }
+        if resp is None:
             return {
                 "success": False,
-                "error": f"backend HTTP {e.response.status_code}: {e.response.text[:300]}",
-                "turn_failed": turn,
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"backend call failed: {type(e).__name__}: {e}",
+                "error": f"backend unavailable after {BACKEND_MAX_RETRIES + 1} attempts (last: {last_transient})",
                 "turn_failed": turn,
             }
 
