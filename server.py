@@ -113,6 +113,11 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 RETRY_BACKOFF = (1.0, 2.0, 4.0, 8.0)
 
 
+class BackendStreamError(Exception):
+    """An SSE `error` event arrived mid-stream (backend overload/abort after 200 OK).
+    Treated as transient by the dispatch retry loop, same as a network drop."""
+
+
 def _retry_after_seconds(response: httpx.Response) -> float | None:
     """Parse a Retry-After header (seconds form) into a capped float, or None."""
     val = response.headers.get("retry-after")
@@ -449,6 +454,181 @@ def _openai_to_anthropic_response(openai_resp: dict) -> dict:
     }
 
 
+# Streaming al backend (default ON). Con stream:true el read-timeout de httpx aplica
+# ENTRE chunks, no al request completo — un thinking largo que emite deltas continuos
+# ya no puede morir por silencio total de N minutos, y el TTFT deja de depender de que
+# el provider bufferee la respuesta entera. DELEGATE_STREAMING=0 revierte al modo
+# request/response clásico sin tocar código.
+DELEGATE_STREAMING = os.environ.get("DELEGATE_STREAMING", "1").lower() not in ("0", "false", "no")
+
+# Timeout del cliente compartido: read= gap máximo entre chunks en streaming (y techo
+# total en no-streaming). 600s tolera la cola serial de oMLX (max-concurrent=1: el
+# primer byte espera a que termine el job anterior).
+_HTTP_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=60.0, pool=30.0)
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Cliente httpx compartido (keep-alive/pooling) — antes se creaba y cerraba uno
+    por turno, pagando handshake TCP+TLS en cada llamada del loop agéntico."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=_HTTP_TIMEOUT,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _http_client
+
+
+async def _iter_sse_data(response: httpx.Response):
+    """Itera los payloads `data:` de un stream SSE, ya parseados como JSON.
+    Ignora comentarios/event:/id:; corta en [DONE] (OpenAI)."""
+    data_lines: list[str] = []
+    async for line in response.aiter_lines():
+        if line == "":
+            if not data_lines:
+                continue
+            data = "\n".join(data_lines)
+            data_lines = []
+            if data.strip() == "[DONE]":
+                return
+            try:
+                yield json.loads(data)
+            except json.JSONDecodeError:
+                continue
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    if data_lines:
+        data = "\n".join(data_lines)
+        if data.strip() != "[DONE]":
+            try:
+                yield json.loads(data)
+            except json.JSONDecodeError:
+                pass
+
+
+async def _consume_anthropic_stream(response: httpx.Response) -> dict:
+    """Acumula un stream SSE Anthropic (/v1/messages) en la misma estructura que
+    devuelve el endpoint sin stream: {content, stop_reason, usage}."""
+    content: list[dict] = []
+    partial_json: dict[int, list[str]] = {}
+    usage: dict[str, int] = {}
+    stop_reason = "unknown"
+
+    def _block(idx: int) -> dict:
+        while len(content) <= idx:
+            content.append({})
+        return content[idx]
+
+    async for ev in _iter_sse_data(response):
+        etype = ev.get("type")
+        if etype == "message_start":
+            for k, v in ((ev.get("message") or {}).get("usage") or {}).items():
+                if isinstance(v, int):
+                    usage[k] = v
+        elif etype == "content_block_start":
+            idx = ev.get("index", len(content))
+            block = dict(ev.get("content_block") or {})
+            if block.get("type") == "tool_use" and not isinstance(block.get("input"), dict):
+                block["input"] = {}
+            _block(idx)
+            content[idx] = block
+        elif etype == "content_block_delta":
+            idx = ev.get("index", 0)
+            delta = ev.get("delta") or {}
+            dtype = delta.get("type")
+            block = _block(idx)
+            if dtype == "text_delta":
+                block.setdefault("type", "text")
+                block["text"] = block.get("text", "") + (delta.get("text") or "")
+            elif dtype == "thinking_delta":
+                block.setdefault("type", "thinking")
+                block["thinking"] = block.get("thinking", "") + (delta.get("thinking") or "")
+            elif dtype == "input_json_delta":
+                partial_json.setdefault(idx, []).append(delta.get("partial_json") or "")
+            elif dtype == "signature_delta":
+                block["signature"] = block.get("signature", "") + (delta.get("signature") or "")
+        elif etype == "message_delta":
+            if (ev.get("delta") or {}).get("stop_reason"):
+                stop_reason = ev["delta"]["stop_reason"]
+            for k, v in (ev.get("usage") or {}).items():
+                if isinstance(v, int):
+                    usage[k] = v
+        elif etype == "error":
+            err = ev.get("error") or {}
+            raise BackendStreamError(f"{err.get('type', 'error')}: {err.get('message', '')}")
+
+    for idx, parts in partial_json.items():
+        raw = "".join(parts)
+        try:
+            content[idx]["input"] = json.loads(raw) if raw.strip() else {}
+        except (json.JSONDecodeError, IndexError):
+            content[idx]["input"] = {}
+    return {
+        "content": [b for b in content if b.get("type")],
+        "stop_reason": stop_reason,
+        "usage": usage,
+    }
+
+
+async def _consume_openai_stream(response: httpx.Response) -> dict:
+    """Acumula un stream SSE OpenAI (/v1/chat/completions) en la forma de la respuesta
+    sin stream, para reusar _openai_to_anthropic_response tal cual."""
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: dict[int, dict] = {}
+    finish_reason = None
+    usage: dict = {}
+
+    async for ev in _iter_sse_data(response):
+        if ev.get("error"):
+            err = ev["error"] if isinstance(ev["error"], dict) else {"message": str(ev["error"])}
+            raise BackendStreamError(f"{err.get('type', 'error')}: {err.get('message', '')}")
+        if isinstance(ev.get("usage"), dict):
+            usage = ev["usage"]
+        choices = ev.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        if choice.get("finish_reason"):
+            finish_reason = choice["finish_reason"]
+        delta = choice.get("delta") or {}
+        if delta.get("content"):
+            text_parts.append(delta["content"])
+        if delta.get("reasoning_content"):
+            reasoning_parts.append(delta["reasoning_content"])
+        for tc in delta.get("tool_calls") or []:
+            idx = tc.get("index", 0)
+            slot = tool_calls.setdefault(
+                idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+            )
+            if tc.get("id"):
+                slot["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                slot["function"]["name"] = fn["name"]
+            if fn.get("arguments"):
+                slot["function"]["arguments"] += fn["arguments"]
+
+    message: dict = {"role": "assistant", "content": "".join(text_parts) or None}
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+    return {
+        "choices": [{"message": message, "finish_reason": finish_reason or "stop"}],
+        "usage": usage,
+    }
+
+
+async def _raise_for_status_streamed(response: httpx.Response) -> None:
+    """raise_for_status para respuestas en modo stream: lee el body de error primero
+    para que e.response.text funcione en el manejo de errores del loop."""
+    if response.status_code >= 400:
+        await response.aread()
+        response.raise_for_status()
+
+
 async def _call_backend(
     messages: list[dict],
     system: str,
@@ -461,21 +641,30 @@ async def _call_backend(
       - openai-format (deepseek-*, gpt-*, etc.) → /v1/chat/completions
       - resto (bedrock-*, local-qwen-*, etc.) → /v1/messages (Anthropic)
     Devuelve estructura Anthropic-like en ambos casos para que el loop sea uniforme.
+    Con DELEGATE_STREAMING (default) consume el backend por SSE y acumula localmente:
+    misma estructura de retorno, pero sin esperas silenciosas de minutos.
     """
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if LITELLM_KEY:
         headers["x-api-key"] = LITELLM_KEY
         headers["Authorization"] = f"Bearer {LITELLM_KEY}"
+    client = _get_http_client()
 
     if _is_openai_format(model):
         # OpenAI format → /v1/chat/completions
         base = LITELLM_URL.rsplit("/v1/", 1)[0]
         url = f"{base}/v1/chat/completions"
         payload = _anthropic_to_openai_request(messages, system, tools, model, max_tokens)
-        async with httpx.AsyncClient(timeout=600.0) as client:
-            r = await client.post(url, json=payload, headers=headers)
-            r.raise_for_status()
-            return _openai_to_anthropic_response(r.json())
+        if DELEGATE_STREAMING:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+            async with client.stream("POST", url, json=payload, headers=headers) as r:
+                await _raise_for_status_streamed(r)
+                openai_resp = await _consume_openai_stream(r)
+            return _openai_to_anthropic_response(openai_resp)
+        r = await client.post(url, json=payload, headers=headers)
+        r.raise_for_status()
+        return _openai_to_anthropic_response(r.json())
     else:
         # Anthropic format → /v1/messages
         headers["anthropic-version"] = "2023-06-01"
@@ -487,10 +676,14 @@ async def _call_backend(
         }
         if tools:
             payload["tools"] = tools
-        async with httpx.AsyncClient(timeout=600.0) as client:
-            r = await client.post(LITELLM_URL, json=payload, headers=headers)
-            r.raise_for_status()
-            return r.json()
+        if DELEGATE_STREAMING:
+            payload["stream"] = True
+            async with client.stream("POST", LITELLM_URL, json=payload, headers=headers) as r:
+                await _raise_for_status_streamed(r)
+                return await _consume_anthropic_stream(r)
+        r = await client.post(LITELLM_URL, json=payload, headers=headers)
+        r.raise_for_status()
+        return r.json()
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -595,8 +788,9 @@ async def _delegate_one_impl(
                     "error": f"backend HTTP {code}: {e.response.text[:300]}",
                     "turn_failed": turn,
                 }
-            except (httpx.TimeoutException, httpx.TransportError) as e:
-                # Network-level transient (connect/read timeout, dropped conn): retry.
+            except (httpx.TimeoutException, httpx.TransportError, BackendStreamError) as e:
+                # Network-level transient (connect/read timeout, dropped conn) o error SSE
+                # mid-stream tras 200 OK (overload del backend): retry.
                 if attempt < BACKEND_MAX_RETRIES:
                     last_transient = f"{type(e).__name__}: {e}"
                     await asyncio.sleep(RETRY_BACKOFF[attempt])
