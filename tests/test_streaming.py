@@ -146,6 +146,14 @@ def test_sse_multiline_and_junk():
     print("PASS sse junk/comments tolerated")
 
 
+def test_openai_truncated_stream_not_end_turn():
+    lines = sse({"choices": [{"delta": {"content": "trunca"}}]})  # EOF sin finish_reason
+    openai_resp = run(server._consume_openai_stream(FakeStream(lines)))
+    out = server._openai_to_anthropic_response(openai_resp)
+    assert out["stop_reason"] == "unknown", out["stop_reason"]
+    print("PASS openai truncated stream -> unknown (no end_turn falso)")
+
+
 if __name__ == "__main__":
     test_anthropic_text_thinking_tooluse()
     test_anthropic_error_event()
@@ -154,4 +162,5 @@ if __name__ == "__main__":
     test_openai_tool_call_fragments()
     test_openai_error_event()
     test_sse_multiline_and_junk()
-    print("\nALL PASS (7/7)")
+    test_openai_truncated_stream_not_end_turn()
+    print("\nALL PASS (8/8)")

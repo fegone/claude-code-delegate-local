@@ -559,10 +559,12 @@ async def _consume_anthropic_stream(response: httpx.Response) -> dict:
             raise BackendStreamError(f"{err.get('type', 'error')}: {err.get('message', '')}")
 
     for idx, parts in partial_json.items():
+        if idx >= len(content):
+            continue
         raw = "".join(parts)
         try:
             content[idx]["input"] = json.loads(raw) if raw.strip() else {}
-        except (json.JSONDecodeError, IndexError):
+        except json.JSONDecodeError:
             content[idx]["input"] = {}
     return {
         "content": [b for b in content if b.get("type")],
@@ -615,8 +617,10 @@ async def _consume_openai_stream(response: httpx.Response) -> dict:
         message["reasoning_content"] = "".join(reasoning_parts)
     if tool_calls:
         message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+    # finish_reason=None (stream cortado sin evento final) se queda None → el mapper
+    # lo reporta como "unknown" en vez de fingir un end_turn limpio sobre texto truncado.
     return {
-        "choices": [{"message": message, "finish_reason": finish_reason or "stop"}],
+        "choices": [{"message": message, "finish_reason": finish_reason}],
         "usage": usage,
     }
 
