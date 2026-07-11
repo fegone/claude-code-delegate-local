@@ -1255,6 +1255,7 @@ async def delegate_to_codex(
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=workdir_abs,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
