@@ -20,6 +20,7 @@ import os
 import pathlib
 import subprocess
 import time
+import uuid
 from typing import Any
 
 import httpx
@@ -1134,6 +1135,183 @@ async def local_backend_status() -> dict:
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
     return out
+
+
+## ────────────────────────────────────────────────────────────────────────────────
+## Codex backend — OpenAI Codex CLI as an autonomous agent, auth by ChatGPT plan.
+## Officially supported by OpenAI (`codex exec` headless draws from the ChatGPT plan's
+## 5-hour message window — NO API key, NO proxy, no ToS gray area). Codex is its OWN
+## agent (does its own read/write/bash in a sandbox), so we shell out to it and return
+## its final message — we do NOT drive it through the LLM tool loop like other backends.
+## HIPAA: cloud model → NUNCA para proyectos con PHI (Neola pacientes/Curve/call-crm).
+## ────────────────────────────────────────────────────────────────────────────────
+CODEX_BIN = os.environ.get("DELEGATE_CODEX_BIN", "codex")
+CODEX_DEFAULT_MODEL = os.environ.get("DELEGATE_CODEX_MODEL", "gpt-5.6-sol")
+# Modelos que el plan ChatGPT (no API key) SÍ permite vía `codex exec`. Verificado
+# 2026-07-11 con un ChatGPT Plus: gpt-5.5 y gpt-5.6-sol responden; gpt-5.6 / -codex
+# devuelven 400 "not supported when using Codex with a ChatGPT account".
+CODEX_PLAN_MODELS = {"gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"}
+
+
+@mcp.tool()
+async def delegate_to_codex(
+    task: str,
+    workdir: str = ".",
+    model: str = CODEX_DEFAULT_MODEL,
+    sandbox: str = "workspace-write",
+    timeout_s: int = 1800,
+    ctx: Context | None = None,
+) -> dict:
+    """
+    Delega una tarea al OpenAI Codex CLI (`codex exec`), autenticado con la SUSCRIPCIÓN
+    ChatGPT del usuario (Plus/Pro) — vía oficial de OpenAI, sin API key ni proxy.
+
+    Codex es un agente autónomo COMPLETO: lee/escribe archivos y corre comandos por su
+    cuenta dentro de su sandbox. Este tool lo lanza headless, espera su mensaje final y
+    lo devuelve. Ideal para coding agéntico con GPT-5.6-sol usando el plan del usuario.
+
+    ⚠️ HIPAA: modelo cloud de OpenAI → NUNCA usar en proyectos con PHI (Neola pacientes,
+    Curve, call-crm). Solo proyectos sin datos sensibles.
+
+    ⚠️ Límite del plan: Plus da ~15-80 mensajes / ventana de 5h; una tarea pesada la
+    drena. Si se agota → error de "usage limit"; esperar o usar Pro/API key.
+
+    Args:
+        task: La instrucción para Codex (autónoma — incluye contexto y archivos objetivo).
+        workdir: Directorio de trabajo (Codex opera aquí). Default: cwd del server.
+        model: Modelo Codex. Default gpt-5.6-sol. Debe estar en los permitidos por el plan.
+        sandbox: 'read-only' | 'workspace-write' (default) | 'danger-full-access'.
+        timeout_s: Tope de segundos para la corrida completa (default 1800 = 30 min).
+    """
+    workdir_abs = os.path.abspath(workdir)
+    if not os.path.isdir(workdir_abs):
+        return {"success": False, "error": f"workdir no existe: {workdir_abs}"}
+    if sandbox not in ("read-only", "workspace-write", "danger-full-access"):
+        return {"success": False, "error": f"sandbox inválido: {sandbox}"}
+    if model not in CODEX_PLAN_MODELS:
+        return {
+            "success": False,
+            "error": (
+                f"modelo '{model}' no está en los permitidos por el plan ChatGPT "
+                f"({sorted(CODEX_PLAN_MODELS)}). Con API key de pago habría más; "
+                f"con suscripción, esos 400ean."
+            ),
+        }
+
+    # -o escribe SOLO el mensaje final del agente a un archivo → parseo limpio, sin
+    # tener que rascar el stream de eventos. uuid en el nombre: os.getpid() es
+    # constante en este server async, dos llamadas en el mismo segundo colisionarían.
+    out_file = os.path.join(workdir_abs, f".codex-last-{uuid.uuid4().hex}.txt")
+    cmd = [
+        CODEX_BIN, "exec",
+        "-m", model,
+        "-C", workdir_abs,
+        "-s", sandbox,
+        "--skip-git-repo-check",
+        "-o", out_file,
+        # "--" termina las opciones: un task que empiece con '-' no se parsea como flag.
+        "--",
+        task,
+    ]
+    if ctx:
+        try:
+            await ctx.report_progress(progress=0, total=1, message=f"codex {model} corriendo…")
+        except Exception:
+            pass
+
+    t0 = time.time()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=workdir_abs,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            stdout_data, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            # Reap el hijo tras kill(): sin esto queda zombie y el transport del
+            # subproceso no se cierra (warnings "Task was destroyed / pending").
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+            _cleanup_file(out_file)
+            return {
+                "success": False,
+                "error": f"codex timeout tras {timeout_s}s",
+                "model": model,
+                "elapsed_s": round(time.time() - t0, 1),
+            }
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "error": f"codex binary no encontrado ('{CODEX_BIN}'). Instala @openai/codex y loguéate con tu plan.",
+        }
+
+    stdout_text = (stdout_data or b"").decode("utf-8", "replace")
+    elapsed = round(time.time() - t0, 1)
+
+    # Errores conocidos del plan → mensaje claro. SOLO si Codex salió con error
+    # (returncode != 0): si no, un run exitoso que MENCIONE "rate limit" en su
+    # razonamiento (comunísimo en tareas de coding: "added rate limit handling")
+    # se clasificaría falsamente como cuota agotada. El error real de OpenAI viene
+    # con exit no-cero.
+    low = stdout_text.lower()
+    failed = proc.returncode not in (0, None)
+    if failed and ("usage limit" in low or "rate limit" in low):
+        _cleanup_file(out_file)
+        return {
+            "success": False,
+            "error": "límite del plan ChatGPT agotado (ventana de 5h). Espera o usa Pro/API key.",
+            "model": model, "elapsed_s": elapsed,
+        }
+    if failed and "not supported when using codex with a chatgpt account" in low:
+        _cleanup_file(out_file)
+        return {
+            "success": False,
+            "error": f"el plan ChatGPT no permite el modelo '{model}' vía Codex.",
+            "model": model, "elapsed_s": elapsed,
+        }
+
+    final_message = ""
+    try:
+        if os.path.isfile(out_file):
+            with open(out_file, "r", encoding="utf-8", errors="replace") as f:
+                final_message = f.read().strip()
+    except OSError:
+        pass
+    finally:
+        _cleanup_file(out_file)
+
+    if not final_message and proc.returncode not in (0, None):
+        return {
+            "success": False,
+            "error": f"codex salió con código {proc.returncode}",
+            "stdout_tail": stdout_text[-1500:],
+            "model": model, "elapsed_s": elapsed,
+        }
+
+    return {
+        "success": True,
+        "model": model,
+        "final_response": final_message or stdout_text[-4000:],
+        "elapsed_s": elapsed,
+        "workdir": workdir_abs,
+        "auth": "chatgpt-plan",
+    }
+
+
+def _cleanup_file(path: str) -> None:
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
 
 
 @mcp.tool()
