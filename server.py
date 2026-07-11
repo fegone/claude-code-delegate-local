@@ -1148,9 +1148,32 @@ async def local_backend_status() -> dict:
 CODEX_BIN = os.environ.get("DELEGATE_CODEX_BIN", "codex")
 CODEX_DEFAULT_MODEL = os.environ.get("DELEGATE_CODEX_MODEL", "gpt-5.6-sol")
 # Modelos que el plan ChatGPT (no API key) SÍ permite vía `codex exec`. Verificado
-# 2026-07-11 con un ChatGPT Plus: gpt-5.5 y gpt-5.6-sol responden; gpt-5.6 / -codex
-# devuelven 400 "not supported when using Codex with a ChatGPT account".
-CODEX_PLAN_MODELS = {"gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"}
+# en vivo con un ChatGPT Plus: los TRES sabores de GPT-5.6 (sol/terra/luna) + 5.5/5.4
+# responden nativos; gpt-5.6 "pelado" y gpt-5.6-codex devuelven 400 "not supported
+# when using Codex with a ChatGPT account" (esos requieren API key de pago).
+CODEX_PLAN_MODELS = {
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
+}
+# Alias cortos → id real del modelo. Permite delegar diciendo solo "sol"/"terra"/"luna".
+CODEX_MODEL_ALIASES = {
+    "sol": "gpt-5.6-sol",
+    "terra": "gpt-5.6-terra",
+    "luna": "gpt-5.6-luna",
+    "5.6-sol": "gpt-5.6-sol",
+    "5.6-terra": "gpt-5.6-terra",
+    "5.6-luna": "gpt-5.6-luna",
+    "5.5": "gpt-5.5",
+    "5.4": "gpt-5.4",
+    "5.4-mini": "gpt-5.4-mini",
+}
+
+
+def _resolve_codex_model(model: str) -> str:
+    """Acepta el id completo ('gpt-5.6-terra') o el alias corto ('terra')."""
+    if not isinstance(model, str):
+        return model
+    return CODEX_MODEL_ALIASES.get(model.strip().lower(), model)
 
 
 @mcp.tool()
@@ -1168,7 +1191,13 @@ async def delegate_to_codex(
 
     Codex es un agente autónomo COMPLETO: lee/escribe archivos y corre comandos por su
     cuenta dentro de su sandbox. Este tool lo lanza headless, espera su mensaje final y
-    lo devuelve. Ideal para coding agéntico con GPT-5.6-sol usando el plan del usuario.
+    lo devuelve. Ideal para coding agéntico con GPT-5.6 usando el plan del usuario.
+
+    GPT-5.6 tiene tres sabores; se pueden pedir por nombre corto (alias) o id completo:
+      - 'sol'   → gpt-5.6-sol   (default)
+      - 'terra' → gpt-5.6-terra
+      - 'luna'  → gpt-5.6-luna
+    También '5.5', '5.4', '5.4-mini'.
 
     ⚠️ HIPAA: modelo cloud de OpenAI → NUNCA usar en proyectos con PHI (Neola pacientes,
     Curve, call-crm). Solo proyectos sin datos sensibles.
@@ -1179,10 +1208,12 @@ async def delegate_to_codex(
     Args:
         task: La instrucción para Codex (autónoma — incluye contexto y archivos objetivo).
         workdir: Directorio de trabajo (Codex opera aquí). Default: cwd del server.
-        model: Modelo Codex. Default gpt-5.6-sol. Debe estar en los permitidos por el plan.
+        model: Modelo o alias. Default 'sol' (gpt-5.6-sol). Acepta 'terra'/'luna'/'sol'
+               o el id completo. Debe resolver a uno permitido por el plan.
         sandbox: 'read-only' | 'workspace-write' (default) | 'danger-full-access'.
         timeout_s: Tope de segundos para la corrida completa (default 1800 = 30 min).
     """
+    model = _resolve_codex_model(model)
     workdir_abs = os.path.abspath(workdir)
     if not os.path.isdir(workdir_abs):
         return {"success": False, "error": f"workdir no existe: {workdir_abs}"}
