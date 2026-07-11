@@ -20,6 +20,7 @@ import os
 import pathlib
 import subprocess
 import time
+import uuid
 from typing import Any
 
 import httpx
@@ -1198,10 +1199,9 @@ async def delegate_to_codex(
         }
 
     # -o escribe SOLO el mensaje final del agente a un archivo → parseo limpio, sin
-    # tener que rascar el stream de eventos.
-    out_file = os.path.join(
-        workdir_abs, f".codex-last-{int(time.time())}-{os.getpid()}.txt"
-    )
+    # tener que rascar el stream de eventos. uuid en el nombre: os.getpid() es
+    # constante en este server async, dos llamadas en el mismo segundo colisionarían.
+    out_file = os.path.join(workdir_abs, f".codex-last-{uuid.uuid4().hex}.txt")
     cmd = [
         CODEX_BIN, "exec",
         "-m", model,
@@ -1209,6 +1209,8 @@ async def delegate_to_codex(
         "-s", sandbox,
         "--skip-git-repo-check",
         "-o", out_file,
+        # "--" termina las opciones: un task que empiece con '-' no se parsea como flag.
+        "--",
         task,
     ]
     if ctx:
@@ -1232,6 +1234,13 @@ async def delegate_to_codex(
                 proc.kill()
             except ProcessLookupError:
                 pass
+            # Reap el hijo tras kill(): sin esto queda zombie y el transport del
+            # subproceso no se cierra (warnings "Task was destroyed / pending").
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+            _cleanup_file(out_file)
             return {
                 "success": False,
                 "error": f"codex timeout tras {timeout_s}s",
@@ -1247,16 +1256,21 @@ async def delegate_to_codex(
     stdout_text = (stdout_data or b"").decode("utf-8", "replace")
     elapsed = round(time.time() - t0, 1)
 
-    # Errores conocidos del plan (usage limit, auth) → mensaje claro, no ruido.
+    # Errores conocidos del plan → mensaje claro. SOLO si Codex salió con error
+    # (returncode != 0): si no, un run exitoso que MENCIONE "rate limit" en su
+    # razonamiento (comunísimo en tareas de coding: "added rate limit handling")
+    # se clasificaría falsamente como cuota agotada. El error real de OpenAI viene
+    # con exit no-cero.
     low = stdout_text.lower()
-    if "usage limit" in low or "rate limit" in low:
+    failed = proc.returncode not in (0, None)
+    if failed and ("usage limit" in low or "rate limit" in low):
         _cleanup_file(out_file)
         return {
             "success": False,
             "error": "límite del plan ChatGPT agotado (ventana de 5h). Espera o usa Pro/API key.",
             "model": model, "elapsed_s": elapsed,
         }
-    if "not supported when using codex with a chatgpt account" in low:
+    if failed and "not supported when using codex with a chatgpt account" in low:
         _cleanup_file(out_file)
         return {
             "success": False,
