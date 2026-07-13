@@ -21,6 +21,7 @@ import os
 import pathlib
 import re
 import signal
+import socket
 import time
 import urllib.parse
 import uuid
@@ -1078,7 +1079,10 @@ async def _delegate_one_impl(
     incomplete = (
         hit_turn_limit
         or stop_reason == "max_tokens"
-        or (not final_text.strip() and stop_reason == "unknown")
+        # No text produced across the whole run, regardless of stop_reason: a truncated
+        # stream (unknown), a moderation cutoff (content_filter), or an empty end_turn all
+        # mean the dispatch produced nothing usable → not a success.
+        or not final_text.strip()
     )
 
     return {
@@ -1542,8 +1546,10 @@ async def delegate_to_codex(
             "model": model,
             "elapsed_s": round(time.time() - t0, 1),
         }
-    except asyncio.CancelledError:
-        # Client cancelled the tool call — don't leak the codex process tree or temp file.
+    except BaseException:
+        # ANY other failure — client cancel (CancelledError), broken pipe / OSError during
+        # the drain, etc. — must still kill the codex process tree and remove the temp file.
+        # Listing only Timeout/Cancelled left orphaned processes on an unexpected exception.
         _kill_process_group(proc)
         _cleanup_file(out_file)
         raise
@@ -1620,7 +1626,7 @@ _PROVIDER_ALLOWED_HOSTS = {
 }
 
 
-def _validate_provider_url(url: str) -> tuple[bool, str]:
+async def _validate_provider_url(url: str) -> tuple[bool, str]:
     if not isinstance(url, str) or not url:
         return False, "provider_url requerido"
     try:
@@ -1636,14 +1642,29 @@ def _validate_provider_url(url: str) -> tuple[bool, str]:
         if host not in _PROVIDER_ALLOWED_HOSTS:
             return False, f"host '{host}' no está en DELEGATE_PROVIDER_ALLOWED_HOSTS"
         return True, ""
-    if host in ("169.254.169.254", "metadata.google.internal", "metadata"):
+    if host in ("metadata.google.internal", "metadata"):
         return False, f"host bloqueado (cloud metadata endpoint): {host}"
+    # Resolve the host and validate the RESOLVED IP(s), not the raw string. This catches
+    # numeric-encoded IPs (2852039166 / 0xA9FEA9FE / octal, which the OS resolver expands
+    # via inet_aton) and A-records pointing at internal/metadata IPs — a string-only check
+    # missed both. Loopback/RFC1918 stay allowed on purpose (Tailscale/LiteLLM local).
+    port = p.port or (443 if p.scheme == "https" else 80)
     try:
-        ip = ipaddress.ip_address(host)
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, OSError, ValueError):
+        infos = []
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr.split("%")[0])
+        except ValueError:
+            continue
+        # link-local covers the cloud-metadata IP (169.254.169.254 / fe80::) — the actual
+        # SSRF target. Loopback/RFC1918 stay allowed on purpose (Tailscale/LiteLLM local);
+        # note is_reserved is NOT used here (it flags IPv6 loopback ::1, a legit target).
         if ip.is_link_local:
-            return False, f"IP link-local bloqueada: {host}"
-    except ValueError:
-        pass  # hostname, not a literal IP
+            return False, f"host '{host}' resuelve a IP bloqueada: {addr}"
     return True, ""
 
 
@@ -1672,7 +1693,7 @@ async def delegate_to_provider(
         agent_name, task, workdir, max_turns: igual que delegate_to_local_agent
         mode_tag: Tag a prepender en system prompt (default MODE:LOCAL — puede ser MODE:DEEPSEEK etc.)
     """
-    ok, why = _validate_provider_url(provider_url)
+    ok, why = await _validate_provider_url(provider_url)
     if not ok:
         return {"success": False, "error": why}
     # No global mutation: the backend override travels as explicit per-dispatch params, so

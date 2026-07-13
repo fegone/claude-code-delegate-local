@@ -107,14 +107,17 @@ def test_derive_base():
     print("PASS _derive_base handles nested and bare /v1 paths")
 
 
-# ── P1: SSRF guard ────────────────────────────────────────────────────────────
+# ── P1: SSRF guard (async; resolves host, blocks numeric-encoded metadata IPs) ──
 def test_validate_provider_url():
-    assert server._validate_provider_url("https://api.deepseek.com/v1/messages")[0]
-    assert server._validate_provider_url("http://localhost:4000/v1/messages")[0]  # legit local
-    assert not server._validate_provider_url("http://169.254.169.254/latest/meta-data")[0]
-    assert not server._validate_provider_url("ftp://x/y")[0]
-    assert not server._validate_provider_url("")[0]
-    print("PASS SSRF guard blocks metadata/link-local + non-http, allows local/https")
+    def v(u):
+        return run_coro(server._validate_provider_url(u))
+    assert v("https://api.deepseek.com/v1/messages")[0]     # DNS may be offline -> allowed
+    assert v("http://localhost:4000/v1/messages")[0]        # loopback legit
+    assert not v("http://169.254.169.254/latest/meta-data")[0]
+    assert not v("http://2852039166/")[0]                   # decimal-encoded metadata IP
+    assert not v("ftp://x/y")[0]
+    assert not v("")[0]
+    print("PASS SSRF guard blocks metadata (incl. numeric-encoded) + non-http")
 
 
 # ── P2: stream-error retry classification ─────────────────────────────────────
@@ -165,7 +168,24 @@ def test_success_gating_clean_finish():
     server._call_backend = done
     r = run_coro(server._delegate_one_impl("a", "t", model="m", max_turns=3))
     assert r["success"] is True and r["final_response"] == "all good", r
+    _restore_patches()
     print("PASS clean end_turn -> success=True")
+
+
+def test_success_gating_empty_nonunknown_stop():
+    # Security review gap: empty output with a *non-unknown* stop_reason (end_turn,
+    # content_filter) previously slipped through as success=True.
+    for stop in ("end_turn", "content_filter"):
+        _patch_agent()
+
+        async def empty(*a, _stop=stop, **k):
+            return {"content": [], "stop_reason": _stop, "usage": {}}
+
+        server._call_backend = empty
+        r = run_coro(server._delegate_one_impl("a", "t", model="m", max_turns=3))
+        assert r["success"] is False and r["incomplete"], (stop, r)
+    _restore_patches()
+    print("PASS empty output with end_turn/content_filter -> success=False")
 
 
 # ── local turn floor stays 25 (Felix benchmark), batch default 2 ──────────────
@@ -187,5 +207,6 @@ if __name__ == "__main__":
     test_success_gating_turn_limit()
     test_success_gating_max_tokens()
     test_success_gating_clean_finish()
+    test_success_gating_empty_nonunknown_stop()
     test_local_turns_floor_and_batch()
-    print("\nALL PASS (12/12)")
+    print("\nALL PASS (13/13)")
