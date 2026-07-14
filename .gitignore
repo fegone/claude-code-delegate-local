@@ -13,8 +13,9 @@ wheels/
 *.bak-*
 *.bak.*
 
-# Scratch: Ornith probe/calibration scripts (Felix 2026-06-28, leen keys en runtime)
-probe_ornith.py
-test_coder_ornith_seq.py
+# Scratch: local probe/calibration scripts (read API keys at runtime — never commit)
+probe_backend.py
+probe_*.py
+test_coder_seq.py
 delegate_results.json
 jest_final.txt

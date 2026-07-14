@@ -188,9 +188,9 @@ def test_success_gating_empty_nonunknown_stop():
     print("PASS empty output with end_turn/content_filter -> success=False")
 
 
-# ── local turn floor stays 25 (Felix benchmark), batch default 2 ──────────────
+# ── local turn floor stays 25 (iterative-coding benchmark), batch default 2 ────
 def test_local_turns_floor_and_batch():
-    assert server.LOCAL_MAX_TURNS == 25, "local floor must stay 25 (2026-07-03 benchmark)"
+    assert server.LOCAL_MAX_TURNS == 25, "local floor must stay 25 (iterative-coding benchmark)"
     assert server.MAX_BATCH_SIZE == 2
     print("PASS local turn floor 25, batch cap 2")
 
