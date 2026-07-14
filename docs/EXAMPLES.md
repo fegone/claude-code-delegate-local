@@ -177,7 +177,7 @@ Useful for "what can I delegate?" introspection from the orchestrator.
 If the agent runs out of `max_turns` while still emitting `tool_use`, the response has `hit_turn_limit: true`. Common causes:
 
 1. **`max_tokens` too low** — model output gets truncated mid-Write, so it tries to append in chunks and never converges. Solution: bump `max_tokens` (or use `creative`/`webdev` agents with prompts that force "Write the COMPLETE file in a single call").
-2. **Genuine multi-step task** — raise `max_turns` (auto default: 15 local / 25 cloud; hard cap 40).
+2. **Genuine multi-step task** — raise `max_turns` (auto default: 25 local / 25 cloud; hard cap 40).
 3. **Agent doing irrelevant exploration** — refine the task prompt with explicit constraints ("don't run bash for exploration, the directory is empty").
 
 ### `400 Bad Request: reasoning_content...`
@@ -186,4 +186,4 @@ This happens with thinking-mode models (DeepSeek V4) if the MCP isn't preserving
 
 ### Empty `final_response`, `stop_reason: "max_tokens"`
 
-The model consumed all `max_tokens` in reasoning without emitting visible output. Raise `max_tokens` in `_call_backend()` (default is 32768, but if you lowered it, restore it).
+The model consumed all `max_tokens` in reasoning without emitting visible output. Raise `max_tokens` (default is 65536; `-max` aliases auto-bump to 150000).

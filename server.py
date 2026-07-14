@@ -15,12 +15,19 @@ License: MIT
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import pathlib
-import subprocess
+import re
+import signal
+import socket
 import time
+import urllib.parse
 import uuid
+from collections import deque
+from contextlib import asynccontextmanager
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -48,11 +55,20 @@ MODE_TAG = "MODE:LOCAL"
 # backends (large context, e.g. MiniMax M3 512K, DeepSeek API, Sonnet/Opus) are
 # also fine at 25-30.
 DEFAULT_MAX_TURNS = 25
+# Local backends (Ornith/Qwen MoE-A3B on oMLX). Benchmark 2026-07-03: a 15-turn budget
+# BREAKS iterative coding tasks — the agent gets cut off with tests still red before it
+# can run→fix→re-run. 25 is the validated floor for local coding; do NOT lower it.
+LOCAL_MAX_TURNS = int(os.getenv("DELEGATE_LOCAL_MAX_TURNS", "25"))
 # Cloud backends (MiniMax M3, DeepSeek API, Sonnet/Opus) tienen contextos grandes
 # (M3 = 512K) y aguantan más turnos de análisis multi-archivo sin saturar.
 # Se resuelve por modelo en _delegate_one_impl cuando max_turns no se pasa explícito.
-CLOUD_MAX_TURNS = 25
+CLOUD_MAX_TURNS = int(os.getenv("DELEGATE_CLOUD_MAX_TURNS", "25"))
 HARD_MAX_TURNS = 40
+# Hard per-turn wall-clock ceiling. httpx read= only bounds the gap BETWEEN chunks, so a
+# backend that dribbles one chunk every few minutes could otherwise keep a single turn
+# alive indefinitely. This caps the whole backend call per turn; a hit is treated as a
+# transient (retried) like a network drop. Generous default tolerates oMLX serial queues.
+TURN_TIMEOUT = int(os.getenv("DELEGATE_TURN_TIMEOUT", "1800"))
 # Real-world finding (2026-07-06 benchmark): a deep-reasoning "-max" tier alias
 # (e.g. deepseek-v4-pro-max, glm-coding-plan-max) can burn its ENTIRE max_tokens
 # budget on thinking before emitting any usable output — with DeepSeek this once
@@ -91,6 +107,16 @@ def _resolve_max_tokens(model: str, max_tokens: int | None) -> int:
     """None (caller didn't pass one) => model-aware default; explicit value otherwise.
     Either way the result is clamped to the provider's hard cap so a "-max" auto-bump
     (or an over-eager explicit value) can't trigger a provider rejection (GLM 1210)."""
+    # Coerce/guard: a non-int or <= 0 value from a caller must not crash the clamp math
+    # or send a nonsense max_tokens to the backend — fall back to the model-aware default.
+    if max_tokens is not None:
+        try:
+            max_tokens = int(max_tokens)
+        except (TypeError, ValueError):
+            max_tokens = None
+        else:
+            if max_tokens <= 0:
+                max_tokens = None
     if max_tokens is None:
         if isinstance(model, str) and model.lower().endswith(MAX_TIER_SUFFIXES):
             max_tokens = MAX_TIER_MAX_TOKENS
@@ -115,23 +141,78 @@ RETRY_BACKOFF = (1.0, 2.0, 4.0, 8.0)
 
 
 class BackendStreamError(Exception):
-    """An SSE `error` event arrived mid-stream (backend overload/abort after 200 OK).
-    Treated as transient by the dispatch retry loop, same as a network drop."""
+    """An SSE `error` event arrived mid-stream (after 200 OK). `retryable` says whether
+    the dispatch retry loop should retry it: transient (overload/timeout/server) → yes;
+    deterministic (auth/invalid_request/not_found) → no, fail fast."""
+
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+# Anthropic/OpenAI error `type`s that are deterministic — retrying just burns time/quota.
+_NON_RETRYABLE_STREAM_ERRORS = {
+    "authentication_error", "permission_error", "invalid_request_error",
+    "not_found_error", "invalid_api_key", "billing_error",
+}
+
+
+def _stream_error_retryable(err_type: str | None) -> bool:
+    return (err_type or "").strip().lower() not in _NON_RETRYABLE_STREAM_ERRORS
 
 
 def _retry_after_seconds(response: httpx.Response) -> float | None:
-    """Parse a Retry-After header (seconds form) into a capped float, or None."""
+    """Parse a Retry-After header (seconds OR HTTP-date form) into a capped float, or None."""
     val = response.headers.get("retry-after")
     if not val:
         return None
     try:
         return min(float(val), 30.0)
     except (TypeError, ValueError):
-        return None
+        pass
+    try:
+        dt = parsedate_to_datetime(val)
+        if dt is not None:
+            import datetime
+            now = datetime.datetime.now(dt.tzinfo)
+            return max(0.0, min((dt - now).total_seconds(), 30.0))
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _derive_base(url: str) -> str:
+    """Strip a trailing /v1[/...] path segment to get the API base, robustly (handles
+    endpoints not ending exactly in /v1/messages)."""
+    p = urllib.parse.urlsplit(url)
+    path = p.path
+    idx = path.find("/v1/")
+    if idx != -1:
+        path = path[:idx]
+    elif path.endswith("/v1"):
+        path = path[:-3]
+    return urllib.parse.urlunsplit((p.scheme, p.netloc, path.rstrip("/"), "", ""))
 # read_file: tope de chars devueltos por lectura. Por encima, el agente debe paginar
 # con offset/limit (NO re-leer lo mismo). Subido de 8000 para que archivos grandes
 # (controllers de 600-900 líneas) se puedan leer por rangos de verdad.
 MAX_READ_CHARS = 50000
+# Guard: don't slurp a giant file fully into RAM before applying MAX_READ_CHARS.
+MAX_READ_FILE_BYTES = int(os.getenv("DELEGATE_MAX_READ_FILE_BYTES", str(64 * 1024 * 1024)))
+# Cap on a single write_file payload.
+MAX_WRITE_BYTES = int(os.getenv("DELEGATE_MAX_WRITE_BYTES", str(8 * 1024 * 1024)))
+
+# ── Agent-tool sandboxing ────────────────────────────────────────────────────
+# Confine read_file/write_file to the agent's workdir (blocks ../ traversal, absolute
+# escape, and symlink escape). Set DELEGATE_ALLOW_PATH_ESCAPE=1 for the legacy
+# unconfined behaviour.
+ALLOW_PATH_ESCAPE = os.getenv("DELEGATE_ALLOW_PATH_ESCAPE", "0").lower() in ("1", "true", "yes")
+# run_bash kill-switch (default ON — coding agents need it to run tests) + bounds.
+RUN_BASH_ENABLED = os.getenv("DELEGATE_RUN_BASH", "1").lower() not in ("0", "false", "no")
+RUN_BASH_TIMEOUT = int(os.getenv("DELEGATE_RUN_BASH_TIMEOUT", "120"))
+_BASH_MAX_CONCURRENCY = int(os.getenv("DELEGATE_RUN_BASH_CONCURRENCY", "4"))
+# Agent name must be a bare filename component (no path separators / traversal), since it
+# is interpolated into agent-definition load paths.
+_AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Hint preventivo inyectado en el system prompt del agente delegado.
 # Reduce ReadTimeouts y context overflow en backends locales con techo de ctx por slot.
@@ -159,7 +240,21 @@ CONTEXT_SCOPE_HINT = (
     "stop reading and produce the final result.\n"
 )
 
-mcp = FastMCP("delegate-local")
+@asynccontextmanager
+async def _lifespan(_app):
+    """Close the shared httpx client on server shutdown (was leaked before)."""
+    try:
+        yield
+    finally:
+        global _http_client
+        if _http_client is not None and not _http_client.is_closed:
+            try:
+                await _http_client.aclose()
+            except Exception:
+                pass
+
+
+mcp = FastMCP("delegate-local", lifespan=_lifespan)
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -191,6 +286,10 @@ def _load_agent(name: str, workdir: str | None = None) -> tuple[dict, str, str] 
     Devuelve (frontmatter_dict, body_text, source) o None.
       source ∈ {"project-agent", "project-skill", "global"}
     """
+    # Reject anything that isn't a bare name — blocks path traversal via agent_name
+    # (e.g. "../../etc/passwd") being interpolated into the load paths below.
+    if not isinstance(name, str) or not _AGENT_NAME_RE.match(name):
+        return None
     candidates: list[tuple[pathlib.Path, str]] = []
     if workdir:
         wd = pathlib.Path(workdir)
@@ -250,15 +349,98 @@ AGENT_TOOLS = [
 ]
 
 
-def _resolve(workdir: str, path: str) -> str:
-    return path if os.path.isabs(path) else os.path.join(workdir, path)
+def _safe_resolve(workdir: str, path: str) -> str:
+    """Resolve `path` (relative to workdir, or absolute) and confine it to workdir unless
+    DELEGATE_ALLOW_PATH_ESCAPE=1. Blocks ../ traversal, absolute-path escape and symlink
+    escape (uses realpath). Raises ValueError on violation."""
+    if not isinstance(path, str) or not path:
+        raise ValueError("path inválido")
+    root = pathlib.Path(workdir).resolve()
+    raw = pathlib.Path(path)
+    candidate = raw if raw.is_absolute() else (root / raw)
+    resolved = candidate.resolve()
+    if ALLOW_PATH_ESCAPE:
+        return str(resolved)
+    if resolved != root and root not in resolved.parents:
+        raise ValueError(f"path escapes workdir (blocked): {path}")
+    return str(resolved)
 
 
-def _execute_tool(workdir: str, name: str, args: dict[str, Any]) -> str:
+def _kill_process_group(proc: "asyncio.subprocess.Process") -> None:
+    """Kill the whole process group of a subprocess started with start_new_session=True,
+    so children (shells, test runners) don't survive a timeout/cancellation."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
+_bash_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_bash_semaphore() -> asyncio.Semaphore:
+    global _bash_semaphore
+    if _bash_semaphore is None:
+        _bash_semaphore = asyncio.Semaphore(_BASH_MAX_CONCURRENCY)
+    return _bash_semaphore
+
+
+async def _run_bash(workdir: str, command: str) -> str:
+    """Run a shell command non-blockingly (own process group, bounded concurrency,
+    hard timeout). Never blocks the event loop the way subprocess.run(shell=True) did."""
+    if not RUN_BASH_ENABLED:
+        return "ERROR: run_bash disabled (DELEGATE_RUN_BASH=0)"
+    async with _get_bash_semaphore():
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command, cwd=workdir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except Exception as e:
+            return f"ERROR: {type(e).__name__}: {e}"
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=RUN_BASH_TIMEOUT)
+        except asyncio.TimeoutError:
+            _kill_process_group(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+            return f"ERROR: command timeout ({RUN_BASH_TIMEOUT}s)"
+        except asyncio.CancelledError:
+            _kill_process_group(proc)
+            raise
+        so = (out or b"").decode("utf-8", "replace")
+        se = (err or b"").decode("utf-8", "replace")
+        return (
+            f"exit_code: {proc.returncode}\n"
+            f"--- stdout ---\n{so[:12000]}\n"
+            f"--- stderr ---\n{se[:4000]}"
+        )
+
+
+async def _execute_tool(workdir: str, name: str, args: dict[str, Any]) -> str:
     """Ejecuta una tool del agente local. Devuelve string (limitado en tamaño)."""
     try:
         if name == "read_file":
-            with open(_resolve(workdir, args["path"]), encoding="utf-8", errors="replace") as f:
+            try:
+                fpath = _safe_resolve(workdir, args["path"])
+            except ValueError as e:
+                return f"ERROR: {e}"
+            try:
+                if os.path.getsize(fpath) > MAX_READ_FILE_BYTES:
+                    return (
+                        f"ERROR: file too large (> {MAX_READ_FILE_BYTES} bytes) to read whole; "
+                        f"read a narrower range with offset/limit"
+                    )
+            except OSError:
+                pass
+            with open(fpath, encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
             total = len(lines)
             try:
@@ -285,26 +467,27 @@ def _execute_tool(workdir: str, name: str, args: dict[str, Any]) -> str:
                 out.append(piece); chars += len(piece); last = idx
             return f"[file {args['path']} | líneas {offset}-{last} de {total}]\n" + "".join(out)
         elif name == "write_file":
-            path = _resolve(workdir, args["path"])
+            try:
+                path = _safe_resolve(workdir, args["path"])
+            except ValueError as e:
+                return f"ERROR: {e}"
+            content = args.get("content")
+            if not isinstance(content, str):
+                return "ERROR: content must be a string"
+            if len(content.encode("utf-8", "ignore")) > MAX_WRITE_BYTES:
+                return f"ERROR: content too large (> {MAX_WRITE_BYTES} bytes)"
             parent = os.path.dirname(path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
-                f.write(args["content"])
-            return f"OK: wrote {len(args['content'])} bytes to {args['path']}"
+                f.write(content)
+            return f"OK: wrote {len(content)} bytes to {args['path']}"
         elif name == "run_bash":
-            r = subprocess.run(
-                args["command"], shell=True, cwd=workdir,
-                capture_output=True, text=True, timeout=120,
-            )
-            return (
-                f"exit_code: {r.returncode}\n"
-                f"--- stdout ---\n{r.stdout[:12000]}\n"
-                f"--- stderr ---\n{r.stderr[:4000]}"
-            )
+            cmd = args.get("command")
+            if not isinstance(cmd, str):
+                return "ERROR: command must be a string"
+            return await _run_bash(workdir, cmd)
         return f"ERROR: unknown tool {name}"
-    except subprocess.TimeoutExpired:
-        return "ERROR: command timeout (120s)"
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
 
@@ -337,8 +520,10 @@ _OPENAI_FORMAT_PREFIXES: tuple[str, ...] = (
 
 
 def _is_openai_format(model: str) -> bool:
-    """True si el modelo requiere /v1/chat/completions (formato OpenAI)."""
-    return any(model.startswith(p) for p in _OPENAI_FORMAT_PREFIXES)
+    """True si el modelo requiere /v1/chat/completions (formato OpenAI). Case-insensitive
+    para que 'Grok-4.5' se enrute igual que 'grok-4.5'."""
+    m = model.lower() if isinstance(model, str) else ""
+    return any(m.startswith(p) for p in _OPENAI_FORMAT_PREFIXES)
 
 
 def _anthropic_to_openai_request(
@@ -557,7 +742,10 @@ async def _consume_anthropic_stream(response: httpx.Response) -> dict:
                     usage[k] = v
         elif etype == "error":
             err = ev.get("error") or {}
-            raise BackendStreamError(f"{err.get('type', 'error')}: {err.get('message', '')}")
+            raise BackendStreamError(
+                f"{err.get('type', 'error')}: {err.get('message', '')}",
+                retryable=_stream_error_retryable(err.get("type")),
+            )
 
     for idx, parts in partial_json.items():
         if idx >= len(content):
@@ -586,7 +774,10 @@ async def _consume_openai_stream(response: httpx.Response) -> dict:
     async for ev in _iter_sse_data(response):
         if ev.get("error"):
             err = ev["error"] if isinstance(ev["error"], dict) else {"message": str(ev["error"])}
-            raise BackendStreamError(f"{err.get('type', 'error')}: {err.get('message', '')}")
+            raise BackendStreamError(
+                f"{err.get('type', 'error')}: {err.get('message', '')}",
+                retryable=_stream_error_retryable(err.get("type")),
+            )
         if isinstance(ev.get("usage"), dict):
             usage = ev["usage"]
         choices = ev.get("choices") or []
@@ -640,34 +831,41 @@ async def _call_backend(
     model: str,
     tools: list[dict] | None = None,
     max_tokens: int = 65536,
+    url: str | None = None,
+    key: str | None = None,
 ) -> dict:
     """
-    Llama al backend LiteLLM. Detecta formato según modelo:
+    Llama al backend. Detecta formato según modelo:
       - openai-format (deepseek-*, gpt-*, etc.) → /v1/chat/completions
       - resto (bedrock-*, local-qwen-*, etc.) → /v1/messages (Anthropic)
     Devuelve estructura Anthropic-like en ambos casos para que el loop sea uniforme.
-    Con DELEGATE_STREAMING (default) consume el backend por SSE y acumula localmente:
-    misma estructura de retorno, pero sin esperas silenciosas de minutos.
+    Con DELEGATE_STREAMING (default) consume el backend por SSE y acumula localmente.
+
+    `url`/`key` se pasan EXPLÍCITAMENTE por dispatch (default = globals LITELLM_URL/KEY).
+    Antes se mutaban globals para rutear a otro provider — una carrera bajo concurrencia
+    (delegate_batch, delegate_to_provider) podía cruzar la key de un request con la URL de
+    otro. Ahora son parámetros locales, nunca estado compartido.
     """
+    endpoint = url if url else LITELLM_URL
+    eff_key = key if key is not None else LITELLM_KEY
     headers: dict[str, str] = {"Content-Type": "application/json"}
-    if LITELLM_KEY:
-        headers["x-api-key"] = LITELLM_KEY
-        headers["Authorization"] = f"Bearer {LITELLM_KEY}"
+    if eff_key:
+        headers["x-api-key"] = eff_key
+        headers["Authorization"] = f"Bearer {eff_key}"
     client = _get_http_client()
 
     if _is_openai_format(model):
         # OpenAI format → /v1/chat/completions
-        base = LITELLM_URL.rsplit("/v1/", 1)[0]
-        url = f"{base}/v1/chat/completions"
+        oai_url = f"{_derive_base(endpoint)}/v1/chat/completions"
         payload = _anthropic_to_openai_request(messages, system, tools, model, max_tokens)
         if DELEGATE_STREAMING:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
-            async with client.stream("POST", url, json=payload, headers=headers) as r:
+            async with client.stream("POST", oai_url, json=payload, headers=headers) as r:
                 await _raise_for_status_streamed(r)
                 openai_resp = await _consume_openai_stream(r)
             return _openai_to_anthropic_response(openai_resp)
-        r = await client.post(url, json=payload, headers=headers)
+        r = await client.post(oai_url, json=payload, headers=headers)
         r.raise_for_status()
         return _openai_to_anthropic_response(r.json())
     else:
@@ -683,10 +881,10 @@ async def _call_backend(
             payload["tools"] = tools
         if DELEGATE_STREAMING:
             payload["stream"] = True
-            async with client.stream("POST", LITELLM_URL, json=payload, headers=headers) as r:
+            async with client.stream("POST", endpoint, json=payload, headers=headers) as r:
                 await _raise_for_status_streamed(r)
                 return await _consume_anthropic_stream(r)
-        r = await client.post(LITELLM_URL, json=payload, headers=headers)
+        r = await client.post(endpoint, json=payload, headers=headers)
         r.raise_for_status()
         return r.json()
 
@@ -702,21 +900,28 @@ async def _delegate_one_impl(
     model: str = DEFAULT_MODEL,
     max_tokens: int | None = None,
     ctx: Context | None = None,
+    url: str | None = None,
+    key: str | None = None,
+    mode_tag: str | None = None,
 ) -> dict:
     """
     Internal implementation of a single agent dispatch loop. Not exposed as an MCP tool —
-    used by both delegate_to_local_agent (public tool) and delegate_batch (parallel wrapper).
+    used by delegate_to_local_agent, delegate_batch, and delegate_to_provider.
 
     Same arguments and return shape as delegate_to_local_agent. `ctx` is optional and only
     used when present (skipped in batch mode where nested progress reporting gets messy).
+    `url`/`key`/`mode_tag` override the default backend per dispatch WITHOUT mutating any
+    global (see delegate_to_provider); default None => the module globals.
     """
+    eff_mode = mode_tag if mode_tag is not None else MODE_TAG
     # Auto-route coding agents to CODING_MODEL when caller didn't override model.
     if model == DEFAULT_MODEL and agent_name.lower() in CODING_AGENTS:
         model = CODING_MODEL
 
-    # max_turns=0 (sentinel) => resolver por modelo: local 15, cloud 25.
+    # max_turns=0 (sentinel) => resolver por modelo: local 25 (benchmark 2026-07-03: 15
+    # rompe tareas iterativas), cloud 25.
     if not max_turns or max_turns <= 0:
-        max_turns = DEFAULT_MAX_TURNS if str(model).startswith("local-") else CLOUD_MAX_TURNS
+        max_turns = LOCAL_MAX_TURNS if str(model).lower().startswith("local-") else CLOUD_MAX_TURNS
     max_turns = max(1, min(max_turns, HARD_MAX_TURNS))
 
     # max_tokens=None (sentinel) => resolver por alias: "-max" tiers get more headroom
@@ -743,7 +948,7 @@ async def _delegate_one_impl(
 
     # System prompt: tag de routing + context-window hint + frontmatter info + body original del agente
     full_system = (
-        f"{MODE_TAG}\n\n"
+        f"{eff_mode}\n\n"
         f"You are running as the '{agent_name}' agent.\n"
         f"Workdir: {workdir_abs} (use relative paths or absolute).\n"
         f"You have 3 tools: read_file, write_file, run_bash. Use them iteratively.\n"
@@ -777,7 +982,13 @@ async def _delegate_one_impl(
         last_transient = None
         for attempt in range(BACKEND_MAX_RETRIES + 1):
             try:
-                resp = await _call_backend(messages, full_system, model, tools=AGENT_TOOLS, max_tokens=max_tokens)
+                resp = await asyncio.wait_for(
+                    _call_backend(
+                        messages, full_system, model, tools=AGENT_TOOLS,
+                        max_tokens=max_tokens, url=url, key=key,
+                    ),
+                    timeout=TURN_TIMEOUT,
+                )
                 break
             except httpx.HTTPStatusError as e:
                 code = e.response.status_code
@@ -793,10 +1004,12 @@ async def _delegate_one_impl(
                     "error": f"backend HTTP {code}: {e.response.text[:300]}",
                     "turn_failed": turn,
                 }
-            except (httpx.TimeoutException, httpx.TransportError, BackendStreamError) as e:
-                # Network-level transient (connect/read timeout, dropped conn) o error SSE
-                # mid-stream tras 200 OK (overload del backend): retry.
-                if attempt < BACKEND_MAX_RETRIES:
+            except (httpx.TimeoutException, httpx.TransportError, asyncio.TimeoutError, BackendStreamError) as e:
+                # Transient: network drop / connect-read timeout / per-turn deadline
+                # (TURN_TIMEOUT) / mid-stream SSE error after 200 OK. A BackendStreamError
+                # flagged non-retryable (auth/invalid_request/not_found) fails fast.
+                retryable = getattr(e, "retryable", True)
+                if retryable and attempt < BACKEND_MAX_RETRIES:
                     last_transient = f"{type(e).__name__}: {e}"
                     await asyncio.sleep(RETRY_BACKOFF[attempt])
                     continue
@@ -849,7 +1062,7 @@ async def _delegate_one_impl(
                 malformed += 1
                 result = f"ERROR: tool inválida o args mal formados ({name=})"
             else:
-                result = _execute_tool(workdir_abs, name, args)
+                result = await _execute_tool(workdir_abs, name, args)
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": tu_id,
@@ -859,8 +1072,21 @@ async def _delegate_one_impl(
 
     elapsed = time.time() - t0
 
+    # Don't report success on an incomplete run: hit the turn limit still wanting tools,
+    # got cut off at max_tokens mid-answer, or ended with no text and an unknown/truncated
+    # stop_reason (a truncated stream previously slipped through as success=True).
+    hit_turn_limit = turn >= max_turns and bool(tool_uses)
+    incomplete = (
+        hit_turn_limit
+        or stop_reason == "max_tokens"
+        # No text produced across the whole run, regardless of stop_reason: a truncated
+        # stream (unknown), a moderation cutoff (content_filter), or an empty end_turn all
+        # mean the dispatch produced nothing usable → not a success.
+        or not final_text.strip()
+    )
+
     return {
-        "success": True,
+        "success": not incomplete,
         "final_response": final_text,
         "agent_name": agent_name,
         "agent_source": agent_source,
@@ -879,7 +1105,8 @@ async def _delegate_one_impl(
             100 * total_cache_read / (total_in + total_cache_read + total_cache_creation), 1
         ) if (total_in + total_cache_read + total_cache_creation) else 0.0,
         "stop_reason": stop_reason,
-        "hit_turn_limit": turn >= max_turns and bool(tool_uses),
+        "hit_turn_limit": hit_turn_limit,
+        "incomplete": incomplete,
     }
 
 
@@ -913,8 +1140,8 @@ async def delegate_to_local_agent(
         workdir: Directorio de trabajo del agente (default: '.' del MCP). Recomendado pasar
                  ruta absoluta al proyecto donde trabajará.
         max_turns: Tope de iteraciones de tool-calling (hard cap 40). Default 0 = AUTO:
-               15 para backends locales (local-*, MoE-A3B con techo de ctx ~262K),
-               25 para backends cloud (MiniMax M3 512K, DeepSeek API, Sonnet/Opus).
+               25 para backends locales (local-*; benchmark 2026-07-03: 15 rompe tareas
+               iterativas de coding) y 25 para cloud (MiniMax M3 512K, DeepSeek, Sonnet/Opus).
                Pasar un valor explícito lo fuerza. Para tareas cortas conocidas: 5-10.
                Para review/análisis multi-archivo pesado en cloud: 25-30.
         model: Model alias as configured in your LiteLLM proxy (or direct provider).
@@ -944,7 +1171,7 @@ async def delegate_to_local_agent(
 # ────────────────────────────────────────────────────────────────────────────────
 # Tool batch: delegate_batch — N tasks en paralelo via asyncio.gather
 # ────────────────────────────────────────────────────────────────────────────────
-MAX_BATCH_SIZE = 2  # Felix rule 2026-07-02: oMLX runs max-concurrent=3 (single instance, threadgroup patch); 1 slot stays reserved for day-to-day (Nicole/bot/pipeline) -> coding uses at most 2. A 3rd+ coding task queues at oMLX (safe) but discipline = 2.
+MAX_BATCH_SIZE = int(os.getenv("DELEGATE_MAX_BATCH_SIZE", "2"))  # Felix rule 2026-07-02: oMLX runs max-concurrent=3 (single instance, threadgroup patch); 1 slot stays reserved for day-to-day (Nicole/bot/pipeline) -> coding uses at most 2. A 3rd+ coding task queues at oMLX (safe) but discipline = 2. Override via DELEGATE_MAX_BATCH_SIZE.
 
 
 @mcp.tool()
@@ -958,9 +1185,9 @@ async def delegate_batch(
     en backends que soportan paralelismo nativo (e.g., llama.cpp con --parallel 4).
 
     USE WHEN you have multiple independent sub-tasks and your backend has parallel slots
-    available (delegate cap = 4 = heavy-coding throughput sweet-spot; oMLX allows 8). With same agent_name
-    reused across tasks, you also benefit from KV cache prefix reuse on the shared system
-    prompt (~30-50% prompt-processing savings).
+    available (delegate cap = MAX_BATCH_SIZE, default 2; override via DELEGATE_MAX_BATCH_SIZE).
+    With same agent_name reused across tasks, you also benefit from KV cache prefix reuse on
+    the shared system prompt (~30-50% prompt-processing savings).
 
     LIMITATION: Sub-agents launched via Claude Code's Agent/Task tool do NOT inherit
     parent's MCP servers, so this tool cannot be called from within a sub-agent. It only
@@ -971,8 +1198,8 @@ async def delegate_batch(
         tasks: List of task dicts. Each dict has the same keys as delegate_to_local_agent's
                parameters: {agent_name, task, workdir?, max_turns?, model?, max_tokens?}.
                agent_name and task are required; rest use defaults.
-               Hard cap MAX_BATCH_SIZE (4) tasks per call. For more, split into multiple
-               calls or use sequential delegate_to_local_agent calls.
+               Hard cap MAX_BATCH_SIZE (default 2) tasks per call. For more, split into
+               multiple calls or use sequential delegate_to_local_agent calls.
 
     Returns:
         dict with keys:
@@ -1023,14 +1250,17 @@ async def delegate_batch(
                 "error": f"task {idx} is not a dict (got {type(t).__name__})",
                 "task_index": idx,
             }
-        agent_name = t.get("agent_name", "").strip()
-        task_str = t.get("task", "").strip()
-        if not agent_name or not task_str:
+        agent_name = t.get("agent_name")
+        task_str = t.get("task")
+        if not isinstance(agent_name, str) or not isinstance(task_str, str) \
+                or not agent_name.strip() or not task_str.strip():
             return {
                 "success": False,
-                "error": f"task {idx} missing required field(s): agent_name and task are required",
+                "error": f"task {idx} needs string 'agent_name' and 'task' (non-empty)",
                 "task_index": idx,
             }
+        agent_name = agent_name.strip()
+        task_str = task_str.strip()
         try:
             return await _delegate_one_impl(
                 agent_name=agent_name,
@@ -1111,7 +1341,7 @@ async def local_backend_status() -> dict:
     estado, modelos disponibles y latencia básica. Útil antes de delegar para validar
     que el backend está alcanzable.
     """
-    base = LITELLM_URL.rsplit("/v1/", 1)[0]
+    base = _derive_base(LITELLM_URL)
     out: dict[str, Any] = {
         "configured_url": LITELLM_URL,
         "default_model": DEFAULT_MODEL,
@@ -1122,6 +1352,7 @@ async def local_backend_status() -> dict:
             t0 = time.time()
             r = await client.get(f"{base}/health/liveliness")
             out["liveness"] = r.text.strip()[:100]
+            out["liveness_status"] = r.status_code
             out["liveness_ms"] = int((time.time() - t0) * 1000)
             headers = {}
             if LITELLM_KEY:
@@ -1147,6 +1378,28 @@ async def local_backend_status() -> dict:
 ## ────────────────────────────────────────────────────────────────────────────────
 CODEX_BIN = os.environ.get("DELEGATE_CODEX_BIN", "codex")
 CODEX_DEFAULT_MODEL = os.environ.get("DELEGATE_CODEX_MODEL", "gpt-5.6-sol")
+# 'danger-full-access' lets Codex run with no sandbox — gated behind an explicit env flag
+# so a routine dispatch can't request it.
+CODEX_ALLOW_DANGER = os.getenv("DELEGATE_CODEX_ALLOW_DANGER", "0").lower() in ("1", "true", "yes")
+# Cap on Codex stdout kept in RAM (only a tail is ever used for diagnostics; the final
+# message comes from the -o file). Bounds memory for a verbose/long (up to 30 min) run.
+CODEX_STDOUT_CAP = int(os.getenv("DELEGATE_CODEX_STDOUT_CAP", str(512 * 1024)))
+
+
+async def _drain_capped(stream: asyncio.StreamReader, cap_bytes: int) -> bytes:
+    """Read a stream to EOF keeping only the last `cap_bytes` (ring buffer). Prevents an
+    unbounded subprocess from exhausting RAM via communicate()."""
+    buf: deque[bytes] = deque()
+    size = 0
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        buf.append(chunk)
+        size += len(chunk)
+        while size > cap_bytes and len(buf) > 1:
+            size -= len(buf.popleft())
+    return b"".join(buf)
 # Modelos que el plan ChatGPT (no API key) SÍ permite vía `codex exec`. Verificado
 # en vivo con un ChatGPT Plus: los TRES sabores de GPT-5.6 (sol/terra/luna) + 5.5/5.4
 # responden nativos; gpt-5.6 "pelado" y gpt-5.6-codex devuelven 400 "not supported
@@ -1219,6 +1472,11 @@ async def delegate_to_codex(
         return {"success": False, "error": f"workdir no existe: {workdir_abs}"}
     if sandbox not in ("read-only", "workspace-write", "danger-full-access"):
         return {"success": False, "error": f"sandbox inválido: {sandbox}"}
+    if sandbox == "danger-full-access" and not CODEX_ALLOW_DANGER:
+        return {
+            "success": False,
+            "error": "sandbox 'danger-full-access' deshabilitado; set DELEGATE_CODEX_ALLOW_DANGER=1 para permitirlo.",
+        }
     if model not in CODEX_PLAN_MODELS:
         return {
             "success": False,
@@ -1258,32 +1516,43 @@ async def delegate_to_codex(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,  # own process group -> kill the whole tree on timeout/cancel
         )
-        try:
-            stdout_data, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            # Reap el hijo tras kill(): sin esto queda zombie y el transport del
-            # subproceso no se cierra (warnings "Task was destroyed / pending").
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=10)
-            except (asyncio.TimeoutError, ProcessLookupError):
-                pass
-            _cleanup_file(out_file)
-            return {
-                "success": False,
-                "error": f"codex timeout tras {timeout_s}s",
-                "model": model,
-                "elapsed_s": round(time.time() - t0, 1),
-            }
     except FileNotFoundError:
         return {
             "success": False,
             "error": f"codex binary no encontrado ('{CODEX_BIN}'). Instala @openai/codex y loguéate con tu plan.",
         }
+
+    try:
+        # Drain capped (bounded RAM) instead of communicate() which buffers everything.
+        stdout_data = await asyncio.wait_for(
+            _drain_capped(proc.stdout, CODEX_STDOUT_CAP), timeout=timeout_s
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
+    except asyncio.TimeoutError:
+        _kill_process_group(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
+        _cleanup_file(out_file)
+        return {
+            "success": False,
+            "error": f"codex timeout tras {timeout_s}s",
+            "model": model,
+            "elapsed_s": round(time.time() - t0, 1),
+        }
+    except BaseException:
+        # ANY other failure — client cancel (CancelledError), broken pipe / OSError during
+        # the drain, etc. — must still kill the codex process tree and remove the temp file.
+        # Listing only Timeout/Cancelled left orphaned processes on an unexpected exception.
+        _kill_process_group(proc)
+        _cleanup_file(out_file)
+        raise
 
     stdout_text = (stdout_data or b"").decode("utf-8", "replace")
     elapsed = round(time.time() - t0, 1)
@@ -1320,10 +1589,13 @@ async def delegate_to_codex(
     finally:
         _cleanup_file(out_file)
 
-    if not final_message and proc.returncode not in (0, None):
+    # Any non-zero exit is a failure — even if Codex wrote a partial final message before
+    # dying. The partial is returned as diagnostic, not passed off as a successful result.
+    if proc.returncode not in (0, None):
         return {
             "success": False,
             "error": f"codex salió con código {proc.returncode}",
+            "final_response": final_message or None,
             "stdout_tail": stdout_text[-1500:],
             "model": model, "elapsed_s": elapsed,
         }
@@ -1344,6 +1616,56 @@ def _cleanup_file(path: str) -> None:
             os.remove(path)
     except OSError:
         pass
+
+
+# SSRF guard for delegate_to_provider. If DELEGATE_PROVIDER_ALLOWED_HOSTS is set, only
+# those hosts are allowed. Otherwise (backward-compat, since localhost/Tailscale 100.x are
+# legit targets) everything is allowed EXCEPT cloud-metadata / link-local endpoints.
+_PROVIDER_ALLOWED_HOSTS = {
+    h.strip().lower() for h in os.getenv("DELEGATE_PROVIDER_ALLOWED_HOSTS", "").split(",") if h.strip()
+}
+
+
+async def _validate_provider_url(url: str) -> tuple[bool, str]:
+    if not isinstance(url, str) or not url:
+        return False, "provider_url requerido"
+    try:
+        p = urllib.parse.urlsplit(url)
+    except Exception:
+        return False, "provider_url no parseable"
+    if p.scheme not in ("http", "https"):
+        return False, f"esquema no permitido: {p.scheme!r} (usa http/https)"
+    host = (p.hostname or "").lower()
+    if not host:
+        return False, "provider_url sin host"
+    if _PROVIDER_ALLOWED_HOSTS:
+        if host not in _PROVIDER_ALLOWED_HOSTS:
+            return False, f"host '{host}' no está en DELEGATE_PROVIDER_ALLOWED_HOSTS"
+        return True, ""
+    if host in ("metadata.google.internal", "metadata"):
+        return False, f"host bloqueado (cloud metadata endpoint): {host}"
+    # Resolve the host and validate the RESOLVED IP(s), not the raw string. This catches
+    # numeric-encoded IPs (2852039166 / 0xA9FEA9FE / octal, which the OS resolver expands
+    # via inet_aton) and A-records pointing at internal/metadata IPs — a string-only check
+    # missed both. Loopback/RFC1918 stay allowed on purpose (Tailscale/LiteLLM local).
+    port = p.port or (443 if p.scheme == "https" else 80)
+    try:
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, OSError, ValueError):
+        infos = []
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr.split("%")[0])
+        except ValueError:
+            continue
+        # link-local covers the cloud-metadata IP (169.254.169.254 / fe80::) — the actual
+        # SSRF target. Loopback/RFC1918 stay allowed on purpose (Tailscale/LiteLLM local);
+        # note is_reserved is NOT used here (it flags IPv6 loopback ::1, a legit target).
+        if ip.is_link_local:
+            return False, f"host '{host}' resuelve a IP bloqueada: {addr}"
+    return True, ""
 
 
 @mcp.tool()
@@ -1371,19 +1693,16 @@ async def delegate_to_provider(
         agent_name, task, workdir, max_turns: igual que delegate_to_local_agent
         mode_tag: Tag a prepender en system prompt (default MODE:LOCAL — puede ser MODE:DEEPSEEK etc.)
     """
-    global LITELLM_URL, LITELLM_KEY, DEFAULT_MODEL, MODE_TAG
-    saved = (LITELLM_URL, LITELLM_KEY, DEFAULT_MODEL, MODE_TAG)
-    try:
-        LITELLM_URL = provider_url
-        LITELLM_KEY = api_key
-        DEFAULT_MODEL = model
-        MODE_TAG = mode_tag
-        return await delegate_to_local_agent(
-            agent_name=agent_name, task=task, workdir=workdir,
-            max_turns=max_turns, model=model, max_tokens=max_tokens, ctx=ctx,
-        )
-    finally:
-        LITELLM_URL, LITELLM_KEY, DEFAULT_MODEL, MODE_TAG = saved
+    ok, why = await _validate_provider_url(provider_url)
+    if not ok:
+        return {"success": False, "error": why}
+    # No global mutation: the backend override travels as explicit per-dispatch params, so
+    # concurrent providers/batches can never cross one request's key with another's URL.
+    return await _delegate_one_impl(
+        agent_name=agent_name, task=task, workdir=workdir,
+        max_turns=max_turns, model=model, max_tokens=max_tokens,
+        url=provider_url, key=api_key, mode_tag=mode_tag, ctx=ctx,
+    )
 
 
 # ────────────────────────────────────────────────────────────────────────────────

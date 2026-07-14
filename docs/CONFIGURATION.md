@@ -10,6 +10,17 @@ Complete reference for all environment variables and supported backend setups.
 | `DELEGATE_LOCAL_KEY` | `""` (empty) | No, but most providers require it | API key / bearer token. Sent as both `x-api-key` and `Authorization: Bearer <key>`. |
 | `DELEGATE_LOCAL_MODEL` | `local-qwen-3-6-35b` | No | Default model when the caller doesn't pass `model=...`. |
 | `DELEGATE_LOCAL_AGENTS_DIR` | `~/.claude/agents` | No | Where to look for global agents (tier 3 in the 3-tier lookup). |
+| `DELEGATE_STREAMING` | `1` | No | `0` reverts to classic request/response (no SSE). |
+| `DELEGATE_TURN_TIMEOUT` | `1800` | No | Hard per-turn wall-clock ceiling (s); a hit is retried as transient. |
+| `DELEGATE_LOCAL_MAX_TURNS` / `DELEGATE_CLOUD_MAX_TURNS` | `25` / `25` | No | Auto `max_turns` per backend class. Local floor is 25 (2026-07-03 benchmark). |
+| `DELEGATE_MAX_BATCH_SIZE` | `2` | No | Max tasks per `delegate_batch` call. |
+| `DELEGATE_ALLOW_PATH_ESCAPE` | `0` | No | `1` disables the workdir confinement on `read_file`/`write_file` (legacy behaviour). |
+| `DELEGATE_RUN_BASH` | `1` | No | `0` disables the `run_bash` agent tool. |
+| `DELEGATE_RUN_BASH_TIMEOUT` / `DELEGATE_RUN_BASH_CONCURRENCY` | `120` / `4` | No | `run_bash` per-call timeout (s) and max concurrent shells. |
+| `DELEGATE_MAX_READ_FILE_BYTES` / `DELEGATE_MAX_WRITE_BYTES` | `64MiB` / `8MiB` | No | Size guards for `read_file` / `write_file`. |
+| `DELEGATE_PROVIDER_ALLOWED_HOSTS` | `""` | No | Comma-separated allowlist for `delegate_to_provider` hosts (SSRF guard). Empty = allow all except metadata/link-local. |
+| `DELEGATE_CODEX_ALLOW_DANGER` | `0` | No | `1` allows Codex `sandbox="danger-full-access"`. |
+| `DELEGATE_CODEX_STDOUT_CAP` | `512KiB` | No | Ring-buffer cap on Codex stdout kept in RAM. |
 
 All env vars are read at MCP startup. To change them you need to restart the MCP server (or your Claude Code session).
 
@@ -380,8 +391,8 @@ The body (after the second `---`) becomes the agent's system prompt body. Anythi
 
 | Caller param | Default | Hard cap | When to change |
 |---|---|---|---|
-| `max_turns` | auto: 15 local / 25 cloud | 40 | Auto-resolved by backend (`local-*` → 15, cloud → 25). Lower for short single-shot tasks (3-5). Raise for complex multi-step debugging (20-30). |
-| `max_tokens` | 32768 (in code) | provider-dependent | Lower if your backend errors out. Raise if you see `stop_reason=max_tokens` truncating output. |
+| `max_turns` | auto: 25 local / 25 cloud | 40 | Auto-resolved by backend (`local-*` → 25 per 2026-07-03 benchmark, cloud → 25). Lower for short single-shot tasks (3-5). Raise for complex multi-step debugging (up to 40). |
+| `max_tokens` | 65536 (model-aware; `-max` → 150000) | provider-dependent (clamped) | Lower if your backend errors out. Raise if you see `stop_reason=max_tokens` truncating output. |
 
 `max_tokens` is set inside `_call_backend()` and isn't currently exposed as a tool parameter — if you need per-call control, modify the tool signature.
 

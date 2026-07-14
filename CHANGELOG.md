@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security (audit hardening 2026-07-13)
+- **P0 — cross-request key↔URL leak in `delegate_to_provider` fixed.** It used to route to another provider by mutating module globals (`LITELLM_URL`/`LITELLM_KEY`/`DEFAULT_MODEL`/`MODE_TAG`) around an `await`. Under concurrency (`delegate_batch`, two `delegate_to_provider` calls) the coroutines interleaved and one request could send its API key to another request's endpoint. The backend override now travels as **explicit per-dispatch parameters** (`url`/`key`/`mode_tag`) threaded through `_delegate_one_impl` → `_call_backend`; no global is ever mutated. Regression test: `tests/test_hardening.py::test_provider_no_global_race`.
+- **Path traversal in `read_file`/`write_file` closed.** Paths are now confined to the agent's `workdir` via realpath (`_safe_resolve`), blocking `../` traversal, absolute-path escape and symlink escape. `DELEGATE_ALLOW_PATH_ESCAPE=1` restores the old unconfined behaviour. `agent_name` is also validated (`^[A-Za-z0-9_-]+$`) so it can't be used to load a `.md` outside the agents dirs.
+- **`run_bash` no longer blocks the event loop.** Was `subprocess.run(shell=True)` (synchronous, up to 120 s freezing MCP/batch/progress). Now `asyncio.create_subprocess_shell` with its own process group, bounded concurrency (`DELEGATE_RUN_BASH_CONCURRENCY`), and a timeout that **kills the whole process tree** (was leaving children alive). Kill-switch `DELEGATE_RUN_BASH=0`.
+- **SSRF guard on `delegate_to_provider`.** `provider_url` must be http/https; cloud-metadata and link-local hosts are blocked. Set `DELEGATE_PROVIDER_ALLOWED_HOSTS` for a strict allowlist (localhost/Tailscale remain allowed by default so existing setups keep working).
+- **Codex hardening.** `danger-full-access` is gated behind `DELEGATE_CODEX_ALLOW_DANGER=1`; the subprocess runs in its own process group and is killed as a group on timeout/cancellation (no orphaned children); stdout is drained through a bounded ring buffer (`DELEGATE_CODEX_STDOUT_CAP`, was buffering an unbounded 30-min stream in RAM); any non-zero exit is now a failure even if a partial message was written.
+
+### Fixed (audit hardening 2026-07-13)
+- **Truncated/incomplete streams no longer report `success: True`.** A dispatch that hit the turn limit still wanting tools, was cut off at `max_tokens`, or ended with no text and an `unknown` stop_reason now returns `success: False` (+ an `incomplete` flag); the partial output is still included for diagnosis.
+- **Per-turn wall-clock deadline (`DELEGATE_TURN_TIMEOUT`, default 1800 s).** httpx `read=` only bounds the gap between chunks, so a backend dribbling one chunk every few minutes could keep a turn alive forever. Each backend call per turn is now wrapped in `asyncio.wait_for`; a hit is treated as transient (retried).
+- **Non-retryable SSE errors fail fast.** Mid-stream `error` events of type `authentication_error`/`invalid_request_error`/`not_found_error`/etc. are no longer retried 3× (only overload/rate-limit/transport are).
+- **Routing prefix match is case-insensitive** (`Grok-4.5` now routes like `grok-4.5`). Base-URL derivation (`_derive_base`) is robust to endpoints not ending exactly in `/v1/messages`.
+- **`max_tokens` input is guarded** — non-int or `<= 0` falls back to the model-aware default instead of crashing the clamp math or sending nonsense to the backend.
+- **Shared httpx client is closed on shutdown** via a FastMCP `lifespan` (was leaked).
+- **`Retry-After` HTTP-date form is honored** (was seconds-only).
+- **`delegate_batch` validates task fields** (string `agent_name`/`task`) instead of assuming and calling `.strip()`. `MAX_BATCH_SIZE` is now env-configurable (`DELEGATE_MAX_BATCH_SIZE`, default 2).
+- **`main.py` is a real entrypoint** (`from server import mcp; mcp.run()`), matching `docs/ARCHITECTURE.md`, instead of a stub print.
+
+### Docs
+- Corrected the misleading `max_turns` guidance (local auto = **25**, not 15 — the 2026-07-03 benchmark showed 15 breaks iterative coding) and the batch cap (**2**, not 4) in docstrings.
+
 ### Added
 - **Three-tier reasoning ladder for GLM, DeepSeek V4, and MiniMax M3** in `examples/litellm.example.yaml`, so you can dispatch by difficulty instead of defaulting everything to one setting: `glm-coding-plan` / `-think` (16K budget) / `-max` (32K budget) — all on the same flat-rate plan endpoint, thinking costs $0 extra; `deepseek-v4-pro` (reasoning_effort: high, explicit) / `-max` (effort: max); `minimax-m3` (thinking: enabled, explicit — M3 has no high/max tiers, just enabled/adaptive/disabled). New "Reasoning tiers" section in `docs/CONFIGURATION.md` documents the pattern and every gotcha found getting it working end-to-end.
 

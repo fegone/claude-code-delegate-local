@@ -21,7 +21,7 @@ The lesson is not "the model can't handle big context." It's that **accumulated 
 `delegate-local` v0.4.0 mitigates this in three ways:
 
 1. **Larger default HTTP timeout** (1800s) so the proxy/client doesn't cut requests prematurely.
-2. **Per-backend `max_turns` default** — auto since v0.6.0: 15 for local (`local-*`, MoE-A3B), 25 for cloud (MiniMax M3, DeepSeek, Sonnet/Opus). Multi-step cloud tasks aren't truncated by an artificially low cap, while local-backend users don't hit the saturation incident described above. Pass an explicit value to override.
+2. **Per-backend `max_turns` default** — auto: 25 for local (`local-*`, MoE-A3B) and 25 for cloud (MiniMax M3, DeepSeek, Sonnet/Opus). The 2026-07-03 benchmark showed a 15-turn local budget breaks iterative coding (agent cut off with tests still red), so local floors at 25. Pass an explicit value to override.
 3. **Built-in context-scope hint** injected into every delegated agent's system prompt, telling it to split mentally when work is large.
 
 Those defaults handle the symptoms. The orchestrator still has to handle the cause: **don't dispatch monolithic sprints to a single agent**.
@@ -212,7 +212,7 @@ For multi-phase sprints projected to take more than 15 minutes total: report par
 
 | Knob | Default | When to change |
 |---|---|---|
-| `max_turns` parameter | auto: 15 local / 25 cloud (v0.6.0) | Cloud backends (MiniMax M3, DeepSeek, Sonnet/Opus) auto-get 25 — no need to pass it. For heavy multi-file review, raise to 25-30. For known-short tasks, lower to 5-10. Raise toward 40 only when verified necessary. |
+| `max_turns` parameter | auto: 25 local / 25 cloud | Both local and cloud auto-get 25 (local floor per 2026-07-03 benchmark). For known-short tasks, lower to 5-10. Raise toward 40 only when verified necessary. |
 | `max_tokens` parameter | 65536 | Raise to 96K-131K only for thinking-mode models doing very long single-response generation. Default is fine for most coding work. |
 | HTTP client timeout | 1800s (in code) | If you're hitting timeouts, the problem is usually context saturation, not the timeout. Split the work instead of raising the timeout. |
 | Context-scope hint | always on | Disable by overriding `CONTEXT_SCOPE_HINT` in your fork if you have a backend with effectively unlimited context (rare). |

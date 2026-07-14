@@ -180,6 +180,16 @@ model_list:
       aws_secret_access_key: os.environ/AWS_SECRET_ACCESS_KEY
 
   # ═══════════════════════════════════════════════════════════════════════════
+  # xAI GROK — OpenAI-compatible (api.x.ai/v1). The server routes grok-* through
+  # /v1/chat/completions automatically (case-insensitive prefix match).
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  - model_name: grok-4.5
+    litellm_params:
+      model: xai/grok-4.5
+      api_key: os.environ/XAI_API_KEY
+
+  # ═══════════════════════════════════════════════════════════════════════════
   # ANTHROPIC DIRECT — if you don't use Bedrock
   # ═══════════════════════════════════════════════════════════════════════════
 
@@ -194,6 +204,7 @@ model_list:
 # export DEEPSEEK_API_KEY=sk-...
 # export ZAI_API_KEY=...            # Z.ai GLM Coding Plan key — from https://z.ai/model-api
 # export OPENAI_API_KEY=sk-...
+# export XAI_API_KEY=xai-...          # xAI Grok — from https://console.x.ai
 # export OPENROUTER_API_KEY=sk-or-v1-...
 # export ANTHROPIC_API_KEY=sk-ant-...
 # export AWS_ACCESS_KEY_ID=AKIA...

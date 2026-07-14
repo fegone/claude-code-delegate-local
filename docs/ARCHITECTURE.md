@@ -93,7 +93,7 @@ Tools available to the delegated agent:
 |---|---|---|
 | `read_file(path, offset?, limit?)` | Read file content with line numbers (relative to workdir or absolute). `offset`/`limit` for line-range pagination | Up to ~50KB per call; header `[lines N-M of TOTAL]` + continuation hint when capped |
 | `write_file(path, content)` | Write/overwrite file, create parent dirs | No size limit |
-| `run_bash(command)` | Execute shell command in workdir | 120s timeout, stdout truncated to 4KB, stderr to 2KB |
+| `run_bash(command)` | Execute shell command in workdir (async, own process group) | 120s timeout (`DELEGATE_RUN_BASH_TIMEOUT`), stdout truncated to 12KB, stderr to 4KB |
 
 ### 4. Dual-format backend routing
 
@@ -136,7 +136,7 @@ turn 2:   build request from history
 
 ### 6. max_tokens default
 
-`max_tokens` defaults to **32768** (set in `_call_backend`). This is intentionally high because:
+`max_tokens` defaults to **65536** (model-aware; `-max`-tier aliases auto-bump to 150000; clamped to each provider's cap). This is intentionally high because:
 
 - Thinking-mode models can consume 2-8K tokens just for `reasoning_content` before emitting any user-visible output.
 - Large single-shot outputs (e.g., a complete HTML file with embedded JS) can be 5-15K tokens.
