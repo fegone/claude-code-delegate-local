@@ -55,9 +55,9 @@ MODE_TAG = "MODE:LOCAL"
 # backends (large context, e.g. MiniMax M3 512K, DeepSeek API, Sonnet/Opus) are
 # also fine at 25-30.
 DEFAULT_MAX_TURNS = 25
-# Local backends (Ornith/Qwen MoE-A3B on oMLX). Benchmark 2026-07-03: a 15-turn budget
-# BREAKS iterative coding tasks — the agent gets cut off with tests still red before it
-# can run→fix→re-run. 25 is the validated floor for local coding; do NOT lower it.
+# Local backends (small thinking-on MoE coder models). A 15-turn budget BREAKS iterative
+# coding tasks — the agent gets cut off with tests still red before it can run→fix→re-run.
+# 25 is a validated floor for local coding; do NOT lower it.
 LOCAL_MAX_TURNS = int(os.getenv("DELEGATE_LOCAL_MAX_TURNS", "25"))
 # Cloud backends (MiniMax M3, DeepSeek API, Sonnet/Opus) tienen contextos grandes
 # (M3 = 512K) y aguantan más turnos de análisis multi-archivo sin saturar.
@@ -1171,7 +1171,7 @@ async def delegate_to_local_agent(
 # ────────────────────────────────────────────────────────────────────────────────
 # Tool batch: delegate_batch — N tasks en paralelo via asyncio.gather
 # ────────────────────────────────────────────────────────────────────────────────
-MAX_BATCH_SIZE = int(os.getenv("DELEGATE_MAX_BATCH_SIZE", "2"))  # Felix rule 2026-07-02: oMLX runs max-concurrent=3 (single instance, threadgroup patch); 1 slot stays reserved for day-to-day (Nicole/bot/pipeline) -> coding uses at most 2. A 3rd+ coding task queues at oMLX (safe) but discipline = 2. Override via DELEGATE_MAX_BATCH_SIZE.
+MAX_BATCH_SIZE = int(os.getenv("DELEGATE_MAX_BATCH_SIZE", "2"))  # Keep local-backend concurrency low: a single-instance local server has limited parallel slots, and reserving headroom for other workloads avoids saturation. A 3rd+ task queues at the backend (safe). Override via DELEGATE_MAX_BATCH_SIZE.
 
 
 @mcp.tool()
@@ -1374,7 +1374,7 @@ async def local_backend_status() -> dict:
 ## 5-hour message window — NO API key, NO proxy, no ToS gray area). Codex is its OWN
 ## agent (does its own read/write/bash in a sandbox), so we shell out to it and return
 ## its final message — we do NOT drive it through the LLM tool loop like other backends.
-## HIPAA: cloud model → NUNCA para proyectos con PHI (Neola pacientes/Curve/call-crm).
+## Privacy: cloud model → never use for projects with sensitive/regulated data (PHI/PII).
 ## ────────────────────────────────────────────────────────────────────────────────
 CODEX_BIN = os.environ.get("DELEGATE_CODEX_BIN", "codex")
 CODEX_DEFAULT_MODEL = os.environ.get("DELEGATE_CODEX_MODEL", "gpt-5.6-sol")
@@ -1452,8 +1452,8 @@ async def delegate_to_codex(
       - 'luna'  → gpt-5.6-luna
     También '5.5', '5.4', '5.4-mini'.
 
-    ⚠️ HIPAA: modelo cloud de OpenAI → NUNCA usar en proyectos con PHI (Neola pacientes,
-    Curve, call-crm). Solo proyectos sin datos sensibles.
+    ⚠️ Privacy: modelo cloud de OpenAI → NUNCA usar en proyectos con datos sensibles/
+    regulados (PHI/PII). Solo proyectos sin datos sensibles.
 
     ⚠️ Límite del plan: Plus da ~15-80 mensajes / ventana de 5h; una tarea pesada la
     drena. Si se agota → error de "usage limit"; esperar o usar Pro/API key.
