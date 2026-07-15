@@ -5,6 +5,6 @@ description = "MCP server that delegates Claude Code subagents to alternative ba
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "fastmcp>=3.3.1",
+    "fastmcp>=3.4.4",
     "httpx>=0.28.1",
 ]
