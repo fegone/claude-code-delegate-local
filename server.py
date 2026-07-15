@@ -209,6 +209,11 @@ ALLOW_PATH_ESCAPE = os.getenv("DELEGATE_ALLOW_PATH_ESCAPE", "0").lower() in ("1"
 # run_bash kill-switch (default ON — coding agents need it to run tests) + bounds.
 RUN_BASH_ENABLED = os.getenv("DELEGATE_RUN_BASH", "1").lower() not in ("0", "false", "no")
 RUN_BASH_TIMEOUT = int(os.getenv("DELEGATE_RUN_BASH_TIMEOUT", "120"))
+# Per-task ceiling inside delegate_batch. A hung provider (quota-saturated
+# plan, dead endpoint) must return a clean per-task error instead of hanging
+# the whole batch until the client gives up and cancels the MCP request
+# (observed live: 811s hang -> remote-cancel -> STDIO desync -> -32000).
+BATCH_TASK_TIMEOUT = int(os.getenv("DELEGATE_BATCH_TASK_TIMEOUT", "1800"))
 _BASH_MAX_CONCURRENCY = int(os.getenv("DELEGATE_RUN_BASH_CONCURRENCY", "4"))
 # Agent name must be a bare filename component (no path separators / traversal), since it
 # is interpolated into agent-definition load paths.
@@ -1287,9 +1292,62 @@ async def delegate_batch(
         )
 
     t0 = time.time()
-    results = await asyncio.gather(
-        *[_run_one_with_isolation(t, i) for i, t in enumerate(tasks)]
-    )
+
+    async def _run_one_bounded(t: dict, idx: int) -> dict:
+        try:
+            return await asyncio.wait_for(
+                _run_one_with_isolation(t, idx), timeout=BATCH_TASK_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "error": (
+                    f"batch task {idx} timed out after {BATCH_TASK_TIMEOUT}s "
+                    "(tune with DELEGATE_BATCH_TASK_TIMEOUT)"
+                ),
+                "task_index": idx,
+                "agent_name": t.get("agent_name", "?"),
+            }
+
+    pending: dict[asyncio.Task, int] = {
+        asyncio.create_task(_run_one_bounded(t, i)): i for i, t in enumerate(tasks)
+    }
+    results_by_idx: dict[int, dict] = {}
+    try:
+        while pending:
+            done, _ = await asyncio.wait(
+                set(pending), return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                idx = pending.pop(task)
+                try:
+                    results_by_idx[idx] = task.result()
+                except Exception as e:  # defensive: bounded wrapper should not raise
+                    results_by_idx[idx] = {
+                        "success": False,
+                        "error": f"batch task {idx} crashed: {type(e).__name__}: {e}",
+                        "task_index": idx,
+                    }
+            if ctx:
+                # Liveness heartbeat as tasks land — keeps impatient clients
+                # from assuming the batch died and cancelling mid-flight.
+                await ctx.report_progress(
+                    progress=len(results_by_idx),
+                    total=len(tasks),
+                    message=f"{len(results_by_idx)}/{len(tasks)} tasks done",
+                )
+    except asyncio.CancelledError:
+        # Client cancelled the MCP request (user abort / client timeout).
+        # Reap children and PROPAGATE so FastMCP acknowledges the cancel
+        # instead of later emitting a response for an already-cancelled id
+        # (that desync killed the STDIO connection -> -32000 on every
+        # subsequent call until restart).
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        raise
+
+    results = [results_by_idx[i] for i in range(len(tasks))]
     elapsed = time.time() - t0
 
     successes = sum(1 for r in results if r.get("success"))
