@@ -91,6 +91,76 @@ PROVIDER_MAX_TOKENS_CAP = {
     "glm-": 131_072,  # GLM-5.2 via Z.ai Anthropic-native endpoint
 }
 
+# ── Concurrencia POR PROVEEDOR ──────────────────────────────────────────────────
+# El cap de paralelismo NO es global: cada backend tiene su propio cuello de botella.
+#
+#   local-/ornith  → slots FÍSICOS del oMLX del Mac Studio (3 en total, 1 reservado
+#                    para el día a día: Nicole, pipeline, Hermes). Subirlo satura la
+#                    máquina y degrada trabajo de producción.
+#   glm-/deepseek- → no usan esos slots (corren en Z.ai / DeepSeek). Su único límite
+#                    real es la cuota del plan, que se consume más rápido pero no se
+#                    "satura" como un servidor local.
+#
+# Semáforos INDEPENDIENTES por proveedor: 6 GLM + 6 DeepSeek = 12 corriendo a la vez,
+# sin que ninguno le robe slots al otro ni al backend local.
+# Override por proveedor: DELEGATE_CONCURRENCY_GLM, _DEEPSEEK, _LOCAL, _CODEX, ...
+PROVIDER_CONCURRENCY = {
+    "local-": 2,
+    "ornith": 2,
+    "glm-": 6,
+    "deepseek-": 6,
+    "minimax": 4,
+    "grok": 4,
+    "codex": 4,
+    "gpt-": 4,
+}
+DEFAULT_PROVIDER_CONCURRENCY = int(os.getenv("DELEGATE_CONCURRENCY_DEFAULT", "4"))
+
+_provider_semaphores: dict[str, asyncio.Semaphore] = {}
+_provider_sem_lock: asyncio.Lock | None = None
+
+
+def _provider_key(model: str) -> str:
+    """Bucket de concurrencia al que pertenece un modelo. Prefijo más largo gana, para
+    que 'glm-coding-plan-max' y 'glm-' no caigan en buckets distintos por accidente."""
+    if not isinstance(model, str):
+        return "_default"
+    m = model.lower()
+    best = ""
+    for prefix in PROVIDER_CONCURRENCY:
+        if m.startswith(prefix) and len(prefix) > len(best):
+            best = prefix
+    return best or "_default"
+
+
+def _provider_concurrency(key: str) -> int:
+    """Slots del bucket. Env var por proveedor gana sobre la tabla."""
+    env = "DELEGATE_CONCURRENCY_" + key.strip("-_").upper().replace("-", "_")
+    raw = os.getenv(env)
+    if raw:
+        try:
+            n = int(raw)
+            if n >= 1:
+                return n
+        except ValueError:
+            pass
+    return PROVIDER_CONCURRENCY.get(key, DEFAULT_PROVIDER_CONCURRENCY)
+
+
+async def _get_provider_semaphore(model: str) -> tuple[asyncio.Semaphore, str]:
+    """Semáforo del proveedor de `model`, creado perezosamente. El lock evita que dos
+    corutinas creen dos semáforos distintos para el mismo bucket bajo carga."""
+    global _provider_sem_lock
+    key = _provider_key(model)
+    if _provider_sem_lock is None:
+        _provider_sem_lock = asyncio.Lock()
+    async with _provider_sem_lock:
+        sem = _provider_semaphores.get(key)
+        if sem is None:
+            sem = asyncio.Semaphore(_provider_concurrency(key))
+            _provider_semaphores[key] = sem
+    return sem, key
+
 
 def _provider_max_tokens_cap(model: str) -> int | None:
     """The hard output-token ceiling for a model's provider, or None if unbounded/unknown."""
@@ -1176,7 +1246,12 @@ async def delegate_to_local_agent(
 # ────────────────────────────────────────────────────────────────────────────────
 # Tool batch: delegate_batch — N tasks en paralelo via asyncio.gather
 # ────────────────────────────────────────────────────────────────────────────────
-MAX_BATCH_SIZE = int(os.getenv("DELEGATE_MAX_BATCH_SIZE", "2"))  # Keep local-backend concurrency low: a single-instance local server has limited parallel slots, and reserving headroom for other workloads avoids saturation. A 3rd+ task queues at the backend (safe). Override via DELEGATE_MAX_BATCH_SIZE.
+# Techo de tareas ACEPTADAS por llamada. Ya no es el limitador de concurrencia: eso lo
+# hacen los semáforos por proveedor (PROVIDER_CONCURRENCY). Aquí solo se acota el tamaño
+# del lote para que un error de tipeo no dispare 200 agentes. Un lote mixto de 12
+# (6 GLM + 6 DeepSeek) corre entero en paralelo; 12 tareas del MISMO proveedor arrancan
+# 6 y las otras 6 esperan en cola — se completan igual, no fallan.
+MAX_BATCH_SIZE = int(os.getenv("DELEGATE_MAX_BATCH_SIZE", "12"))
 
 
 @mcp.tool()
@@ -1189,8 +1264,14 @@ async def delegate_batch(
     Útil cuando el orquestador quiere ejecutar N sub-tareas independientes simultáneamente
     en backends que soportan paralelismo nativo (e.g., llama.cpp con --parallel 4).
 
-    USE WHEN you have multiple independent sub-tasks and your backend has parallel slots
-    available (delegate cap = MAX_BATCH_SIZE, default 2; override via DELEGATE_MAX_BATCH_SIZE).
+    Concurrency is enforced PER PROVIDER, not globally: local/ornith get 2 slots (real
+    oMLX capacity, one reserved for production work), while cloud providers get their own
+    independent pools (glm 6, deepseek 6, others 4). A mixed batch of 6 GLM + 6 DeepSeek
+    runs all 12 at once. Tasks beyond a provider's slots queue instead of failing.
+
+    USE WHEN you have multiple independent sub-tasks (batch cap = MAX_BATCH_SIZE, default
+    12; override via DELEGATE_MAX_BATCH_SIZE, or per provider via DELEGATE_CONCURRENCY_GLM,
+    DELEGATE_CONCURRENCY_DEEPSEEK, DELEGATE_CONCURRENCY_LOCAL, ...).
     With same agent_name reused across tasks, you also benefit from KV cache prefix reuse on
     the shared system prompt (~30-50% prompt-processing savings).
 
@@ -1266,16 +1347,22 @@ async def delegate_batch(
             }
         agent_name = agent_name.strip()
         task_str = task_str.strip()
+        model = t.get("model", DEFAULT_MODEL)
         try:
-            return await _delegate_one_impl(
-                agent_name=agent_name,
-                task=task_str,
-                workdir=t.get("workdir", "."),
-                max_turns=t.get("max_turns", 0),
-                model=t.get("model", DEFAULT_MODEL),
-                max_tokens=t.get("max_tokens"),  # None sentinel -> _delegate_one_impl resolves by alias
-                ctx=None,  # nested per-task progress reporting omitted in batch
-            )
+            # Semáforo POR PROVEEDOR: las tareas de backends distintos no compiten entre
+            # sí. Lo que exceda los slots de su proveedor espera aquí en vez de saturar
+            # el backend (o, en el caso local, de tumbar el trabajo de producción).
+            sem, prov = await _get_provider_semaphore(model)
+            async with sem:
+                return await _delegate_one_impl(
+                    agent_name=agent_name,
+                    task=task_str,
+                    workdir=t.get("workdir", "."),
+                    max_turns=t.get("max_turns", 0),
+                    model=model,
+                    max_tokens=t.get("max_tokens"),  # None sentinel -> _delegate_one_impl resolves by alias
+                    ctx=None,  # nested per-task progress reporting omitted in batch
+                )
         except Exception as e:
             return {
                 "success": False,
