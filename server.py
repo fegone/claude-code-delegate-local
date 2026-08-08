@@ -81,6 +81,17 @@ DEFAULT_MAX_TOKENS = 65536
 MAX_TIER_MAX_TOKENS = 150_000
 MAX_TIER_SUFFIXES = ("-max",)  # extend here if new "-max"-style aliases appear
 
+# The "-max" suffix is not the only signal. Some aliases reason heavily BY DEFAULT
+# and hit the exact same wall with nothing in the name to warn you. Verified
+# 2026-08-04: deepseek-v4-flash — which reasons at "high" out of the box, which is
+# why no separate "-think" alias exists for it — burned ~16k tokens of reasoning and
+# returned an EMPTY response at the 65536 default, reproducibly, on open-ended
+# prompts. deepseek-v4-pro likewise defaults to high effort. Matching only on the
+# suffix left the plain aliases exposed to the failure the suffix rule was written
+# to prevent. Prefix match, so a tier variant ("-max") and the plain alias both get
+# the headroom.
+HIGH_REASONING_PREFIXES = ("deepseek-v4-flash", "deepseek-v4-pro")
+
 # Hard per-provider output-token ceilings. A provider REJECTS a request whose
 # max_tokens exceeds its cap, so the "-max" auto-bump above (and any over-eager
 # explicit value) must be clamped to the target provider's limit. Verified live
@@ -173,6 +184,19 @@ def _provider_max_tokens_cap(model: str) -> int | None:
     return None
 
 
+def _wants_max_tier_budget(model: str) -> bool:
+    """True when a model needs the larger default token budget.
+
+    Two ways to qualify: an explicit deep-reasoning tier ("-max" suffix), or an
+    alias that reasons heavily by default and so hits the same starvation without
+    advertising it in its name.
+    """
+    if not isinstance(model, str):
+        return False
+    m = model.lower()
+    return m.endswith(MAX_TIER_SUFFIXES) or m.startswith(HIGH_REASONING_PREFIXES)
+
+
 def _resolve_max_tokens(model: str, max_tokens: int | None) -> int:
     """None (caller didn't pass one) => model-aware default; explicit value otherwise.
     Either way the result is clamped to the provider's hard cap so a "-max" auto-bump
@@ -188,7 +212,7 @@ def _resolve_max_tokens(model: str, max_tokens: int | None) -> int:
             if max_tokens <= 0:
                 max_tokens = None
     if max_tokens is None:
-        if isinstance(model, str) and model.lower().endswith(MAX_TIER_SUFFIXES):
+        if _wants_max_tier_budget(model):
             max_tokens = MAX_TIER_MAX_TOKENS
         else:
             max_tokens = DEFAULT_MAX_TOKENS
@@ -1221,12 +1245,16 @@ async def delegate_to_local_agent(
                Para review/análisis multi-archivo pesado en cloud: 25-30.
         model: Model alias as configured in your LiteLLM proxy (or direct provider).
                Default 'local-qwen-3-6-35b'. Override via DELEGATE_LOCAL_MODEL env var.
-        max_tokens: Tope de tokens por turno del modelo. Default = 65536, EXCEPTO si
-               `model` termina en "-max" (p.ej. glm-coding-plan-max, deepseek-v4-pro-max)
-               -> default sube a 150000 automático. Motivo: en deep-reasoning tiers el
-               modelo puede gastar TODO el budget pensando y no dejar nada para la
-               respuesta (verificado: deepseek-v4-pro-max con 32K devolvió 0 tool_calls,
-               respuesta vacía). Pasar un valor explícito siempre gana sobre el auto-bump.
+        max_tokens: Tope de tokens por turno del modelo. Default = 65536, EXCEPTO para
+               modelos que razonan fuerte, donde sube a 150000 automático. Califican
+               dos grupos: (a) los tiers "-max" (glm-coding-plan-max, deepseek-v4-pro-max)
+               y (b) los alias que razonan por default aunque nada en el nombre lo
+               anuncie (deepseek-v4-flash, deepseek-v4-pro). Motivo: el modelo puede
+               gastar TODO el budget pensando y no dejar nada para la respuesta
+               (verificado: deepseek-v4-pro-max con 32K devolvió 0 tool_calls y
+               respuesta vacía; deepseek-v4-flash con el default 65536 quemó ~16k de
+               razonamiento y devolvió respuesta vacía en prompts abiertos).
+               Pasar un valor explícito siempre gana sobre el auto-bump.
 
     Returns:
         dict con keys: success, final_response, turns, tool_calls, malformed_calls,

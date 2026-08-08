@@ -22,7 +22,23 @@ def _restore_patches():
 
 
 def run_coro(coro):
-    return asyncio.run(coro)
+    """Run a coroutine from a sync test.
+
+    ``asyncio.run`` clears the current event loop on exit. These tests are sync
+    and run before ``test_streaming.py``, whose tests are ``async def`` — so
+    without restoring the loop afterwards those 8 tests fail with "coroutine was
+    never awaited" when the suite runs as a whole, while passing when that file
+    is run on its own.
+    """
+    try:
+        prev = asyncio.get_event_loop_policy().get_event_loop()
+    except RuntimeError:
+        prev = None
+    try:
+        return asyncio.run(coro)
+    finally:
+        if prev is not None and not prev.is_closed():
+            asyncio.set_event_loop(prev)
 
 
 # ── P0: no global mutation / no cross-request key↔url leak ────────────────────
@@ -97,6 +113,24 @@ def test_resolve_max_tokens_guard():
     assert server._resolve_max_tokens("glm-coding-plan", 999999) == 131072      # capped
     assert server._resolve_max_tokens("deepseek-v4-pro-max", None) == server.MAX_TIER_MAX_TOKENS
     print("PASS max_tokens guards bad input, caps, and -max bump")
+
+
+# ── Aliases that reason by default get the bump WITHOUT a "-max" suffix ───────
+def test_resolve_max_tokens_high_reasoning_defaults():
+    """deepseek-v4-flash reasons at "high" out of the box, so it starves at the
+    65536 default exactly like a "-max" tier — verified 2026-08-04: ~16k tokens
+    spent reasoning, empty response. Matching on the suffix alone left it exposed.
+    """
+    assert server._resolve_max_tokens("deepseek-v4-flash", None) == server.MAX_TIER_MAX_TOKENS
+    assert server._resolve_max_tokens("deepseek-v4-pro", None) == server.MAX_TIER_MAX_TOKENS
+    # Case-insensitive, like the routing prefix match.
+    assert server._resolve_max_tokens("DeepSeek-V4-Flash", None) == server.MAX_TIER_MAX_TOKENS
+    # An explicit value still wins over the auto-bump.
+    assert server._resolve_max_tokens("deepseek-v4-flash", 8000) == 8000
+    # Models that do NOT reason by default keep the ordinary ceiling.
+    assert server._resolve_max_tokens("deepseek-v4-lite", None) == server.DEFAULT_MAX_TOKENS
+    assert server._resolve_max_tokens("glm-coding-plan", None) == server.DEFAULT_MAX_TOKENS
+    print("PASS reason-by-default aliases get the max-tier budget without a suffix")
 
 
 # ── P2: robust base derivation ────────────────────────────────────────────────
@@ -188,11 +222,15 @@ def test_success_gating_empty_nonunknown_stop():
     print("PASS empty output with end_turn/content_filter -> success=False")
 
 
-# ── local turn floor stays 25 (iterative-coding benchmark), batch default 2 ────
+# ── local turn floor stays 25 (iterative-coding benchmark), batch cap 12 ──────
 def test_local_turns_floor_and_batch():
     assert server.LOCAL_MAX_TURNS == 25, "local floor must stay 25 (iterative-coding benchmark)"
-    assert server.MAX_BATCH_SIZE == 2
-    print("PASS local turn floor 25, batch cap 2")
+    # Was 2 back when a single global semaphore capped concurrency. Per-provider
+    # semaphores replaced that, so the batch cap is now only a typo guard: 12 lets
+    # a mixed 6-GLM + 6-DeepSeek batch run fully in parallel. 12 tasks on the SAME
+    # provider still start 6 and queue the rest — they complete, they don't fail.
+    assert server.MAX_BATCH_SIZE == 12
+    print("PASS local turn floor 25, batch cap 12")
 
 
 if __name__ == "__main__":
@@ -201,6 +239,7 @@ if __name__ == "__main__":
     test_agent_name_rejects_traversal()
     test_openai_format_case_insensitive()
     test_resolve_max_tokens_guard()
+    test_resolve_max_tokens_high_reasoning_defaults()
     test_derive_base()
     test_validate_provider_url()
     test_stream_error_retryable()

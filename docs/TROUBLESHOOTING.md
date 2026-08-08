@@ -64,7 +64,11 @@ The fix takes effect on next sub-agent dispatch — **no Claude Code restart nee
 
 **Cause**: Thinking-mode models can consume thousands of tokens just reasoning before emitting visible output. If `max_tokens` is too low, the model runs out of budget before saying anything user-visible.
 
-**Fix**: Pass a higher `max_tokens` to the tool call (default is 65536 in v0.3.0+, but you can override):
+**The trap is that the model name often doesn't warn you.** A `-max` tier alias obviously reasons hard, but some aliases reason at high effort *by default* with nothing in the name to signal it — `deepseek-v4-flash` is one (there is no separate `-think` variant precisely because there is nothing left to raise). Measured 2026-08-04: on open-ended prompts it spent ~16k tokens reasoning and returned an empty response at the 65536 default.
+
+The server now auto-bumps the default to 150000 for both groups — `-max` suffixed tiers *and* the aliases known to reason by default (`HIGH_REASONING_PREFIXES` in `server.py`). If you add a provider whose model reasons heavily out of the box, add its prefix there or you will hit this.
+
+**Fix**: An explicit `max_tokens` always overrides the auto-bump, in either direction:
 
 ```python
 mcp__delegate-local__delegate_to_local_agent(
@@ -90,6 +94,10 @@ mcp__delegate-local__delegate_to_local_agent(
 **Cause**: Wrong API key or the backend requires authentication you didn't send.
 
 **Fix**: Verify `DELEGATE_LOCAL_KEY` matches your backend's expected key. For LiteLLM, this is the `master_key` in your `general_settings`. For direct providers, it's the provider's API key.
+
+**LiteLLM gotcha — a model added through the admin API can 401 silently.** If you register a new alias via LiteLLM's `/model/new` endpoint (or the admin UI) and its `api_key` is written as an environment reference like `os.environ/YOUR_PROVIDER_KEY`, LiteLLM stores that string in its database **without resolving it**. Aliases defined in `config.yaml` get the reference expanded at load time; aliases that live in the DB do not. The result is a model that appears correctly in `/v1/models` and fails every real request with a 401 that names the *provider*, not LiteLLM — so it reads like your provider key is wrong when it is actually fine.
+
+Define aliases in `config.yaml` and reload the proxy. Confirmed 2026-08-04 after chasing a phantom bad key.
 
 ### `backend HTTP 404 or connection refused`
 

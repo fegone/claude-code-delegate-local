@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed (2026-08-08)
+- **Aliases that reason by default now get the larger token budget, without needing a `-max` suffix.** The auto-bump introduced for deep-reasoning tiers matched only on the `-max` suffix, which left the exact same starvation open for models that reason at high effort out of the box. Measured 2026-08-04: `deepseek-v4-flash` at the 65536 default spent ~16k tokens reasoning and returned an **empty** response on open-ended prompts, reproducibly — the failure the suffix rule existed to prevent, on a model the rule never covered. `deepseek-v4-pro` defaults to high effort too. Both now qualify via the new `HIGH_REASONING_PREFIXES`; add a prefix there when onboarding a provider whose model reasons by default. Regression test: `tests/test_hardening.py::test_resolve_max_tokens_high_reasoning_defaults`.
+- **Test suite is green again (was 9 failing).** Two unrelated causes, both pre-existing:
+  - The 8 stream-accumulator tests are `async def` but there was no pytest-asyncio configuration, so pytest collected them and never awaited the coroutines. They passed when the file was run standalone (`python tests/test_streaming.py`) and failed under `pytest`, which is the worst possible split. Added `asyncio_mode = "auto"` to `pyproject.toml`.
+  - `run_coro` in `tests/test_hardening.py` calls `asyncio.run`, which clears the current event loop on exit. Since those sync tests run first, they left the async tests in the next file with no loop — so the streaming tests passed alone and failed as part of the suite. `run_coro` now restores the previous loop.
+- **`test_local_turns_floor_and_batch` asserted a stale `MAX_BATCH_SIZE == 2`.** The per-provider concurrency change raised the cap to 12 (it is now only a typo guard, not the concurrency limiter) and the assertion was not updated with it.
+
+### Docs (2026-08-08)
+- `TROUBLESHOOTING.md`: the empty-response section now explains that the model name often does not signal heavy reasoning, and documents the auto-bump.
+- `TROUBLESHOOTING.md`: new LiteLLM gotcha — an alias registered through `/model/new` with an `os.environ/...` api_key is stored **unresolved**, so it lists fine in `/v1/models` and 401s on every real request with an error naming the provider rather than LiteLLM. Define aliases in `config.yaml`.
+- `README.md`: guidance on choosing between the DeepSeek tiers (flash as the default for coding/agentic, pro for long reasoning chains), flagged as vendor self-reported benchmarks worth validating locally. Added GLM Coding Plan to the tested-with table.
+
 ### Security (audit hardening 2026-07-13)
 - **P0 — cross-request key↔URL leak in `delegate_to_provider` fixed.** It used to route to another provider by mutating module globals (`LITELLM_URL`/`LITELLM_KEY`/`DEFAULT_MODEL`/`MODE_TAG`) around an `await`. Under concurrency (`delegate_batch`, two `delegate_to_provider` calls) the coroutines interleaved and one request could send its API key to another request's endpoint. The backend override now travels as **explicit per-dispatch parameters** (`url`/`key`/`mode_tag`) threaded through `_delegate_one_impl` → `_call_backend`; no global is ever mutated. Regression test: `tests/test_hardening.py::test_provider_no_global_race`.
 - **Path traversal in `read_file`/`write_file` closed.** Paths are now confined to the agent's `workdir` via realpath (`_safe_resolve`), blocking `../` traversal, absolute-path escape and symlink escape. `DELEGATE_ALLOW_PATH_ESCAPE=1` restores the old unconfined behaviour. `agent_name` is also validated (`^[A-Za-z0-9_-]+$`) so it can't be used to load a `.md` outside the agents dirs.
