@@ -8,3 +8,10 @@ dependencies = [
     "fastmcp>=3.4.4",
     "httpx>=0.28.1",
 ]
+
+[tool.pytest.ini_options]
+# The stream-accumulator tests are `async def`. Without this, pytest collects them,
+# never awaits the coroutine, and reports 8 failures for tests that actually pass
+# (they were written to run standalone: `python tests/test_streaming.py`).
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

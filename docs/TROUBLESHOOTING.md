@@ -64,7 +64,11 @@ The fix takes effect on next sub-agent dispatch — **no Claude Code restart nee
 
 **Cause**: Thinking-mode models can consume thousands of tokens just reasoning before emitting visible output. If `max_tokens` is too low, the model runs out of budget before saying anything user-visible.
 
-**Fix**: Pass a higher `max_tokens` to the tool call (default is 65536 in v0.3.0+, but you can override):
+**The trap is that the model name often doesn't warn you.** A `-max` tier alias obviously reasons hard, but some aliases reason at high effort *by default* with nothing in the name to signal it — `deepseek-v4-flash` is one (there is no separate `-think` variant precisely because there is nothing left to raise). Measured 2026-08-04: on open-ended prompts it spent ~16k tokens reasoning and returned an empty response at the 65536 default.
+
+The server now auto-bumps the default to 150000 for both groups — `-max` suffixed tiers *and* the aliases known to reason by default (`HIGH_REASONING_PREFIXES` in `server.py`). If you add a provider whose model reasons heavily out of the box, add its prefix there or you will hit this.
+
+**Fix**: An explicit `max_tokens` always overrides the auto-bump, in either direction:
 
 ```python
 mcp__delegate-local__delegate_to_local_agent(
@@ -74,6 +78,60 @@ mcp__delegate-local__delegate_to_local_agent(
     task="..."
 )
 ```
+
+### `success: true` but the work is half-done
+
+**Symptom**: The dispatch reports success, `stop_reason` is `end_turn`, `incomplete` is
+false — and the code is wrong. A variable is parsed and never used, tests are failing, a
+file was never written.
+
+**Cause**: the agent ended its turn *announcing* an action instead of taking it — "I'll run
+the tests to verify everything works correctly" — and stopped. Before this was fixed, the
+loop ended on the first turn with no tool calls and, since there was text and the stop
+reason looked clean, reported success.
+
+**Fix**: already in the loop. A tool-less turn is now prodded up to `MAX_COMPLETION_NUDGES`
+times (default 2, override with `DELEGATE_MAX_NUDGES`) before the run is accepted as
+finished.
+
+**What to look for in the result**: `nudges` and `resumed_after_nudge`. If
+`resumed_after_nudge` is `true`, the agent produced tool calls only *after* being prodded —
+it was not done when it first stopped, and the old loop would have reported that run as a
+clean success. Treat those results with suspicion and check the work.
+
+> Independently of this: **do not trust `success: true` as proof that tests pass.** Run them
+> yourself. Models self-report optimistically, and no harness change removes that.
+
+### Agentic runs on GLM are slow and get slower with each turn
+
+**Symptom**: a simple coding task takes far longer than it should, and each turn is slower
+than the last.
+
+**Cause**: prompt caching in Anthropic format is **not automatic**. It only happens where an
+explicit `cache_control` breakpoint is set. Without one, every turn of an agentic loop
+reprocesses the entire conversation — which grows every turn, so cost and latency scale
+quadratically with turn count. A LiteLLM config comment claiming a provider caches
+"automatically" is worth verifying rather than believing; ours was wrong.
+
+**Fix**: already applied for allowlisted providers (`glm-`, `bedrock-`, `claude-`,
+`anthropic/`). Verify it is working by checking `cache_read_tokens` in the result — it
+should be large from the second turn onward.
+
+**If you add a provider**: add its prefix to `_supports_prompt_caching` only after testing.
+The Anthropic branch also serves `local-*` aliases that LiteLLM forwards to an OpenAI-format
+server; marking those either drops the marker or 400s the request.
+
+### `cache_read_tokens: 0` on a local model
+
+Not necessarily a bug. Local backends served through the OpenAI path report
+`prompt_tokens_details.cached_tokens`, which this server normalizes — a zero there is a real
+zero, but the cause is usually on the server side (prefix cache full, or evicted), not here.
+
+Before concluding the model is slow, **check whether something else is saturating it**. A
+shared local inference server with another workload hitting it will queue your requests
+behind theirs; the symptom is indistinguishable from "the model is bad" unless you look at
+throughput. Compare tokens/sec against a known-good baseline with the machine otherwise
+idle. Any quality judgement made while the server is saturated is worthless.
 
 ### `hit_turn_limit: true` and the agent never finished writing
 
@@ -90,6 +148,10 @@ mcp__delegate-local__delegate_to_local_agent(
 **Cause**: Wrong API key or the backend requires authentication you didn't send.
 
 **Fix**: Verify `DELEGATE_LOCAL_KEY` matches your backend's expected key. For LiteLLM, this is the `master_key` in your `general_settings`. For direct providers, it's the provider's API key.
+
+**LiteLLM gotcha — a model added through the admin API can 401 silently.** If you register a new alias via LiteLLM's `/model/new` endpoint (or the admin UI) and its `api_key` is written as an environment reference like `os.environ/YOUR_PROVIDER_KEY`, LiteLLM stores that string in its database **without resolving it**. Aliases defined in `config.yaml` get the reference expanded at load time; aliases that live in the DB do not. The result is a model that appears correctly in `/v1/models` and fails every real request with a 401 that names the *provider*, not LiteLLM — so it reads like your provider key is wrong when it is actually fine.
+
+Define aliases in `config.yaml` and reload the proxy. Confirmed 2026-08-04 after chasing a phantom bad key.
 
 ### `backend HTTP 404 or connection refused`
 

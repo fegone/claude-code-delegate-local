@@ -22,7 +22,23 @@ def _restore_patches():
 
 
 def run_coro(coro):
-    return asyncio.run(coro)
+    """Run a coroutine from a sync test.
+
+    ``asyncio.run`` clears the current event loop on exit. These tests are sync
+    and run before ``test_streaming.py``, whose tests are ``async def`` — so
+    without restoring the loop afterwards those 8 tests fail with "coroutine was
+    never awaited" when the suite runs as a whole, while passing when that file
+    is run on its own.
+    """
+    try:
+        prev = asyncio.get_event_loop_policy().get_event_loop()
+    except RuntimeError:
+        prev = None
+    try:
+        return asyncio.run(coro)
+    finally:
+        if prev is not None and not prev.is_closed():
+            asyncio.set_event_loop(prev)
 
 
 # ── P0: no global mutation / no cross-request key↔url leak ────────────────────
@@ -97,6 +113,24 @@ def test_resolve_max_tokens_guard():
     assert server._resolve_max_tokens("glm-coding-plan", 999999) == 131072      # capped
     assert server._resolve_max_tokens("deepseek-v4-pro-max", None) == server.MAX_TIER_MAX_TOKENS
     print("PASS max_tokens guards bad input, caps, and -max bump")
+
+
+# ── Aliases that reason by default get the bump WITHOUT a "-max" suffix ───────
+def test_resolve_max_tokens_high_reasoning_defaults():
+    """deepseek-v4-flash reasons at "high" out of the box, so it starves at the
+    65536 default exactly like a "-max" tier — verified 2026-08-04: ~16k tokens
+    spent reasoning, empty response. Matching on the suffix alone left it exposed.
+    """
+    assert server._resolve_max_tokens("deepseek-v4-flash", None) == server.MAX_TIER_MAX_TOKENS
+    assert server._resolve_max_tokens("deepseek-v4-pro", None) == server.MAX_TIER_MAX_TOKENS
+    # Case-insensitive, like the routing prefix match.
+    assert server._resolve_max_tokens("DeepSeek-V4-Flash", None) == server.MAX_TIER_MAX_TOKENS
+    # An explicit value still wins over the auto-bump.
+    assert server._resolve_max_tokens("deepseek-v4-flash", 8000) == 8000
+    # Models that do NOT reason by default keep the ordinary ceiling.
+    assert server._resolve_max_tokens("deepseek-v4-lite", None) == server.DEFAULT_MAX_TOKENS
+    assert server._resolve_max_tokens("glm-coding-plan", None) == server.DEFAULT_MAX_TOKENS
+    print("PASS reason-by-default aliases get the max-tier budget without a suffix")
 
 
 # ── P2: robust base derivation ────────────────────────────────────────────────
@@ -188,11 +222,64 @@ def test_success_gating_empty_nonunknown_stop():
     print("PASS empty output with end_turn/content_filter -> success=False")
 
 
-# ── local turn floor stays 25 (iterative-coding benchmark), batch default 2 ────
+# ── local turn floor stays 25 (iterative-coding benchmark), batch cap 12 ──────
 def test_local_turns_floor_and_batch():
     assert server.LOCAL_MAX_TURNS == 25, "local floor must stay 25 (iterative-coding benchmark)"
-    assert server.MAX_BATCH_SIZE == 2
-    print("PASS local turn floor 25, batch cap 2")
+    # Was 2 back when a single global semaphore capped concurrency. Per-provider
+    # semaphores replaced that, so the batch cap is now only a typo guard: 12 lets
+    # a mixed 6-GLM + 6-DeepSeek batch run fully in parallel. 12 tasks on the SAME
+    # provider still start 6 and queue the rest — they complete, they don't fail.
+    assert server.MAX_BATCH_SIZE == 12
+    print("PASS local turn floor 25, batch cap 12")
+
+
+# ── Prompt caching: breakpoints solo donde el backend los honra ────────────────
+def test_prompt_caching_allowlist():
+    """cache_control is an allowlist, not a blanket. The Anthropic branch also serves
+    local-* aliases that LiteLLM forwards to an OpenAI-format server; marking those
+    would either drop the marker or 400 the request."""
+    assert server._supports_prompt_caching("glm-coding-plan") is True
+    assert server._supports_prompt_caching("bedrock-sonnet-4-6") is True
+    assert server._supports_prompt_caching("local-qwen-3-6-35b") is False
+    assert server._supports_prompt_caching("ornith-think") is False
+    assert server._supports_prompt_caching(None) is False
+    print("PASS prompt-caching allowlist keeps local backends unmarked")
+
+
+def test_apply_cache_control_marks_three_breakpoints():
+    """Anthropic prompt caching is NOT automatic — without explicit breakpoints every
+    agentic turn reprocesses the whole growing conversation. Verified 2026-08-08 that
+    none were being set anywhere."""
+    payload = {
+        "model": "glm-coding-plan",
+        "system": "you are an agent",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "read_file"}, {"name": "run_bash"}],
+    }
+    server._apply_cache_control(payload, "glm-coding-plan")
+
+    assert payload["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in payload["tools"][0]      # only the last tool
+    assert payload["messages"][-1]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    print("PASS cache_control marks system, last tool, and final message")
+
+
+def test_apply_cache_control_leaves_local_backends_alone():
+    payload = {"model": "local-qwen-3-6-35b", "system": "x",
+               "messages": [{"role": "user", "content": "y"}]}
+    server._apply_cache_control(payload, "local-qwen-3-6-35b")
+    assert payload["system"] == "x"                        # untouched string, not a block
+    assert payload["messages"][0]["content"] == "y"
+    print("PASS local backends are never given cache_control")
+
+
+def test_nudge_constants_are_sane():
+    """A tool-less turn must be prodded before the loop believes it. Ending on the first
+    one reported half-done work as success (verified 2026-08-08)."""
+    assert server.MAX_COMPLETION_NUDGES >= 1
+    assert "without calling a tool" in server.NUDGE_TEXT
+    print("PASS completion-nudge is configured")
 
 
 if __name__ == "__main__":
@@ -201,6 +288,11 @@ if __name__ == "__main__":
     test_agent_name_rejects_traversal()
     test_openai_format_case_insensitive()
     test_resolve_max_tokens_guard()
+    test_resolve_max_tokens_high_reasoning_defaults()
+    test_prompt_caching_allowlist()
+    test_apply_cache_control_marks_three_breakpoints()
+    test_apply_cache_control_leaves_local_backends_alone()
+    test_nudge_constants_are_sane()
     test_derive_base()
     test_validate_provider_url()
     test_stream_error_retryable()
@@ -209,4 +301,4 @@ if __name__ == "__main__":
     test_success_gating_clean_finish()
     test_success_gating_empty_nonunknown_stop()
     test_local_turns_floor_and_batch()
-    print("\nALL PASS (13/13)")
+    print("\nALL PASS (18/18)")

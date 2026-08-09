@@ -156,9 +156,14 @@ Then run `litellm --config config.yaml --port 4000` and point this MCP at it.
 | Backend | Model | Single-turn | Multi-turn |
 |---|---|:-:|:-:|
 | LiteLLM + llama.cpp | `local-qwen-3-6-35b` (Qwen3.6 35B-A3B) | ✅ | ✅ |
-| LiteLLM + DeepSeek API | `deepseek-v4-pro` | ✅ | ✅ |
 | LiteLLM + DeepSeek API | `deepseek-v4-flash` | ✅ | ✅ |
+| LiteLLM + DeepSeek API | `deepseek-v4-pro` | ✅ | ✅ |
+| LiteLLM + Z.ai | `glm-coding-plan` | ✅ | ✅ |
 | LiteLLM + AWS Bedrock | `bedrock-sonnet-4-6`, `bedrock-llama4-*` | ✅ | ✅ |
+
+> **Picking a DeepSeek tier:** `deepseek-v4-flash` is the better default for coding and agentic work — the 2026-07-31 rebuild beats `deepseek-v4-pro` across DeepSeek's published benchmarks at roughly a third of the output cost, and it already reasons at high effort by default (which is why it has no `-think` variant). Reserve `deepseek-v4-pro` for very long reasoning chains. Note these are the vendor's own self-reported numbers on their own harness — good enough to pick a default, worth validating on your own task before you move serious work.
+>
+> ⚠️ Both tiers can spend their whole token budget reasoning and return nothing. The server auto-raises the default budget for them; see [max_tokens troubleshooting](docs/TROUBLESHOOTING.md#stop_reason-max_tokens-and-final_response-).
 
 Validation tasks: SQL injection review (security-engineer agent), HTML calculator (creative agent, 500-800 LOC monolithic), Pac-Man game (884 LOC monolithic single-shot).
 
