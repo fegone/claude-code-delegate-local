@@ -6,6 +6,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed (2026-08-08, second pass — why strong models looked weak)
+
+Two bugs that made capable models appear to stall or produce sloppy work on agentic coding
+tasks. Both were in this server, not in the models.
+
+- **The loop treated an announced intention as finished work.** It ended on the first turn
+  that returned no tool calls: `if not tool_uses: break`. A model that says *"I'll run the
+  tests to verify everything works correctly"* and stops was taken at its word — and since
+  `final_text` was non-empty and `stop_reason` was `end_turn`, the run reported
+  **`success: True`**. Verified on a real dispatch: it closed exactly that way with a parsed
+  `to_date` variable never wired into the query it belonged to, and 4 of its own tests
+  failing. The loop now prods a tool-less turn up to `MAX_COMPLETION_NUDGES` times
+  (default 2, `DELEGATE_MAX_NUDGES`) before believing it, and the result carries `nudges`
+  and `resumed_after_nudge` — the latter meaning the agent was demonstrably *not* done when
+  it first stopped, so that result deserves suspicion.
+- **Anthropic-format backends were never caching anything.** Prompt caching in that format
+  is not automatic; it only happens where an explicit `cache_control` breakpoint is set, and
+  neither this server nor the LiteLLM config set one anywhere. Every turn of every GLM
+  dispatch reprocessed the entire, growing conversation. Three breakpoints are now marked —
+  `system`, the last tool definition, and the final message. Measured against `api.z.ai`:
+
+  | call | `input_tokens` | `cache_read_input_tokens` |
+  |---|---:|---:|
+  | first | 3,652 | 0 |
+  | second | 4 | 3,648 |
+
+  Deliberately an **allowlist** (`_supports_prompt_caching`: `glm-`, `bedrock-`, `claude-`,
+  `anthropic/`). The Anthropic branch also serves `local-*` aliases that LiteLLM forwards to
+  an OpenAI-format server — marking those would drop the marker or 400 the request. Kill
+  switch: `DELEGATE_PROMPT_CACHING=0`.
+
+### Investigated and ruled out (2026-08-08)
+
+- **The 30-second idle timeout on `api.z.ai` that cuts long tool calls.** Reported for
+  GLM-4.7/5.1 in other harnesses ([vercel/ai#12949](https://github.com/vercel/ai/issues/12949),
+  opencode), with `tool_stream=True` as the documented remedy. **It does not reproduce here.**
+  Tested with streaming and a prompt that makes the model write a large file in a single
+  `write_file` call: largest gap between chunks was **5.4 s**, with **zero** gaps above 30 s,
+  with and without `tool_stream`. The Anthropic-compatible endpoint already emits tool-call
+  arguments incrementally. No change made — a fix for a problem you do not have is just a new
+  thing that can break.
+
 ### Fixed (2026-08-08)
 - **Aliases that reason by default now get the larger token budget, without needing a `-max` suffix.** The auto-bump introduced for deep-reasoning tiers matched only on the `-max` suffix, which left the exact same starvation open for models that reason at high effort out of the box. Measured 2026-08-04: `deepseek-v4-flash` at the 65536 default spent ~16k tokens reasoning and returned an **empty** response on open-ended prompts, reproducibly — the failure the suffix rule existed to prevent, on a model the rule never covered. `deepseek-v4-pro` defaults to high effort too. Both now qualify via the new `HIGH_REASONING_PREFIXES`; add a prefix there when onboarding a provider whose model reasons by default. Regression test: `tests/test_hardening.py::test_resolve_max_tokens_high_reasoning_defaults`.
 - **Test suite is green again (was 9 failing).** Two unrelated causes, both pre-existing:

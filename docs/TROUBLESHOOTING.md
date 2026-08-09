@@ -79,6 +79,60 @@ mcp__delegate-local__delegate_to_local_agent(
 )
 ```
 
+### `success: true` but the work is half-done
+
+**Symptom**: The dispatch reports success, `stop_reason` is `end_turn`, `incomplete` is
+false — and the code is wrong. A variable is parsed and never used, tests are failing, a
+file was never written.
+
+**Cause**: the agent ended its turn *announcing* an action instead of taking it — "I'll run
+the tests to verify everything works correctly" — and stopped. Before this was fixed, the
+loop ended on the first turn with no tool calls and, since there was text and the stop
+reason looked clean, reported success.
+
+**Fix**: already in the loop. A tool-less turn is now prodded up to `MAX_COMPLETION_NUDGES`
+times (default 2, override with `DELEGATE_MAX_NUDGES`) before the run is accepted as
+finished.
+
+**What to look for in the result**: `nudges` and `resumed_after_nudge`. If
+`resumed_after_nudge` is `true`, the agent produced tool calls only *after* being prodded —
+it was not done when it first stopped, and the old loop would have reported that run as a
+clean success. Treat those results with suspicion and check the work.
+
+> Independently of this: **do not trust `success: true` as proof that tests pass.** Run them
+> yourself. Models self-report optimistically, and no harness change removes that.
+
+### Agentic runs on GLM are slow and get slower with each turn
+
+**Symptom**: a simple coding task takes far longer than it should, and each turn is slower
+than the last.
+
+**Cause**: prompt caching in Anthropic format is **not automatic**. It only happens where an
+explicit `cache_control` breakpoint is set. Without one, every turn of an agentic loop
+reprocesses the entire conversation — which grows every turn, so cost and latency scale
+quadratically with turn count. A LiteLLM config comment claiming a provider caches
+"automatically" is worth verifying rather than believing; ours was wrong.
+
+**Fix**: already applied for allowlisted providers (`glm-`, `bedrock-`, `claude-`,
+`anthropic/`). Verify it is working by checking `cache_read_tokens` in the result — it
+should be large from the second turn onward.
+
+**If you add a provider**: add its prefix to `_supports_prompt_caching` only after testing.
+The Anthropic branch also serves `local-*` aliases that LiteLLM forwards to an OpenAI-format
+server; marking those either drops the marker or 400s the request.
+
+### `cache_read_tokens: 0` on a local model
+
+Not necessarily a bug. Local backends served through the OpenAI path report
+`prompt_tokens_details.cached_tokens`, which this server normalizes — a zero there is a real
+zero, but the cause is usually on the server side (prefix cache full, or evicted), not here.
+
+Before concluding the model is slow, **check whether something else is saturating it**. A
+shared local inference server with another workload hitting it will queue your requests
+behind theirs; the symptom is indistinguishable from "the model is bad" unless you look at
+throughput. Compare tokens/sec against a known-good baseline with the machine otherwise
+idle. Any quality judgement made while the server is saturated is worthless.
+
 ### `hit_turn_limit: true` and the agent never finished writing
 
 **Symptom**: The agent kept calling `write_file` with chunks via "append" but never converged.
