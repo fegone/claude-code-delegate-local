@@ -117,6 +117,11 @@ HIGH_REASONING_PREFIXES = ("deepseek-v4-flash", "deepseek-v4-pro")
 # Keyed by alias prefix; models not listed are treated as unbounded/unknown.
 PROVIDER_MAX_TOKENS_CAP = {
     "glm-": 131_072,  # GLM-5.2 via Z.ai Anthropic-native endpoint
+    # Alibaba Token Plan (qwen3.8-max y familia). Verificado live 2026-08-09:
+    # max_tokens=150000 -> "Range of max_tokens should be [1, 131072]". El alias
+    # termina en "-max", asi que sin este cap el auto-bump a MAX_TIER_MAX_TOKENS
+    # lo hace rechazar TODA request.
+    "qwen-3-8": 131_072,
 }
 
 # ── Concurrencia POR PROVEEDOR ──────────────────────────────────────────────────
