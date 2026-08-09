@@ -146,6 +146,12 @@ PROVIDER_CONCURRENCY = {
     "grok": 4,
     "codex": 4,
     "gpt-": 4,
+    # Alibaba Token Plan. Medido 2026-08-09 sobre una corrida real de agentes:
+    # 241 requests movieron 10.5M tokens de ENTRADA contra 247K de salida
+    # (ratio 42:1) — el costo de un agente aqui lo domina el contexto que
+    # rearrastra cada turno, no lo que escribe. El plan es por cuota mensual,
+    # asi que conviene un bucket mas estrecho que el default de 4.
+    "qwen-": 3,
 }
 DEFAULT_PROVIDER_CONCURRENCY = int(os.getenv("DELEGATE_CONCURRENCY_DEFAULT", "4"))
 
