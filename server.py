@@ -77,6 +77,23 @@ TURN_TIMEOUT = int(os.getenv("DELEGATE_TURN_TIMEOUT", "1800"))
 # footgun, not a real capability gap (verified: both models solved the same task
 # fine once given enough budget). Auto-bump the default for any model alias whose
 # name signals maximum reasoning effort, so this doesn't depend on remembering.
+# How many times a tool-less turn gets prodded before the loop accepts it as finished.
+# See the nudge block in the agentic loop for why ending on the first one is wrong.
+# 2 is deliberate: one nudge catches the common "announced but didn't act" case, a second
+# covers a model that acknowledges the nudge in prose before acting. Beyond that it is
+# almost certainly genuinely done and further prodding just burns turns.
+MAX_COMPLETION_NUDGES = int(os.getenv("DELEGATE_MAX_NUDGES", "2"))
+# Kill switch for the cache_control breakpoints (see _apply_cache_control). On by default:
+# without it, Anthropic-format backends reprocess the entire growing conversation on every
+# turn of an agentic loop.
+DELEGATE_PROMPT_CACHING = os.getenv("DELEGATE_PROMPT_CACHING", "1") not in ("0", "false", "False")
+NUDGE_TEXT = (
+    "You ended your turn without calling a tool. If the task is fully complete AND you "
+    "have verified it (tests run and passing, files actually written), say so plainly and "
+    "stop. If you were about to do something — run tests, write a file, check a result — "
+    "do it now by calling the tool. Do not describe an action instead of taking it."
+)
+
 DEFAULT_MAX_TOKENS = 65536
 MAX_TIER_MAX_TOKENS = 150_000
 MAX_TIER_SUFFIXES = ("-max",)  # extend here if new "-max"-style aliases appear
@@ -924,6 +941,65 @@ async def _raise_for_status_streamed(response: httpx.Response) -> None:
         response.raise_for_status()
 
 
+def _supports_prompt_caching(model: str) -> bool:
+    """True for Anthropic-format backends known to honour ``cache_control``.
+
+    Deliberately an allowlist, not a blanket. The Anthropic branch of ``_call_backend``
+    also serves ``local-*`` aliases, which LiteLLM translates onward to an OpenAI-format
+    server (oMLX) — that path has its own prefix cache and would either drop the marker
+    or reject the request. Adding a provider here without checking it is how you turn a
+    working backend into a 400.
+    """
+    if not isinstance(model, str):
+        return False
+    m = model.lower()
+    return m.startswith(("glm-", "bedrock-", "claude-", "anthropic/"))
+
+
+def _apply_cache_control(payload: dict, model: str) -> None:
+    """Mark cacheable prefixes so an agentic loop stops paying for its whole history.
+
+    Anthropic-format prompt caching is NOT automatic — it only happens where an explicit
+    ``cache_control`` breakpoint is set. Verified 2026-08-08: neither this server nor the
+    LiteLLM config set one anywhere, so every turn of every GLM dispatch reprocessed the
+    full, growing conversation from scratch. On a long agentic run that is most of the
+    wall-clock time, and it scales quadratically with turn count.
+
+    Three breakpoints, well under Anthropic's limit of four:
+      1. ``system`` — the agent definition, identical on every turn.
+      2. the last tool definition — tools are identical on every turn, and marking the
+         last one covers the whole block.
+      3. the final message — moves forward each turn, so the conversation prefix is
+         re-cached incrementally instead of recomputed.
+
+    Mutates ``payload`` in place. No-op for backends not on the allowlist.
+    """
+    if not DELEGATE_PROMPT_CACHING or not _supports_prompt_caching(model):
+        return
+    mark = {"type": "ephemeral"}
+
+    sys_val = payload.get("system")
+    if isinstance(sys_val, str) and sys_val.strip():
+        payload["system"] = [{"type": "text", "text": sys_val, "cache_control": mark}]
+
+    tools = payload.get("tools")
+    if isinstance(tools, list) and tools and isinstance(tools[-1], dict):
+        tools[-1] = {**tools[-1], "cache_control": mark}
+
+    msgs = payload.get("messages")
+    if isinstance(msgs, list) and msgs and isinstance(msgs[-1], dict):
+        last = dict(msgs[-1])
+        content = last.get("content")
+        if isinstance(content, str) and content.strip():
+            last["content"] = [{"type": "text", "text": content, "cache_control": mark}]
+            msgs[-1] = last
+        elif isinstance(content, list) and content and isinstance(content[-1], dict):
+            blocks = list(content)
+            blocks[-1] = {**blocks[-1], "cache_control": mark}
+            last["content"] = blocks
+            msgs[-1] = last
+
+
 async def _call_backend(
     messages: list[dict],
     system: str,
@@ -978,6 +1054,7 @@ async def _call_backend(
         }
         if tools:
             payload["tools"] = tools
+        _apply_cache_control(payload, model)
         if DELEGATE_STREAMING:
             payload["stream"] = True
             async with client.stream("POST", endpoint, json=payload, headers=headers) as r:
@@ -1066,6 +1143,8 @@ async def _delegate_one_impl(
     total_cache_creation = 0
     final_text = ""
     stop_reason = "unknown"
+    nudges = 0
+    resumed_after_nudge = False
     t0 = time.time()
 
     while turn < max_turns:
@@ -1148,7 +1227,26 @@ async def _delegate_one_impl(
             final_text = text_join
 
         if not tool_uses:
-            break  # agente cerró con texto final
+            # A tool-less turn is ambiguous: the agent may be finished, or it may have
+            # merely ANNOUNCED an action and stopped. Breaking on the first one silently
+            # accepts half-done work — verified 2026-08-08, a dispatch ended on "I'll run
+            # the tests to verify everything works correctly." with a parsed variable never
+            # wired into the query and 4 of its own tests failing, and still reported
+            # success=True because final_text was non-empty and stop_reason was end_turn.
+            # Nudge before believing it. A genuinely finished agent just restates that it's
+            # done and costs one cheap turn; one that was mid-thought resumes working.
+            if nudges < MAX_COMPLETION_NUDGES and turn < max_turns:
+                nudges += 1
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": NUDGE_TEXT})
+                continue
+            break  # finished, or out of nudges
+
+        if nudges:
+            # It produced tool calls only after being nudged — it was NOT done when it
+            # first stopped. Surfaced in the result so the caller can distrust runs that
+            # needed prodding.
+            resumed_after_nudge = True
 
         messages.append({"role": "assistant", "content": content})
         tool_results = []
@@ -1195,6 +1293,12 @@ async def _delegate_one_impl(
         "max_turns": max_turns,
         "tool_calls": tool_calls,
         "malformed_calls": malformed,
+        # How many times the agent stopped without calling a tool and had to be prodded,
+        # and whether prodding actually made it resume work. A run with
+        # resumed_after_nudge=True would have been reported as a clean success by the old
+        # loop while leaving the task half-done — treat those results with suspicion.
+        "nudges": nudges,
+        "resumed_after_nudge": resumed_after_nudge,
         "elapsed_s": round(elapsed, 1),
         "tokens_in": total_in,
         "tokens_out": total_out,

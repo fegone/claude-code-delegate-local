@@ -233,6 +233,55 @@ def test_local_turns_floor_and_batch():
     print("PASS local turn floor 25, batch cap 12")
 
 
+# ── Prompt caching: breakpoints solo donde el backend los honra ────────────────
+def test_prompt_caching_allowlist():
+    """cache_control is an allowlist, not a blanket. The Anthropic branch also serves
+    local-* aliases that LiteLLM forwards to an OpenAI-format server; marking those
+    would either drop the marker or 400 the request."""
+    assert server._supports_prompt_caching("glm-coding-plan") is True
+    assert server._supports_prompt_caching("bedrock-sonnet-4-6") is True
+    assert server._supports_prompt_caching("local-qwen-3-6-35b") is False
+    assert server._supports_prompt_caching("ornith-think") is False
+    assert server._supports_prompt_caching(None) is False
+    print("PASS prompt-caching allowlist keeps local backends unmarked")
+
+
+def test_apply_cache_control_marks_three_breakpoints():
+    """Anthropic prompt caching is NOT automatic — without explicit breakpoints every
+    agentic turn reprocesses the whole growing conversation. Verified 2026-08-08 that
+    none were being set anywhere."""
+    payload = {
+        "model": "glm-coding-plan",
+        "system": "you are an agent",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "read_file"}, {"name": "run_bash"}],
+    }
+    server._apply_cache_control(payload, "glm-coding-plan")
+
+    assert payload["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert payload["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in payload["tools"][0]      # only the last tool
+    assert payload["messages"][-1]["content"][0]["cache_control"] == {"type": "ephemeral"}
+    print("PASS cache_control marks system, last tool, and final message")
+
+
+def test_apply_cache_control_leaves_local_backends_alone():
+    payload = {"model": "local-qwen-3-6-35b", "system": "x",
+               "messages": [{"role": "user", "content": "y"}]}
+    server._apply_cache_control(payload, "local-qwen-3-6-35b")
+    assert payload["system"] == "x"                        # untouched string, not a block
+    assert payload["messages"][0]["content"] == "y"
+    print("PASS local backends are never given cache_control")
+
+
+def test_nudge_constants_are_sane():
+    """A tool-less turn must be prodded before the loop believes it. Ending on the first
+    one reported half-done work as success (verified 2026-08-08)."""
+    assert server.MAX_COMPLETION_NUDGES >= 1
+    assert "without calling a tool" in server.NUDGE_TEXT
+    print("PASS completion-nudge is configured")
+
+
 if __name__ == "__main__":
     test_provider_no_global_race()
     test_safe_resolve_confines()
@@ -240,6 +289,10 @@ if __name__ == "__main__":
     test_openai_format_case_insensitive()
     test_resolve_max_tokens_guard()
     test_resolve_max_tokens_high_reasoning_defaults()
+    test_prompt_caching_allowlist()
+    test_apply_cache_control_marks_three_breakpoints()
+    test_apply_cache_control_leaves_local_backends_alone()
+    test_nudge_constants_are_sane()
     test_derive_base()
     test_validate_provider_url()
     test_stream_error_retryable()
@@ -248,4 +301,4 @@ if __name__ == "__main__":
     test_success_gating_clean_finish()
     test_success_gating_empty_nonunknown_stop()
     test_local_turns_floor_and_batch()
-    print("\nALL PASS (13/13)")
+    print("\nALL PASS (18/18)")
