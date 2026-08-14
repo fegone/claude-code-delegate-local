@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import os
 import pathlib
 import re
@@ -32,6 +33,11 @@ from typing import Any
 
 import httpx
 from fastmcp import Context, FastMCP
+
+# Logger del server. IMPORTANTE: este MCP habla por stdio, asi que nada de
+# diagnostico puede ir a stdout (corromperia el protocolo). Sin handler
+# configurado, logging usa lastResort, que emite WARNING+ por stderr.
+log = logging.getLogger("delegate")
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Config — overridable por env vars (registradas en ~/.claude/settings.json)
@@ -69,6 +75,19 @@ HARD_MAX_TURNS = 40
 # alive indefinitely. This caps the whole backend call per turn; a hit is treated as a
 # transient (retried) like a network drop. Generous default tolerates oMLX serial queues.
 TURN_TIMEOUT = int(os.getenv("DELEGATE_TURN_TIMEOUT", "1800"))
+
+# Deadline TOTAL de un despacho. TURN_TIMEOUT es por INTENTO, y los intentos se
+# multiplican: BACKEND_MAX_RETRIES+1 intentos x max_turns turnos x 1800s da un techo
+# nominal de ~50 HORAS por despacho. No es un hang infinito, pero operativamente da
+# igual: el slot del proveedor queda ocupado por trabajo que ya nadie espera. Este
+# deadline envuelve TODO (turnos, reintentos, backoff y ejecucion de herramientas) y
+# convierte ese techo en algo predecible.
+DISPATCH_TIMEOUT = int(os.getenv("DELEGATE_DISPATCH_TIMEOUT", "3600"))
+
+# Margen minimo para que valga la pena empezar otro intento: si queda menos que esto
+# antes del deadline, se corta con un error claro en vez de lanzar una llamada que
+# morira a medias.
+DISPATCH_MIN_SLICE = 30
 # Real-world finding (2026-07-06 benchmark): a deep-reasoning "-max" tier alias
 # (e.g. deepseek-v4-pro-max, glm-coding-plan-max) can burn its ENTIRE max_tokens
 # budget on thinking before emitting any usable output — with DeepSeek this once
@@ -213,6 +232,48 @@ def _provider_max_tokens_cap(model: str) -> int | None:
     return None
 
 
+# ── Politica de presupuesto por ALIAS (explicita, no adivinada por el nombre) ────
+# Inferir el presupuesto del SUFIJO del alias es fragil y ya produjo un fallo mudo:
+# "qwen-3-8-max-think" razona alto pero termina en "-think", no en "-max", asi que no
+# calificaba para el presupuesto ampliado y se quedaba en DEFAULT_MAX_TOKENS. El
+# razonamiento se comia el presupuesto entero y la respuesta salia VACIA, sin error.
+# Un alias listado aqui gana su valor explicito; uno no listado cae al heuristico de
+# abajo (que se conserva para no romper aliases nuevos) y deja un warning para que se
+# registre en vez de fallar en silencio.
+MODEL_BUDGET_POLICY = {
+    "qwen-3-8-max-think": 131_072,   # razona alto; cap del provider = 131072
+    "qwen-3-8-max": 131_072,
+    "glm-coding-plan-max": 131_072,  # budget de thinking 64K
+    "glm-coding-plan-think": 65_536,  # budget de thinking 16K
+    "glm-coding-plan": 65_536,
+    "deepseek-v4-flash": 150_000,
+    "deepseek-v4-flash-max": 150_000,
+    "deepseek-v4-pro": 150_000,
+    "deepseek-v4-pro-max": 150_000,
+}
+
+
+def _should_nudge(stop_reason: str | None, text: str | None) -> bool:
+    """Si vale la pena re-preguntarle a un turno que no pidio herramientas.
+
+    Solo cuando el turno termino NORMALMENTE y dijo algo: ahi la respuesta puede ser
+    un anuncio a medias ("ahora corro los tests") que conviene interrogar.
+
+    Un turno cortado por max_tokens (o filtrado, o truncado a media transmision) NO
+    anuncio y paro: se quedo sin presupuesto, y volver a preguntar no lo arregla porque
+    el turno siguiente lleva el mismo presupuesto y muere igual — un fallo se vuelve
+    tres llamadas largas. Una respuesta vacia tampoco tiene nada que interrogar.
+    """
+    return stop_reason == "end_turn" and bool((text or "").strip())
+
+
+def _policy_max_tokens(model: str) -> int | None:
+    """Presupuesto explicito del alias, o None si no esta en la tabla."""
+    if not isinstance(model, str):
+        return None
+    return MODEL_BUDGET_POLICY.get(model.lower().strip())
+
+
 def _wants_max_tier_budget(model: str) -> bool:
     """True when a model needs the larger default token budget.
 
@@ -241,10 +302,19 @@ def _resolve_max_tokens(model: str, max_tokens: int | None) -> int:
             if max_tokens <= 0:
                 max_tokens = None
     if max_tokens is None:
-        if _wants_max_tier_budget(model):
+        policy = _policy_max_tokens(model)
+        if policy is not None:
+            max_tokens = policy
+        elif _wants_max_tier_budget(model):
             max_tokens = MAX_TIER_MAX_TOKENS
         else:
             max_tokens = DEFAULT_MAX_TOKENS
+            if isinstance(model, str) and model.strip():
+                log.warning(
+                    "alias %r sin politica de presupuesto explicita; usando el default %d. "
+                    "Si este modelo razona alto puede devolver respuesta vacia: agregalo a "
+                    "MODEL_BUDGET_POLICY.", model, DEFAULT_MAX_TOKENS,
+                )
     cap = _provider_max_tokens_cap(model)
     if cap is not None and max_tokens > cap:
         max_tokens = cap
@@ -336,7 +406,15 @@ RUN_BASH_TIMEOUT = int(os.getenv("DELEGATE_RUN_BASH_TIMEOUT", "120"))
 # plan, dead endpoint) must return a clean per-task error instead of hanging
 # the whole batch until the client gives up and cancels the MCP request
 # (observed live: 811s hang -> remote-cancel -> STDIO desync -> -32000).
-BATCH_TASK_TIMEOUT = int(os.getenv("DELEGATE_BATCH_TASK_TIMEOUT", "1800"))
+# El timeout de una tarea en batch DEBE cubrir el deadline del despacho individual mas
+# el tiempo que la tarea pasa ESPERANDO SLOT en el semaforo del proveedor. Cuando ambos
+# valian 1800s, el mismo trabajo se cancelaba en batch y seguia horas en individual, lo
+# que hacia que los fallos parecieran aleatorios. Default = DISPATCH_TIMEOUT + margen de
+# cola, para que batch nunca sea el que corta primero.
+BATCH_QUEUE_GRACE = int(os.getenv("DELEGATE_BATCH_QUEUE_GRACE", "900"))
+BATCH_TASK_TIMEOUT = int(
+    os.getenv("DELEGATE_BATCH_TASK_TIMEOUT", str(DISPATCH_TIMEOUT + BATCH_QUEUE_GRACE))
+)
 _BASH_MAX_CONCURRENCY = int(os.getenv("DELEGATE_RUN_BASH_CONCURRENCY", "4"))
 # Agent name must be a bare filename component (no path separators / traversal), since it
 # is interpolated into agent-definition load paths.
@@ -1158,8 +1236,20 @@ async def _delegate_one_impl(
     nudges = 0
     resumed_after_nudge = False
     t0 = time.time()
+    deadline = t0 + DISPATCH_TIMEOUT
 
     while turn < max_turns:
+        if time.time() >= deadline:
+            return {
+                "success": False,
+                "error": (
+                    f"dispatch timeout: supero el deadline total de {DISPATCH_TIMEOUT}s "
+                    f"tras {turn} turnos. Subir con DELEGATE_DISPATCH_TIMEOUT."
+                ),
+                "timeout_scope": "dispatch",
+                "turn_failed": turn,
+                "final_response": final_text,
+            }
         turn += 1
         if ctx:
             await ctx.report_progress(
@@ -1172,12 +1262,25 @@ async def _delegate_one_impl(
         last_transient = None
         for attempt in range(BACKEND_MAX_RETRIES + 1):
             try:
+                remaining = deadline - time.time()
+                if remaining < DISPATCH_MIN_SLICE:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"dispatch timeout: quedan {max(0, int(remaining))}s del deadline "
+                            f"total de {DISPATCH_TIMEOUT}s, insuficiente para otro intento."
+                        ),
+                        "timeout_scope": "dispatch",
+                        "turn_failed": turn,
+                        "final_response": final_text,
+                    }
                 resp = await asyncio.wait_for(
                     _call_backend(
                         messages, full_system, model, tools=AGENT_TOOLS,
                         max_tokens=max_tokens, url=url, key=key,
                     ),
-                    timeout=TURN_TIMEOUT,
+                    # El intento nunca puede sobrevivir al deadline del despacho.
+                    timeout=min(TURN_TIMEOUT, remaining),
                 )
                 break
             except httpx.HTTPStatusError as e:
@@ -1247,7 +1350,16 @@ async def _delegate_one_impl(
             # success=True because final_text was non-empty and stop_reason was end_turn.
             # Nudge before believing it. A genuinely finished agent just restates that it's
             # done and costs one cheap turn; one that was mid-thought resumes working.
-            if nudges < MAX_COMPLETION_NUDGES and turn < max_turns:
+            #
+            # BUT only when the turn ended NORMALLY and said something. A turn cut off at
+            # max_tokens (or filtered, or truncated mid-stream) did not "announce and stop"
+            # — it ran out of budget, and re-asking cannot fix that: the next turn carries
+            # the same budget and dies the same way, so one dead dispatch becomes three long
+            # calls. Same for an empty answer: there is no half-done claim to interrogate.
+            # This is the qwen-3-8-max-think failure mode (reasoning eats the whole budget,
+            # returns empty, no error) — it must fail fast and visibly instead of retrying.
+            can_nudge = _should_nudge(stop_reason, text_join)
+            if can_nudge and nudges < MAX_COMPLETION_NUDGES and turn < max_turns:
                 nudges += 1
                 messages.append({"role": "assistant", "content": content})
                 messages.append({"role": "user", "content": NUDGE_TEXT})
