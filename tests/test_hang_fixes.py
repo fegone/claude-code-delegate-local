@@ -131,3 +131,26 @@ def test_el_logger_no_escribe_en_stdout(capsys):
     srv.log.warning("mensaje de prueba")
     capturado = capsys.readouterr()
     assert capturado.out == "", "un MCP stdio se rompe si algo escribe en stdout"
+
+
+# ── Reintentos: una sola capa, no dos ───────────────────────────────────────────
+
+def test_reconoce_el_endpoint_de_litellm():
+    """El header solo debe viajar al proxy, no a un provider directo."""
+    assert srv._is_litellm_endpoint(srv.LITELLM_URL) is True
+    assert srv._is_litellm_endpoint("https://api.z.ai/api/anthropic/v1/messages") is False
+    assert srv._is_litellm_endpoint("") is False
+    assert srv._is_litellm_endpoint(None) is False
+
+
+def test_mismo_host_distinta_ruta_sigue_siendo_litellm():
+    """El proxy se identifica por scheme+host+puerto, no por el path exacto."""
+    import urllib.parse
+    b = urllib.parse.urlsplit(srv.LITELLM_URL)
+    otra_ruta = f"{b.scheme}://{b.netloc}/v1/chat/completions"
+    assert srv._is_litellm_endpoint(otra_ruta) is True
+
+
+def test_url_basura_no_revienta():
+    for mala in ("://no-es-url", "no-es-una-url", "http://[bad"):
+        assert srv._is_litellm_endpoint(mala) is False

@@ -253,6 +253,22 @@ MODEL_BUDGET_POLICY = {
 }
 
 
+def _is_litellm_endpoint(endpoint: str | None) -> bool:
+    """True si la URL apunta al proxy LiteLLM configurado (no a un provider directo).
+
+    delegate_to_provider puede apuntar a z.ai/DeepSeek/etc. directo; ahi el header de
+    LiteLLM no aplica (seria ignorado, pero no tiene por que viajar).
+    """
+    if not endpoint or not LITELLM_URL:
+        return False
+    try:
+        a = urllib.parse.urlsplit(endpoint)
+        b = urllib.parse.urlsplit(LITELLM_URL)
+    except ValueError:
+        return False
+    return (a.scheme, a.netloc) == (b.scheme, b.netloc)
+
+
 def _should_nudge(stop_reason: str | None, text: str | None) -> bool:
     """Si vale la pena re-preguntarle a un turno que no pidio herramientas.
 
@@ -1117,6 +1133,15 @@ async def _call_backend(
     if eff_key:
         headers["x-api-key"] = eff_key
         headers["Authorization"] = f"Bearer {eff_key}"
+    if _is_litellm_endpoint(endpoint):
+        # Los reintentos se hacen AQUI, no en el proxy. Este loop distingue lo transitorio
+        # (429/5xx, corte de red) de lo determinista (payload/auth), y conoce el estado del
+        # dispatch; LiteLLM reintenta a ciegas. Con num_retries: 3 a ambos lados, un solo
+        # blip se multiplicaba: 4 intentos nuestros x 4 del proxy = hasta 16 llamadas al
+        # provider, que es justo lo que agrava un 429 y dispara fallas en cascada.
+        # El header outranks num_retries del body, del deployment y de litellm_settings.
+        # Verificado en LiteLLM 1.83.9 (litellm_pre_call_utils.py, _get_num_retries_from_request).
+        headers["x-litellm-num-retries"] = "0"
     client = _get_http_client()
 
     if _is_openai_format(model):
