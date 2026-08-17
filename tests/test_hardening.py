@@ -510,6 +510,94 @@ def test_batch_cleans_up_on_non_cancel_exception():
     print("PASS delegate_batch recolecta los hijos ante cualquier excepción")
 
 
+# ── Slots cross-process: el cap por proveedor vale entre TODAS las sesiones ────
+def test_cross_process_slot_blocks_when_full():
+    """El asyncio.Semaphore solo acota un proceso, y cada sesión de Claude Code lanza su
+    propia instancia del server: medido, 4 vivas a la vez -> el cap de 6 valía 24."""
+    with tempfile.TemporaryDirectory() as d:
+        server._SLOT_DIR = __import__("pathlib").Path(d)
+        server._SLOT_POLL = 0.05
+
+        async def run():
+            held = []
+            # Ocupa los 2 slots del bucket y verifica que el 3ro NO entra.
+            async with server._cross_process_slot("glm-", 2, 5):
+                async with server._cross_process_slot("glm-", 2, 5):
+                    held.append("dos tomados")
+                    try:
+                        async with server._cross_process_slot("glm-", 2, 0.3):
+                            held.append("TERCERO ENTRO")
+                    except server.SlotWaitTimeout:
+                        held.append("tercero rechazado")
+            # Liberados los dos, uno nuevo debe entrar sin esperar.
+            async with server._cross_process_slot("glm-", 2, 1):
+                held.append("reentro tras liberar")
+            return held
+
+        got = run_coro(run())
+    assert got == ["dos tomados", "tercero rechazado", "reentro tras liberar"], got
+    print("PASS slot cross-process: llena el cupo, rechaza el extra, libera al salir")
+
+
+def test_cross_process_slot_is_really_cross_process():
+    """El test de arriba corre en UN proceso. Este arranca otro python de verdad: si el
+    candado fuera in-process (o un contador mal hecho), el hijo entraría igual."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # Hijo: intenta tomar el único slot y reporta si lo consiguió.
+        child = (
+            "import asyncio, pathlib, sys\n"
+            f"sys.path.insert(0, {repo!r})\n"
+            "import server\n"
+            f"server._SLOT_DIR = pathlib.Path({d!r})\n"
+            "server._SLOT_POLL = 0.05\n"
+            "async def m():\n"
+            "    try:\n"
+            "        async with server._cross_process_slot('glm-', 1, 0.4):\n"
+            "            print('ENTRO')\n"
+            "    except server.SlotWaitTimeout:\n"
+            "        print('BLOQUEADO')\n"
+            "asyncio.run(m())\n"
+        )
+        server._SLOT_DIR = __import__("pathlib").Path(d)
+        server._SLOT_POLL = 0.05
+
+        async def run():
+            # Con el slot TOMADO por este proceso, el hijo debe quedar fuera.
+            async with server._cross_process_slot("glm-", 1, 5):
+                a = subprocess.run([sys.executable, "-c", child], capture_output=True,
+                                   text=True, timeout=60).stdout.strip()
+            # Liberado, el mismo hijo debe entrar.
+            b = subprocess.run([sys.executable, "-c", child], capture_output=True,
+                               text=True, timeout=60).stdout.strip()
+            return a, b
+
+        con_slot_tomado, con_slot_libre = run_coro(run())
+    assert con_slot_tomado == "BLOQUEADO", f"otro proceso entró al slot ocupado: {con_slot_tomado!r}"
+    assert con_slot_libre == "ENTRO", f"el proceso no entró al slot libre: {con_slot_libre!r}"
+    print("PASS el candado vale entre procesos distintos (verificado con un python aparte)")
+
+
+def test_cross_process_slot_can_be_disabled():
+    """Este candado acota el uso del plan, no protege datos: nunca debe ser el motivo por
+    el que un despacho no corre."""
+    with tempfile.TemporaryDirectory() as d:
+        server._SLOT_DIR = __import__("pathlib").Path(d)
+        orig = server.CROSS_PROCESS_SLOTS
+        server.CROSS_PROCESS_SLOTS = False
+
+        async def run():
+            async with server._cross_process_slot("glm-", 1, 5):
+                async with server._cross_process_slot("glm-", 1, 0.2):
+                    return "ambos entraron"
+
+        got = run_coro(run())
+        server.CROSS_PROCESS_SLOTS = orig
+    assert got == "ambos entraron"
+    print("PASS DELEGATE_CROSS_PROCESS_SLOTS=0 lo desactiva por completo")
+
+
 if __name__ == "__main__":
     test_provider_no_global_race()
     test_safe_resolve_confines()
@@ -539,4 +627,7 @@ if __name__ == "__main__":
     test_retry_delay_respects_retry_after_and_jitters()
     test_retry_after_cap_is_not_30s()
     test_batch_cleans_up_on_non_cancel_exception()
-    print("\nALL PASS (28/28)")
+    test_cross_process_slot_blocks_when_full()
+    test_cross_process_slot_is_really_cross_process()
+    test_cross_process_slot_can_be_disabled()
+    print("\nALL PASS (31/31)")
