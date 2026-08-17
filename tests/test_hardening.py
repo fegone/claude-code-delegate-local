@@ -282,6 +282,99 @@ def test_nudge_constants_are_sane():
     print("PASS completion-nudge is configured")
 
 
+
+# ── Auditoría 2026-08-17: estado compartido, truncado, semáforo, stop_reason ────
+def test_apply_cache_control_does_not_mutate_shared_state():
+    """Regression (auditoría 2026-08): _apply_cache_control reemplazaba msgs[-1] y
+    tools[-1] sobre los objetos DEL CALLER. El loop agéntico reutiliza una sola lista
+    `messages` entre turnos, así que las marcas acumulaban una por turno — el request
+    del turno 3 llevaba 5 breakpoints (system + tools + 3 mensajes marcados) contra el
+    límite de 4 de la API Anthropic -> 400 invalid_request_error a mitad de dispatch en
+    glm-*. También mutaba AGENT_TOOLS, global y compartido por todos los dispatches."""
+    messages = [{"role": "user", "content": "hi"}]
+    tools_snapshot = [dict(t) for t in server.AGENT_TOOLS]
+
+    def count_marks(msgs):
+        n = 0
+        for m in msgs:
+            c = m.get("content")
+            if isinstance(c, list):
+                n += sum(1 for b in c if isinstance(b, dict) and "cache_control" in b)
+        return n
+
+    for turn in range(4):  # simula turnos del loop sobre la MISMA lista
+        payload = {"system": "S", "tools": server.AGENT_TOOLS, "messages": messages}
+        server._apply_cache_control(payload, "glm-coding-plan")
+        assert count_marks(messages) == 0, f"turn {turn}: marker leaked into shared conversation"
+        assert count_marks(payload["messages"]) == 1, "payload should carry exactly 1 message mark"
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": "a"}]})
+        messages.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": "r"}]})
+
+    assert server.AGENT_TOOLS == tools_snapshot, "AGENT_TOOLS global was mutated"
+    assert isinstance(messages[0]["content"], str), "string content rewritten in place"
+    print("PASS cache_control no muta messages compartidos ni AGENT_TOOLS")
+
+
+def test_success_gating_unknown_stop_reason():
+    """Un stream que termina limpiamente SIN evento final deja stop_reason='unknown'
+    con texto parcial — antes se reportaba success=True (trabajo a medias como éxito).
+    content_filter con texto parcial ídem."""
+    for stop in ("unknown", "content_filter"):
+        _patch_agent()
+
+        async def truncated(*a, _stop=stop, **k):
+            return {"content": [{"type": "text", "text": "partial answer, cut mid-str"}],
+                    "stop_reason": _stop, "usage": {}}
+
+        server._call_backend = truncated
+        r = run_coro(server._delegate_one_impl("a", "t", model="m", max_turns=3))
+        assert r["success"] is False and r["incomplete"], (stop, r)
+    _restore_patches()
+    print("PASS unknown/content_filter con texto parcial -> success=False")
+
+
+def test_run_bash_truncation_is_loud():
+    """stdout cortado a 12000 chars no llevaba marcador: un resumen de fallos que
+    caía después del corte se veía verde para el modelo (éxito con tests rojos)."""
+    wd = tempfile.mkdtemp()
+    out = run_coro(server._run_bash(wd, "seq 1 4000"))  # ~19KB de stdout
+    assert "truncado" in out and "12000" in out, out[-400:]
+    assert "exit_code: 0" in out
+    small = run_coro(server._run_bash(wd, "echo hi"))
+    assert "truncado" not in small, small
+    print("PASS truncado de run_bash lleva marcador visible solo cuando corta")
+
+
+def test_dispatch_bounded_enforces_semaphore_on_all_routes():
+    """El semáforo por proveedor antes SOLO lo adquiría delegate_batch; las rutas
+    directas lo bypassaban (N despachos GLM concurrentes -> tormenta de 429).
+    _dispatch_bounded debe serializar el trabajo del mismo bucket."""
+    _patch_agent()
+    server._provider_semaphores["_default"] = asyncio.Semaphore(1)  # fuerza serialización
+    conc = {"now": 0, "max": 0}
+
+    async def fake_call(*a, **k):
+        conc["now"] += 1
+        conc["max"] = max(conc["max"], conc["now"])
+        await asyncio.sleep(0.05)
+        conc["now"] -= 1
+        return {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "usage": {}}
+
+    server._call_backend = fake_call
+
+    async def run():
+        return await asyncio.gather(*[
+            server._dispatch_bounded("a", f"t{i}", model="m") for i in range(3)
+        ])
+
+    results = run_coro(run())
+    assert all(r["success"] for r in results), results
+    assert conc["max"] == 1, f"semaphore not enforced: max concurrent = {conc['max']}"
+    server._provider_semaphores.pop("_default", None)
+    _restore_patches()
+    print("PASS _dispatch_bounded aplica el semáforo (max concurrent = 1)")
+
+
 if __name__ == "__main__":
     test_provider_no_global_race()
     test_safe_resolve_confines()
@@ -300,5 +393,9 @@ if __name__ == "__main__":
     test_success_gating_max_tokens()
     test_success_gating_clean_finish()
     test_success_gating_empty_nonunknown_stop()
+    test_apply_cache_control_does_not_mutate_shared_state()
+    test_success_gating_unknown_stop_reason()
+    test_run_bash_truncation_is_loud()
+    test_dispatch_bounded_enforces_semaphore_on_all_routes()
     test_local_turns_floor_and_batch()
-    print("\nALL PASS (18/18)")
+    print("\nALL PASS (22/22)")
