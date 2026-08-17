@@ -15,6 +15,7 @@ License: MIT
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import ipaddress
 import json
 import logging
@@ -645,6 +646,78 @@ def _child_env(extra: tuple[str, ...] = ()) -> dict[str, str]:
         k: v for k, v in os.environ.items()
         if k in allowed or k.startswith(_ENV_ALLOWLIST_PREFIXES)
     }
+
+
+# ── Semáforo CROSS-PROCESS ───────────────────────────────────────────────────
+# El asyncio.Semaphore por proveedor solo acota UN proceso, y cada sesión de Claude Code
+# lanza su propia instancia de este server. Medido 2026-08-18: 4 instancias vivas a la vez,
+# o sea el cap de 6 de `glm-` era en la práctica 24 contra el plan. Medido el mismo día
+# contra z.ai, con prompts triviales Y con thinking + salida larga: 6 concurrentes pasan
+# 6/6 limpio, 9 concurrentes devuelven 429. El cap por bucket está bien; lo que faltaba era
+# que valiera entre procesos.
+#
+# flock y no un contador en disco: el kernel suelta el lock si el proceso muere, así que
+# una sesión que se cae no deja slots fantasma bloqueando a las demás.
+CROSS_PROCESS_SLOTS = os.getenv("DELEGATE_CROSS_PROCESS_SLOTS", "1").lower() not in (
+    "0", "false", "no",
+)
+_SLOT_DIR = pathlib.Path(
+    os.getenv("DELEGATE_SLOT_DIR", os.path.expanduser("~/.cache/claude-delegate-local/slots"))
+)
+_SLOT_POLL = float(os.getenv("DELEGATE_SLOT_POLL", "0.5"))
+
+
+class SlotWaitTimeout(Exception):
+    """No hubo slot libre del proveedor dentro del tiempo de cola permitido."""
+
+
+@asynccontextmanager
+async def _cross_process_slot(bucket: str, limit: int, wait_max: float):
+    """Toma uno de `limit` slots del proveedor, contando TODAS las instancias del server.
+
+    No-op si se desactiva por env o si el directorio de slots no se puede crear: este
+    candado acota el uso del plan, no protege datos — nunca debe ser el motivo por el que
+    un despacho no corre.
+    """
+    if not CROSS_PROCESS_SLOTS or limit <= 0:
+        yield
+        return
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", bucket) or "_default"
+    d = _SLOT_DIR / safe
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        yield
+        return
+
+    give_up = time.time() + wait_max
+    fh = None
+    while fh is None:
+        for i in range(limit):
+            f = open(d / f"slot-{i}", "a+")
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fh = f
+                break
+            except OSError:
+                f.close()
+        if fh is not None:
+            break
+        if time.time() >= give_up:
+            raise SlotWaitTimeout(
+                f"sin slot libre de '{bucket}' ({limit} en total, compartidos entre todas "
+                f"las sesiones) tras {wait_max:.0f}s en cola"
+            )
+        # Jitter: si N procesos esperan el mismo bucket, un poll fijo los hace reintentar
+        # sincronizados y siempre gana el mismo.
+        await asyncio.sleep(_SLOT_POLL * random.uniform(0.5, 1.5))
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        finally:
+            fh.close()
 
 
 _bash_semaphore: asyncio.Semaphore | None = None
@@ -1586,13 +1659,27 @@ async def _dispatch_bounded(
     if isinstance(agent_name, str) and model == DEFAULT_MODEL \
             and agent_name.lower() in CODING_AGENTS:
         eff_model = CODING_MODEL
-    sem, _prov = await _get_provider_semaphore(eff_model)
+    sem, prov = await _get_provider_semaphore(eff_model)
+    # Dos capas: el asyncio.Semaphore acota ESTA instancia (barato, sin I/O) y el slot por
+    # flock acota el total entre todas las sesiones de Claude Code abiertas. El in-process
+    # va primero para que el polling del cross-process solo lo hagan los que ya ganaron
+    # su turno local.
     async with sem:
-        return await _delegate_one_impl(
-            agent_name=agent_name, task=task, workdir=workdir, max_turns=max_turns,
-            model=model, max_tokens=max_tokens, ctx=ctx, url=url, key=key,
-            mode_tag=mode_tag,
-        )
+        try:
+            async with _cross_process_slot(prov, _provider_concurrency(prov), BATCH_QUEUE_GRACE):
+                return await _delegate_one_impl(
+                    agent_name=agent_name, task=task, workdir=workdir, max_turns=max_turns,
+                    model=model, max_tokens=max_tokens, ctx=ctx, url=url, key=key,
+                    mode_tag=mode_tag,
+                )
+        except SlotWaitTimeout as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "timeout_scope": "provider_queue",
+                "agent_name": agent_name,
+                "model": model,
+            }
 
 
 # ────────────────────────────────────────────────────────────────────────────────
