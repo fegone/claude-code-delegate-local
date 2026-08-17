@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import pathlib
+import random
 import re
 import signal
 import socket
@@ -345,8 +346,14 @@ def _resolve_max_tokens(model: str, max_tokens: int | None) -> int:
 # blip would otherwise discard a whole multi-turn dispatch (and, for pay-per-token
 # providers, the thinking tokens already billed).
 BACKEND_MAX_RETRIES = 3
-RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# 529 = "overloaded" de Anthropic/z.ai. Es transitorio por definición y estaba fuera de la
+# lista: caía al error inmediato y descartaba el despacho entero. Verificado en vivo el
+# 2026-08-17: z.ai devolvió 529 siete veces seguidas bajo concurrencia 3.
+RETRYABLE_STATUS = {429, 500, 502, 503, 504, 529}
 RETRY_BACKOFF = (1.0, 2.0, 4.0, 8.0)
+# Techo del Retry-After del servidor. El cap viejo de 30s hacía que, cuando GLM pedía
+# esperar 60-120s, el delegate volviera antes de tiempo y agravara el 429.
+RETRY_AFTER_MAX = 120.0
 
 
 class BackendStreamError(Exception):
@@ -376,7 +383,7 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
     if not val:
         return None
     try:
-        return min(float(val), 30.0)
+        return max(0.0, min(float(val), RETRY_AFTER_MAX))
     except (TypeError, ValueError):
         pass
     try:
@@ -384,10 +391,24 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
         if dt is not None:
             import datetime
             now = datetime.datetime.now(dt.tzinfo)
-            return max(0.0, min((dt - now).total_seconds(), 30.0))
+            return max(0.0, min((dt - now).total_seconds(), RETRY_AFTER_MAX))
     except (TypeError, ValueError):
         pass
     return None
+
+
+def _retry_delay(attempt: int, retry_after: float | None = None) -> float:
+    """Segundos a esperar antes del próximo intento, con jitter.
+
+    Sin jitter, varios agentes rebotados por el mismo 429 vuelven a golpear el backend
+    EXACTAMENTE a la vez y se rebotan de nuevo. Con Retry-After el jitter va POR ENCIMA
+    de lo pedido (nunca antes de lo que el servidor mandó); sin él se usa equal-jitter
+    sobre el backoff exponencial.
+    """
+    if retry_after is not None:
+        return retry_after + random.uniform(0.0, min(retry_after * 0.25, 5.0))
+    base = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+    return random.uniform(base * 0.5, base)
 
 
 def _derive_base(url: str) -> str:
@@ -600,6 +621,32 @@ def _kill_process_group(proc: "asyncio.subprocess.Process") -> None:
             pass
 
 
+# ── Entorno de los subprocesos ───────────────────────────────────────────────────
+# ALLOWLIST, no denylist. `create_subprocess_*` sin `env=` hereda el entorno COMPLETO del
+# servidor MCP: el shell del agente veía DELEGATE_LOCAL_KEY, LITELLM_MASTER_KEY y todo
+# secreto exportado en la sesión. Un modelo externo con run_bash solo tenía que correr
+# `env` para exfiltrarlas. Una denylist fallaría con la primera variable nueva; la
+# allowlist falla hacia el lado seguro.
+_ENV_ALLOWLIST = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TZ", "PWD", "LANG",
+})
+_ENV_ALLOWLIST_PREFIXES = ("LC_",)
+# Escotilla para cuando una tarea legítima necesite una variable extra (nombres separados
+# por coma). Es explícita a propósito: quien la abre sabe qué está dejando pasar.
+_ENV_PASSTHROUGH = tuple(
+    n.strip() for n in os.environ.get("DELEGATE_ENV_PASSTHROUGH", "").split(",") if n.strip()
+)
+
+
+def _child_env(extra: tuple[str, ...] = ()) -> dict[str, str]:
+    """Entorno mínimo para un subproceso del agente: solo lo de la allowlist."""
+    allowed = _ENV_ALLOWLIST | set(extra) | set(_ENV_PASSTHROUGH)
+    return {
+        k: v for k, v in os.environ.items()
+        if k in allowed or k.startswith(_ENV_ALLOWLIST_PREFIXES)
+    }
+
+
 _bash_semaphore: asyncio.Semaphore | None = None
 
 
@@ -622,6 +669,7 @@ async def _run_bash(workdir: str, command: str) -> str:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
+                env=_child_env(),  # allowlist: el shell del agente no ve los secretos
             )
         except Exception as e:
             return f"ERROR: {type(e).__name__}: {e}"
@@ -1333,8 +1381,23 @@ async def _delegate_one_impl(
                 # Retry only transient statuses; other 4xx (bad payload/auth, incl. GLM's
                 # 1210 max_tokens error) are deterministic — retrying wastes time/quota.
                 if code in RETRYABLE_STATUS and attempt < BACKEND_MAX_RETRIES:
-                    delay = _retry_after_seconds(e.response) or RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                    # `is not None`: un Retry-After: 0 explícito es válido ("reintenta ya")
+                    # y con `or` caía al backoff, esperando de más.
+                    delay = _retry_delay(attempt, _retry_after_seconds(e.response))
                     last_transient = f"HTTP {code}"
+                    # Dormir más de lo que queda del deadline es tiempo tirado: el próximo
+                    # intento moriría en el chequeo de DISPATCH_MIN_SLICE igual.
+                    if delay > (deadline - time.time()) - DISPATCH_MIN_SLICE:
+                        return {
+                            "success": False,
+                            "error": (
+                                f"backend HTTP {code}; la espera de {delay:.1f}s no cabe "
+                                f"en lo que queda del deadline de {DISPATCH_TIMEOUT}s"
+                            ),
+                            "timeout_scope": "dispatch",
+                            "turn_failed": turn,
+                            "final_response": final_text,
+                        }
                     await asyncio.sleep(delay)
                     continue
                 return {
@@ -1349,7 +1412,7 @@ async def _delegate_one_impl(
                 retryable = getattr(e, "retryable", True)
                 if retryable and attempt < BACKEND_MAX_RETRIES:
                     last_transient = f"{type(e).__name__}: {e}"
-                    await asyncio.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
+                    await asyncio.sleep(_retry_delay(attempt))
                     continue
                 return {
                     "success": False,
@@ -1776,12 +1839,15 @@ async def delegate_batch(
                     total=len(tasks),
                     message=f"{len(results_by_idx)}/{len(tasks)} tasks done",
                 )
-    except asyncio.CancelledError:
-        # Client cancelled the MCP request (user abort / client timeout).
-        # Reap children and PROPAGATE so FastMCP acknowledges the cancel
-        # instead of later emitting a response for an already-cancelled id
-        # (that desync killed the STDIO connection -> -32000 on every
-        # subsequent call until restart).
+    except BaseException:
+        # CancelledError = el cliente abortó la request MCP (user abort / timeout del
+        # cliente). Pero la limpieza NO puede ser exclusiva de ese caso: si
+        # ctx.report_progress lanza cualquier otra cosa, delegate_batch salía dejando las
+        # tasks vivas, llamando al proveedor y reteniendo slots del semáforo que ya nadie
+        # esperaba — los "agentes ocupando slot huérfano". Se recolectan los hijos y se
+        # PROPAGA, para que FastMCP reconozca el fin en vez de emitir después una
+        # respuesta para un id ya cancelado (ese desync tumbaba el STDIO -> -32000 en
+        # cada llamada siguiente hasta reiniciar).
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
@@ -2015,6 +2081,10 @@ async def delegate_to_codex(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,  # own process group -> kill the whole tree on timeout/cancel
+            # Misma allowlist que run_bash. Codex se autentica con ~/.codex/auth.json, así
+            # que le basta HOME + PATH; los CODEX_* propios pasan por prefijo. Que
+            # OPENAI_API_KEY quede fuera es deseado: el plan de ChatGPT es la única ruta.
+            env=_child_env(("CODEX_HOME",)),
         )
     except FileNotFoundError:
         return {

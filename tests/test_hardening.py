@@ -375,6 +375,141 @@ def test_dispatch_bounded_enforces_semaphore_on_all_routes():
     print("PASS _dispatch_bounded aplica el semáforo (max concurrent = 1)")
 
 
+# ── Auditoría 2026-08-17: entorno, 529, backoff, limpieza del batch ────────────
+def test_child_env_is_allowlisted():
+    """create_subprocess_* sin env= hereda el entorno COMPLETO: el shell del agente veía
+    DELEGATE_LOCAL_KEY y demás secretos, y un modelo externo solo tenía que correr `env`."""
+    os.environ["DELEGATE_LOCAL_KEY"] = "sk-secreto-no-debe-salir"
+    os.environ["LITELLM_MASTER_KEY"] = "sk-master-no-debe-salir"
+    env = server._child_env()
+    assert "DELEGATE_LOCAL_KEY" not in env
+    assert "LITELLM_MASTER_KEY" not in env
+    assert "PATH" in env and "HOME" in env, "el subproceso sí necesita PATH/HOME"
+    # La escotilla explícita es lo único que deja pasar algo fuera de la allowlist.
+    server._ENV_PASSTHROUGH = ("LITELLM_MASTER_KEY",)
+    assert "LITELLM_MASTER_KEY" in server._child_env()
+    assert "DELEGATE_LOCAL_KEY" not in server._child_env()
+    server._ENV_PASSTHROUGH = ()
+    os.environ.pop("LITELLM_MASTER_KEY", None)
+    print("PASS _child_env es allowlist: los secretos no llegan al subproceso")
+
+
+def test_run_bash_does_not_leak_env_secrets():
+    """El de arriba prueba el helper; este prueba el hueco real, corriendo `env`."""
+    os.environ["DELEGATE_LOCAL_KEY"] = "sk-secreto-no-debe-salir"
+    with tempfile.TemporaryDirectory() as wd:
+        out = run_coro(server._run_bash(wd, "env"))
+    assert "sk-secreto-no-debe-salir" not in out, out[:400]
+    assert "exit_code: 0" in out
+    print("PASS run_bash no expone secretos del entorno")
+
+
+def test_529_is_retryable():
+    """529 = overloaded (Anthropic/z.ai). Estaba fuera de la lista y caía al error
+    inmediato: verificado en vivo, z.ai devolvió 529 siete veces seguidas."""
+    assert 529 in server.RETRYABLE_STATUS
+    assert 400 not in server.RETRYABLE_STATUS  # los deterministas siguen fallando rápido
+    assert 401 not in server.RETRYABLE_STATUS
+    print("PASS 529 entra en RETRYABLE_STATUS y los 4xx deterministas no")
+
+
+def test_retry_delay_respects_retry_after_and_jitters():
+    """Sin jitter, N agentes rebotados por el mismo 429 vuelven a golpear a la vez."""
+    # Retry-After manda: nunca se vuelve ANTES de lo pedido, y el jitter va por encima.
+    for _ in range(20):
+        d = server._retry_delay(0, 60.0)
+        assert 60.0 <= d <= 75.0, d
+    # Retry-After: 0 explícito es válido; con `or` caía al backoff y esperaba de más.
+    assert server._retry_delay(3, 0.0) == 0.0
+    # Sin Retry-After: equal jitter sobre el backoff, y valores distintos entre llamadas.
+    base = server.RETRY_BACKOFF[0]
+    vals = {server._retry_delay(0) for _ in range(20)}
+    assert all(base * 0.5 <= v <= base for v in vals), vals
+    assert len(vals) > 1, "sin jitter todos los reintentos vuelven sincronizados"
+    # attempt fuera de rango: clamp, no IndexError.
+    server._retry_delay(len(server.RETRY_BACKOFF) + 5)
+    print("PASS _retry_delay respeta Retry-After (incl. 0) y dispersa con jitter")
+
+
+def test_retry_after_cap_is_not_30s():
+    """El cap viejo de 30s hacía volver antes de tiempo cuando GLM pedía 60-120s."""
+    class _Resp:
+        def __init__(self, v):
+            self.headers = {"retry-after": v}
+
+    assert server._retry_after_seconds(_Resp("60")) == 60.0
+    assert server._retry_after_seconds(_Resp("9999")) == server.RETRY_AFTER_MAX
+    assert server._retry_after_seconds(_Resp("0")) == 0.0
+    assert server._retry_after_seconds(_Resp("basura")) is None
+    print(f"PASS Retry-After se honra hasta {server.RETRY_AFTER_MAX}s")
+
+
+def test_batch_cleans_up_on_non_cancel_exception():
+    """La limpieza cubría solo CancelledError: si ctx.report_progress lanzaba otra cosa,
+    delegate_batch salía y las tasks seguían llamando al proveedor con el slot tomado."""
+    seen = {"started": 0, "cancelled": 0}
+
+    async def staged_dispatch(**kw):
+        """La 1ra responde ya (dispara el done -> report_progress -> boom); las demás
+        siguen corriendo, que es justo el estado en que quedaban huérfanas.
+
+        Se espía el despacho, no _call_backend: con el semáforo por proveedor las tareas
+        en cola ni siquiera llegan al backend, así que una cancelación ahí no se vería.
+        """
+        seen["started"] += 1
+        if seen["started"] == 1:
+            return {"success": True, "final_response": "ok"}
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            seen["cancelled"] += 1
+            raise
+        return {"success": True, "final_response": "ok"}
+
+    # Se parchean ambos nombres a propósito: así el test también corre (y falla) contra
+    # la versión anterior del server, donde el semáforo vivía dentro de delegate_batch.
+    orig_impl = server._delegate_one_impl
+    orig_bounded = getattr(server, "_dispatch_bounded", None)
+    server._delegate_one_impl = staged_dispatch
+    if orig_bounded is not None:
+        server._dispatch_bounded = staged_dispatch
+
+    class _BoomCtx:
+        """Deja pasar el progreso inicial (que corre antes de crear las tasks) y revienta
+        en el heartbeat del while, con las tasks ya en vuelo — el escenario del hallazgo."""
+        def __init__(self):
+            self.calls = 0
+
+        async def report_progress(self, **kw):
+            self.calls += 1
+            if self.calls > 1:
+                raise ValueError("boom desde el cliente MCP")
+
+    batch = getattr(server.delegate_batch, "fn", server.delegate_batch)
+    tasks = [{"agent_name": "a", "task": f"t{i}", "model": "m"} for i in range(3)]
+
+    async def run():
+        try:
+            await batch(tasks=tasks, ctx=_BoomCtx())
+        except ValueError:
+            pass
+        # Se cuenta AQUÍ, con el loop todavía vivo: asyncio.run lo cierra al salir y se
+        # llevaría las huérfanas por delante, escondiendo justo el fallo que se busca
+        # (en producción el loop del servidor MCP sigue corriendo).
+        await asyncio.sleep(0.05)
+        return seen["cancelled"]
+
+    cancelled = run_coro(run())
+    server._delegate_one_impl = orig_impl
+    if orig_bounded is not None:
+        server._dispatch_bounded = orig_bounded
+    assert cancelled == 2, (
+        f"quedaron {2 - cancelled} tasks vivas llamando al proveedor con el slot tomado"
+    )
+    _restore_patches()
+    print("PASS delegate_batch recolecta los hijos ante cualquier excepción")
+
+
 if __name__ == "__main__":
     test_provider_no_global_race()
     test_safe_resolve_confines()
@@ -398,4 +533,10 @@ if __name__ == "__main__":
     test_run_bash_truncation_is_loud()
     test_dispatch_bounded_enforces_semaphore_on_all_routes()
     test_local_turns_floor_and_batch()
-    print("\nALL PASS (22/22)")
+    test_child_env_is_allowlisted()
+    test_run_bash_does_not_leak_env_secrets()
+    test_529_is_retryable()
+    test_retry_delay_respects_retry_after_and_jitters()
+    test_retry_after_cap_is_not_30s()
+    test_batch_cleans_up_on_non_cancel_exception()
+    print("\nALL PASS (28/28)")
