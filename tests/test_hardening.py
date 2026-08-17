@@ -282,6 +282,234 @@ def test_nudge_constants_are_sane():
     print("PASS completion-nudge is configured")
 
 
+
+# ── Auditoría 2026-08-17: estado compartido, truncado, semáforo, stop_reason ────
+def test_apply_cache_control_does_not_mutate_shared_state():
+    """Regression (auditoría 2026-08): _apply_cache_control reemplazaba msgs[-1] y
+    tools[-1] sobre los objetos DEL CALLER. El loop agéntico reutiliza una sola lista
+    `messages` entre turnos, así que las marcas acumulaban una por turno — el request
+    del turno 3 llevaba 5 breakpoints (system + tools + 3 mensajes marcados) contra el
+    límite de 4 de la API Anthropic -> 400 invalid_request_error a mitad de dispatch en
+    glm-*. También mutaba AGENT_TOOLS, global y compartido por todos los dispatches."""
+    messages = [{"role": "user", "content": "hi"}]
+    tools_snapshot = [dict(t) for t in server.AGENT_TOOLS]
+
+    def count_marks(msgs):
+        n = 0
+        for m in msgs:
+            c = m.get("content")
+            if isinstance(c, list):
+                n += sum(1 for b in c if isinstance(b, dict) and "cache_control" in b)
+        return n
+
+    for turn in range(4):  # simula turnos del loop sobre la MISMA lista
+        payload = {"system": "S", "tools": server.AGENT_TOOLS, "messages": messages}
+        server._apply_cache_control(payload, "glm-coding-plan")
+        assert count_marks(messages) == 0, f"turn {turn}: marker leaked into shared conversation"
+        assert count_marks(payload["messages"]) == 1, "payload should carry exactly 1 message mark"
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": "a"}]})
+        messages.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": "r"}]})
+
+    assert server.AGENT_TOOLS == tools_snapshot, "AGENT_TOOLS global was mutated"
+    assert isinstance(messages[0]["content"], str), "string content rewritten in place"
+    print("PASS cache_control no muta messages compartidos ni AGENT_TOOLS")
+
+
+def test_success_gating_unknown_stop_reason():
+    """Un stream que termina limpiamente SIN evento final deja stop_reason='unknown'
+    con texto parcial — antes se reportaba success=True (trabajo a medias como éxito).
+    content_filter con texto parcial ídem."""
+    for stop in ("unknown", "content_filter"):
+        _patch_agent()
+
+        async def truncated(*a, _stop=stop, **k):
+            return {"content": [{"type": "text", "text": "partial answer, cut mid-str"}],
+                    "stop_reason": _stop, "usage": {}}
+
+        server._call_backend = truncated
+        r = run_coro(server._delegate_one_impl("a", "t", model="m", max_turns=3))
+        assert r["success"] is False and r["incomplete"], (stop, r)
+    _restore_patches()
+    print("PASS unknown/content_filter con texto parcial -> success=False")
+
+
+def test_run_bash_truncation_is_loud():
+    """stdout cortado a 12000 chars no llevaba marcador: un resumen de fallos que
+    caía después del corte se veía verde para el modelo (éxito con tests rojos)."""
+    wd = tempfile.mkdtemp()
+    out = run_coro(server._run_bash(wd, "seq 1 4000"))  # ~19KB de stdout
+    assert "truncado" in out and "12000" in out, out[-400:]
+    assert "exit_code: 0" in out
+    small = run_coro(server._run_bash(wd, "echo hi"))
+    assert "truncado" not in small, small
+    print("PASS truncado de run_bash lleva marcador visible solo cuando corta")
+
+
+def test_dispatch_bounded_enforces_semaphore_on_all_routes():
+    """El semáforo por proveedor antes SOLO lo adquiría delegate_batch; las rutas
+    directas lo bypassaban (N despachos GLM concurrentes -> tormenta de 429).
+    _dispatch_bounded debe serializar el trabajo del mismo bucket."""
+    _patch_agent()
+    server._provider_semaphores["_default"] = asyncio.Semaphore(1)  # fuerza serialización
+    conc = {"now": 0, "max": 0}
+
+    async def fake_call(*a, **k):
+        conc["now"] += 1
+        conc["max"] = max(conc["max"], conc["now"])
+        await asyncio.sleep(0.05)
+        conc["now"] -= 1
+        return {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "usage": {}}
+
+    server._call_backend = fake_call
+
+    async def run():
+        return await asyncio.gather(*[
+            server._dispatch_bounded("a", f"t{i}", model="m") for i in range(3)
+        ])
+
+    results = run_coro(run())
+    assert all(r["success"] for r in results), results
+    assert conc["max"] == 1, f"semaphore not enforced: max concurrent = {conc['max']}"
+    server._provider_semaphores.pop("_default", None)
+    _restore_patches()
+    print("PASS _dispatch_bounded aplica el semáforo (max concurrent = 1)")
+
+
+# ── Auditoría 2026-08-17: entorno, 529, backoff, limpieza del batch ────────────
+def test_child_env_is_allowlisted():
+    """create_subprocess_* sin env= hereda el entorno COMPLETO: el shell del agente veía
+    DELEGATE_LOCAL_KEY y demás secretos, y un modelo externo solo tenía que correr `env`."""
+    os.environ["DELEGATE_LOCAL_KEY"] = "sk-secreto-no-debe-salir"
+    os.environ["LITELLM_MASTER_KEY"] = "sk-master-no-debe-salir"
+    env = server._child_env()
+    assert "DELEGATE_LOCAL_KEY" not in env
+    assert "LITELLM_MASTER_KEY" not in env
+    assert "PATH" in env and "HOME" in env, "el subproceso sí necesita PATH/HOME"
+    # La escotilla explícita es lo único que deja pasar algo fuera de la allowlist.
+    server._ENV_PASSTHROUGH = ("LITELLM_MASTER_KEY",)
+    assert "LITELLM_MASTER_KEY" in server._child_env()
+    assert "DELEGATE_LOCAL_KEY" not in server._child_env()
+    server._ENV_PASSTHROUGH = ()
+    os.environ.pop("LITELLM_MASTER_KEY", None)
+    print("PASS _child_env es allowlist: los secretos no llegan al subproceso")
+
+
+def test_run_bash_does_not_leak_env_secrets():
+    """El de arriba prueba el helper; este prueba el hueco real, corriendo `env`."""
+    os.environ["DELEGATE_LOCAL_KEY"] = "sk-secreto-no-debe-salir"
+    with tempfile.TemporaryDirectory() as wd:
+        out = run_coro(server._run_bash(wd, "env"))
+    assert "sk-secreto-no-debe-salir" not in out, out[:400]
+    assert "exit_code: 0" in out
+    print("PASS run_bash no expone secretos del entorno")
+
+
+def test_529_is_retryable():
+    """529 = overloaded (Anthropic/z.ai). Estaba fuera de la lista y caía al error
+    inmediato: verificado en vivo, z.ai devolvió 529 siete veces seguidas."""
+    assert 529 in server.RETRYABLE_STATUS
+    assert 400 not in server.RETRYABLE_STATUS  # los deterministas siguen fallando rápido
+    assert 401 not in server.RETRYABLE_STATUS
+    print("PASS 529 entra en RETRYABLE_STATUS y los 4xx deterministas no")
+
+
+def test_retry_delay_respects_retry_after_and_jitters():
+    """Sin jitter, N agentes rebotados por el mismo 429 vuelven a golpear a la vez."""
+    # Retry-After manda: nunca se vuelve ANTES de lo pedido, y el jitter va por encima.
+    for _ in range(20):
+        d = server._retry_delay(0, 60.0)
+        assert 60.0 <= d <= 75.0, d
+    # Retry-After: 0 explícito es válido; con `or` caía al backoff y esperaba de más.
+    assert server._retry_delay(3, 0.0) == 0.0
+    # Sin Retry-After: equal jitter sobre el backoff, y valores distintos entre llamadas.
+    base = server.RETRY_BACKOFF[0]
+    vals = {server._retry_delay(0) for _ in range(20)}
+    assert all(base * 0.5 <= v <= base for v in vals), vals
+    assert len(vals) > 1, "sin jitter todos los reintentos vuelven sincronizados"
+    # attempt fuera de rango: clamp, no IndexError.
+    server._retry_delay(len(server.RETRY_BACKOFF) + 5)
+    print("PASS _retry_delay respeta Retry-After (incl. 0) y dispersa con jitter")
+
+
+def test_retry_after_cap_is_not_30s():
+    """El cap viejo de 30s hacía volver antes de tiempo cuando GLM pedía 60-120s."""
+    class _Resp:
+        def __init__(self, v):
+            self.headers = {"retry-after": v}
+
+    assert server._retry_after_seconds(_Resp("60")) == 60.0
+    assert server._retry_after_seconds(_Resp("9999")) == server.RETRY_AFTER_MAX
+    assert server._retry_after_seconds(_Resp("0")) == 0.0
+    assert server._retry_after_seconds(_Resp("basura")) is None
+    print(f"PASS Retry-After se honra hasta {server.RETRY_AFTER_MAX}s")
+
+
+def test_batch_cleans_up_on_non_cancel_exception():
+    """La limpieza cubría solo CancelledError: si ctx.report_progress lanzaba otra cosa,
+    delegate_batch salía y las tasks seguían llamando al proveedor con el slot tomado."""
+    seen = {"started": 0, "cancelled": 0}
+
+    async def staged_dispatch(**kw):
+        """La 1ra responde ya (dispara el done -> report_progress -> boom); las demás
+        siguen corriendo, que es justo el estado en que quedaban huérfanas.
+
+        Se espía el despacho, no _call_backend: con el semáforo por proveedor las tareas
+        en cola ni siquiera llegan al backend, así que una cancelación ahí no se vería.
+        """
+        seen["started"] += 1
+        if seen["started"] == 1:
+            return {"success": True, "final_response": "ok"}
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            seen["cancelled"] += 1
+            raise
+        return {"success": True, "final_response": "ok"}
+
+    # Se parchean ambos nombres a propósito: así el test también corre (y falla) contra
+    # la versión anterior del server, donde el semáforo vivía dentro de delegate_batch.
+    orig_impl = server._delegate_one_impl
+    orig_bounded = getattr(server, "_dispatch_bounded", None)
+    server._delegate_one_impl = staged_dispatch
+    if orig_bounded is not None:
+        server._dispatch_bounded = staged_dispatch
+
+    class _BoomCtx:
+        """Deja pasar el progreso inicial (que corre antes de crear las tasks) y revienta
+        en el heartbeat del while, con las tasks ya en vuelo — el escenario del hallazgo."""
+        def __init__(self):
+            self.calls = 0
+
+        async def report_progress(self, **kw):
+            self.calls += 1
+            if self.calls > 1:
+                raise ValueError("boom desde el cliente MCP")
+
+    batch = getattr(server.delegate_batch, "fn", server.delegate_batch)
+    tasks = [{"agent_name": "a", "task": f"t{i}", "model": "m"} for i in range(3)]
+
+    async def run():
+        try:
+            await batch(tasks=tasks, ctx=_BoomCtx())
+        except ValueError:
+            pass
+        # Se cuenta AQUÍ, con el loop todavía vivo: asyncio.run lo cierra al salir y se
+        # llevaría las huérfanas por delante, escondiendo justo el fallo que se busca
+        # (en producción el loop del servidor MCP sigue corriendo).
+        await asyncio.sleep(0.05)
+        return seen["cancelled"]
+
+    cancelled = run_coro(run())
+    server._delegate_one_impl = orig_impl
+    if orig_bounded is not None:
+        server._dispatch_bounded = orig_bounded
+    assert cancelled == 2, (
+        f"quedaron {2 - cancelled} tasks vivas llamando al proveedor con el slot tomado"
+    )
+    _restore_patches()
+    print("PASS delegate_batch recolecta los hijos ante cualquier excepción")
+
+
 if __name__ == "__main__":
     test_provider_no_global_race()
     test_safe_resolve_confines()
@@ -300,5 +528,15 @@ if __name__ == "__main__":
     test_success_gating_max_tokens()
     test_success_gating_clean_finish()
     test_success_gating_empty_nonunknown_stop()
+    test_apply_cache_control_does_not_mutate_shared_state()
+    test_success_gating_unknown_stop_reason()
+    test_run_bash_truncation_is_loud()
+    test_dispatch_bounded_enforces_semaphore_on_all_routes()
     test_local_turns_floor_and_batch()
-    print("\nALL PASS (18/18)")
+    test_child_env_is_allowlisted()
+    test_run_bash_does_not_leak_env_secrets()
+    test_529_is_retryable()
+    test_retry_delay_respects_retry_after_and_jitters()
+    test_retry_after_cap_is_not_30s()
+    test_batch_cleans_up_on_non_cancel_exception()
+    print("\nALL PASS (28/28)")

@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import pathlib
+import random
 import re
 import signal
 import socket
@@ -345,8 +346,14 @@ def _resolve_max_tokens(model: str, max_tokens: int | None) -> int:
 # blip would otherwise discard a whole multi-turn dispatch (and, for pay-per-token
 # providers, the thinking tokens already billed).
 BACKEND_MAX_RETRIES = 3
-RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# 529 = "overloaded" de Anthropic/z.ai. Es transitorio por definición y estaba fuera de la
+# lista: caía al error inmediato y descartaba el despacho entero. Verificado en vivo el
+# 2026-08-17: z.ai devolvió 529 siete veces seguidas bajo concurrencia 3.
+RETRYABLE_STATUS = {429, 500, 502, 503, 504, 529}
 RETRY_BACKOFF = (1.0, 2.0, 4.0, 8.0)
+# Techo del Retry-After del servidor. El cap viejo de 30s hacía que, cuando GLM pedía
+# esperar 60-120s, el delegate volviera antes de tiempo y agravara el 429.
+RETRY_AFTER_MAX = 120.0
 
 
 class BackendStreamError(Exception):
@@ -376,7 +383,7 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
     if not val:
         return None
     try:
-        return min(float(val), 30.0)
+        return max(0.0, min(float(val), RETRY_AFTER_MAX))
     except (TypeError, ValueError):
         pass
     try:
@@ -384,10 +391,24 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
         if dt is not None:
             import datetime
             now = datetime.datetime.now(dt.tzinfo)
-            return max(0.0, min((dt - now).total_seconds(), 30.0))
+            return max(0.0, min((dt - now).total_seconds(), RETRY_AFTER_MAX))
     except (TypeError, ValueError):
         pass
     return None
+
+
+def _retry_delay(attempt: int, retry_after: float | None = None) -> float:
+    """Segundos a esperar antes del próximo intento, con jitter.
+
+    Sin jitter, varios agentes rebotados por el mismo 429 vuelven a golpear el backend
+    EXACTAMENTE a la vez y se rebotan de nuevo. Con Retry-After el jitter va POR ENCIMA
+    de lo pedido (nunca antes de lo que el servidor mandó); sin él se usa equal-jitter
+    sobre el backoff exponencial.
+    """
+    if retry_after is not None:
+        return retry_after + random.uniform(0.0, min(retry_after * 0.25, 5.0))
+    base = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+    return random.uniform(base * 0.5, base)
 
 
 def _derive_base(url: str) -> str:
@@ -600,6 +621,32 @@ def _kill_process_group(proc: "asyncio.subprocess.Process") -> None:
             pass
 
 
+# ── Entorno de los subprocesos ───────────────────────────────────────────────────
+# ALLOWLIST, no denylist. `create_subprocess_*` sin `env=` hereda el entorno COMPLETO del
+# servidor MCP: el shell del agente veía DELEGATE_LOCAL_KEY, LITELLM_MASTER_KEY y todo
+# secreto exportado en la sesión. Un modelo externo con run_bash solo tenía que correr
+# `env` para exfiltrarlas. Una denylist fallaría con la primera variable nueva; la
+# allowlist falla hacia el lado seguro.
+_ENV_ALLOWLIST = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TZ", "PWD", "LANG",
+})
+_ENV_ALLOWLIST_PREFIXES = ("LC_",)
+# Escotilla para cuando una tarea legítima necesite una variable extra (nombres separados
+# por coma). Es explícita a propósito: quien la abre sabe qué está dejando pasar.
+_ENV_PASSTHROUGH = tuple(
+    n.strip() for n in os.environ.get("DELEGATE_ENV_PASSTHROUGH", "").split(",") if n.strip()
+)
+
+
+def _child_env(extra: tuple[str, ...] = ()) -> dict[str, str]:
+    """Entorno mínimo para un subproceso del agente: solo lo de la allowlist."""
+    allowed = _ENV_ALLOWLIST | set(extra) | set(_ENV_PASSTHROUGH)
+    return {
+        k: v for k, v in os.environ.items()
+        if k in allowed or k.startswith(_ENV_ALLOWLIST_PREFIXES)
+    }
+
+
 _bash_semaphore: asyncio.Semaphore | None = None
 
 
@@ -622,6 +669,7 @@ async def _run_bash(workdir: str, command: str) -> str:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
+                env=_child_env(),  # allowlist: el shell del agente no ve los secretos
             )
         except Exception as e:
             return f"ERROR: {type(e).__name__}: {e}"
@@ -639,10 +687,18 @@ async def _run_bash(workdir: str, command: str) -> str:
             raise
         so = (out or b"").decode("utf-8", "replace")
         se = (err or b"").decode("utf-8", "replace")
+        so_t, se_t = so[:12000], se[:4000]
+        # Marcador de truncado: sin él, un resumen de fallos que cae después del corte
+        # se ve "verde" para el modelo, que reporta éxito con tests rojos (fallo
+        # histórico de esta tool: trabajo a medias reportado como éxito).
+        so_note = (f"\n[... stdout truncado a 12000 de {len(so)} chars — "
+                   f"re-ejecuta con grep/tail para ver el resto]") if len(so) > 12000 else ""
+        se_note = (f"\n[... stderr truncado a 4000 de {len(se)} chars — "
+                   f"re-ejecuta para ver el resto]") if len(se) > 4000 else ""
         return (
             f"exit_code: {proc.returncode}\n"
-            f"--- stdout ---\n{so[:12000]}\n"
-            f"--- stderr ---\n{se[:4000]}"
+            f"--- stdout ---\n{so_t}{so_note}\n"
+            f"--- stderr ---\n{se_t}{se_note}"
         )
 
 
@@ -1082,6 +1138,18 @@ def _apply_cache_control(payload: dict, model: str) -> None:
     """
     if not DELEGATE_PROMPT_CACHING or not _supports_prompt_caching(model):
         return
+
+    # NO mutar los objetos compartidos con el loop agéntico ni AGENT_TOOLS: copiar la
+    # LISTA y reemplazar solo su último elemento. Sin esto, cada turno dejaba un
+    # cache_control huérfano en la historia compartida (verificado: 1 marca por turno,
+    # acumulándose) hasta superar el límite de 4 breakpoints de la API Anthropic —
+    # 400 invalid_request_error a mitad de dispatch en glm-*. AGENT_TOOLS (global,
+    # compartido por todos los dispatches) quedaba marcado igualmente.
+    if isinstance(payload.get("tools"), list) and payload["tools"]:
+        payload["tools"] = list(payload["tools"])
+    if isinstance(payload.get("messages"), list) and payload["messages"]:
+        payload["messages"] = list(payload["messages"])
+
     mark = {"type": "ephemeral"}
 
     sys_val = payload.get("system")
@@ -1313,8 +1381,23 @@ async def _delegate_one_impl(
                 # Retry only transient statuses; other 4xx (bad payload/auth, incl. GLM's
                 # 1210 max_tokens error) are deterministic — retrying wastes time/quota.
                 if code in RETRYABLE_STATUS and attempt < BACKEND_MAX_RETRIES:
-                    delay = _retry_after_seconds(e.response) or RETRY_BACKOFF[attempt]
+                    # `is not None`: un Retry-After: 0 explícito es válido ("reintenta ya")
+                    # y con `or` caía al backoff, esperando de más.
+                    delay = _retry_delay(attempt, _retry_after_seconds(e.response))
                     last_transient = f"HTTP {code}"
+                    # Dormir más de lo que queda del deadline es tiempo tirado: el próximo
+                    # intento moriría en el chequeo de DISPATCH_MIN_SLICE igual.
+                    if delay > (deadline - time.time()) - DISPATCH_MIN_SLICE:
+                        return {
+                            "success": False,
+                            "error": (
+                                f"backend HTTP {code}; la espera de {delay:.1f}s no cabe "
+                                f"en lo que queda del deadline de {DISPATCH_TIMEOUT}s"
+                            ),
+                            "timeout_scope": "dispatch",
+                            "turn_failed": turn,
+                            "final_response": final_text,
+                        }
                     await asyncio.sleep(delay)
                     continue
                 return {
@@ -1329,7 +1412,7 @@ async def _delegate_one_impl(
                 retryable = getattr(e, "retryable", True)
                 if retryable and attempt < BACKEND_MAX_RETRIES:
                     last_transient = f"{type(e).__name__}: {e}"
-                    await asyncio.sleep(RETRY_BACKOFF[attempt])
+                    await asyncio.sleep(_retry_delay(attempt))
                     continue
                 return {
                     "success": False,
@@ -1400,6 +1483,17 @@ async def _delegate_one_impl(
         messages.append({"role": "assistant", "content": content})
         tool_results = []
         for tu in tool_uses:
+            # El deadline del despacho también acota la ejecución de tools: sin este
+            # chequeo, un turno con K tool_use puede excederlo en K×RUN_BASH_TIMEOUT
+            # mientras retiene el bash-semaphore global que comparten los demás
+            # despachos (el chequeo del while solo corre al inicio del turno).
+            if time.time() >= deadline:
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu.get("id"),
+                    "content": "ERROR: dispatch deadline reached; tool not executed",
+                })
+                continue
             tool_calls += 1
             name = tu.get("name")
             args = tu.get("input", {})
@@ -1424,7 +1518,7 @@ async def _delegate_one_impl(
     hit_turn_limit = turn >= max_turns and bool(tool_uses)
     incomplete = (
         hit_turn_limit
-        or stop_reason == "max_tokens"
+        or stop_reason in ("max_tokens", "content_filter", "unknown")
         # No text produced across the whole run, regardless of stop_reason: a truncated
         # stream (unknown), a moderation cutoff (content_filter), or an empty end_turn all
         # mean the dispatch produced nothing usable → not a success.
@@ -1460,6 +1554,45 @@ async def _delegate_one_impl(
         "hit_turn_limit": hit_turn_limit,
         "incomplete": incomplete,
     }
+
+
+async def _dispatch_bounded(
+    agent_name: str,
+    task: str,
+    workdir: str = ".",
+    max_turns: int = 0,
+    model: str = DEFAULT_MODEL,
+    max_tokens: int | None = None,
+    ctx: Context | None = None,
+    url: str | None = None,
+    key: str | None = None,
+    mode_tag: str | None = None,
+) -> dict:
+    """_delegate_one_impl + semáforo del proveedor, en UN solo lugar.
+
+    Antes el semáforo solo lo adquiría delegate_batch: delegate_to_local_agent y
+    delegate_to_provider llamaban a _delegate_one_impl directo y bypassaban el cap
+    por proveedor — N despachos directos concurrentes contra el mismo plan (GLM)
+    disparaban los 429/529 en cascada. Todas las tools MCP entran por aquí.
+
+    El bucket se calcula con el model EFECTIVO (incl. el auto-route a CODING_MODEL
+    que _delegate_one_impl hace adentro); el wrapper viejo de batch lo calculaba con
+    el model SIN resolver y podía contar el slot del bucket equivocado. El semáforo
+    se toma antes de que _delegate_one_impl fije su t0/deadline: el deadline sigue
+    sin contar tiempo de cola (semántica que batch ya tenía) y BATCH_TASK_TIMEOUT =
+    DISPATCH_TIMEOUT + grace sigue cubriendo cola + despacho.
+    """
+    eff_model = model
+    if isinstance(agent_name, str) and model == DEFAULT_MODEL \
+            and agent_name.lower() in CODING_AGENTS:
+        eff_model = CODING_MODEL
+    sem, _prov = await _get_provider_semaphore(eff_model)
+    async with sem:
+        return await _delegate_one_impl(
+            agent_name=agent_name, task=task, workdir=workdir, max_turns=max_turns,
+            model=model, max_tokens=max_tokens, ctx=ctx, url=url, key=key,
+            mode_tag=mode_tag,
+        )
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -1513,7 +1646,7 @@ async def delegate_to_local_agent(
         dict con keys: success, final_response, turns, tool_calls, malformed_calls,
         elapsed_s, tokens_in, tokens_out, stop_reason, agent_name, model, workdir
     """
-    return await _delegate_one_impl(
+    return await _dispatch_bounded(
         agent_name=agent_name,
         task=task,
         workdir=workdir,
@@ -1633,17 +1766,19 @@ async def delegate_batch(
             # Semáforo POR PROVEEDOR: las tareas de backends distintos no compiten entre
             # sí. Lo que exceda los slots de su proveedor espera aquí en vez de saturar
             # el backend (o, en el caso local, de tumbar el trabajo de producción).
-            sem, prov = await _get_provider_semaphore(model)
-            async with sem:
-                return await _delegate_one_impl(
-                    agent_name=agent_name,
-                    task=task_str,
-                    workdir=t.get("workdir", "."),
-                    max_turns=t.get("max_turns", 0),
-                    model=model,
-                    max_tokens=t.get("max_tokens"),  # None sentinel -> _delegate_one_impl resolves by alias
-                    ctx=None,  # nested per-task progress reporting omitted in batch
-                )
+            # El semáforo por proveedor ahora lo aplica _dispatch_bounded, compartido
+            # por TODAS las rutas de entrada (batch, directas y provider). Las tareas
+            # de backends distintos no compiten entre sí; lo que exceda los slots de
+            # su proveedor espera en cola en vez de saturar el plan.
+            return await _dispatch_bounded(
+                agent_name=agent_name,
+                task=task_str,
+                workdir=t.get("workdir", "."),
+                max_turns=t.get("max_turns", 0),
+                model=model,
+                max_tokens=t.get("max_tokens"),  # None sentinel -> resolved by alias inside
+                ctx=None,  # nested per-task progress reporting omitted in batch
+            )
         except Exception as e:
             return {
                 "success": False,
@@ -1704,12 +1839,15 @@ async def delegate_batch(
                     total=len(tasks),
                     message=f"{len(results_by_idx)}/{len(tasks)} tasks done",
                 )
-    except asyncio.CancelledError:
-        # Client cancelled the MCP request (user abort / client timeout).
-        # Reap children and PROPAGATE so FastMCP acknowledges the cancel
-        # instead of later emitting a response for an already-cancelled id
-        # (that desync killed the STDIO connection -> -32000 on every
-        # subsequent call until restart).
+    except BaseException:
+        # CancelledError = el cliente abortó la request MCP (user abort / timeout del
+        # cliente). Pero la limpieza NO puede ser exclusiva de ese caso: si
+        # ctx.report_progress lanza cualquier otra cosa, delegate_batch salía dejando las
+        # tasks vivas, llamando al proveedor y reteniendo slots del semáforo que ya nadie
+        # esperaba — los "agentes ocupando slot huérfano". Se recolectan los hijos y se
+        # PROPAGA, para que FastMCP reconozca el fin en vez de emitir después una
+        # respuesta para un id ya cancelado (ese desync tumbaba el STDIO -> -32000 en
+        # cada llamada siguiente hasta reiniciar).
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
@@ -1943,6 +2081,10 @@ async def delegate_to_codex(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,  # own process group -> kill the whole tree on timeout/cancel
+            # Misma allowlist que run_bash. Codex se autentica con ~/.codex/auth.json, así
+            # que le basta HOME + PATH; los CODEX_* propios pasan por prefijo. Que
+            # OPENAI_API_KEY quede fuera es deseado: el plan de ChatGPT es la única ruta.
+            env=_child_env(("CODEX_HOME",)),
         )
     except FileNotFoundError:
         return {
@@ -2124,7 +2266,7 @@ async def delegate_to_provider(
         return {"success": False, "error": why}
     # No global mutation: the backend override travels as explicit per-dispatch params, so
     # concurrent providers/batches can never cross one request's key with another's URL.
-    return await _delegate_one_impl(
+    return await _dispatch_bounded(
         agent_name=agent_name, task=task, workdir=workdir,
         max_turns=max_turns, model=model, max_tokens=max_tokens,
         url=provider_url, key=api_key, mode_tag=mode_tag, ctx=ctx,
