@@ -135,3 +135,57 @@ def test_nudges_por_default_es_uno():
 def test_defaults_de_las_banderas_nuevas():
     assert server.RESEND_REASONING is False
     assert server.KEEP_TOOL_RESULTS == 6
+
+
+# ------------------------------------------------ F4: errores accionables
+
+
+def test_json_truncado_se_marca_en_vez_de_ejecutarse_con_args_vacios():
+    """Antes, un JSON cortado en tránsito se ejecutaba con {} y el agente veía un error
+    incomprensible sobre parámetros faltantes."""
+    openai_msg = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": '{"path": "server.py", "lim'},
+        }],
+    }
+    resp = server._openai_to_anthropic_response({"choices": [{"message": openai_msg}]})
+    tool_uses = [b for b in resp["content"] if b.get("type") == "tool_use"]
+    assert tool_uses, "debe producir un tool_use"
+    assert tool_uses[0].get("_input_truncated") is True
+
+
+def test_json_valido_no_se_marca_como_truncado():
+    openai_msg = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_2",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": '{"path": "server.py"}'},
+        }],
+    }
+    resp = server._openai_to_anthropic_response({"choices": [{"message": openai_msg}]})
+    tool_uses = [b for b in resp["content"] if b.get("type") == "tool_use"]
+    assert "_input_truncated" not in tool_uses[0]
+    assert tool_uses[0]["input"] == {"path": "server.py"}
+
+
+def test_read_file_inexistente_sugiere_vecinos(tmp_path):
+    """El error debe dejar corregir el path en el mismo turno, no al siguiente."""
+    (tmp_path / "server.py").write_text("x = 1\n")
+    (tmp_path / "README.md").write_text("hola\n")
+    import asyncio
+    out = asyncio.run(server._execute_tool(str(tmp_path), "read_file", {"path": "serverr.py"}))
+    assert "no existe" in out
+    assert "server.py" in out, "debe listar los vecinos para que corrija el nombre"
+
+
+def test_read_file_sobre_directorio_lo_dice(tmp_path):
+    (tmp_path / "sub").mkdir()
+    import asyncio
+    out = asyncio.run(server._execute_tool(str(tmp_path), "read_file", {"path": "sub"}))
+    assert "directorio" in out.lower()
