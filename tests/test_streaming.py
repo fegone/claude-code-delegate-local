@@ -28,7 +28,21 @@ def sse(obj):
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    """Corre la corrutina en un loop propio si el ambiente no tiene uno usable.
+
+    En la suite completa, los tests que usan ``asyncio.run`` dejan el loop cerrado, y
+    ``get_event_loop()`` levantaba RuntimeError: los 8 tests de aquí fallaban por ORDEN
+    de ejecución, pasando en cuanto se corría este archivo solo. El fallo era del arnés,
+    no del código bajo prueba.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("loop cerrado")
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
 
 
 def test_anthropic_text_thinking_tooluse():
