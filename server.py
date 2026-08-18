@@ -764,7 +764,10 @@ async def _run_bash(workdir: str, command: str) -> str:
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except (asyncio.TimeoutError, ProcessLookupError):
                 pass
-            return f"ERROR: command timeout ({RUN_BASH_TIMEOUT}s)"
+            return (
+                f"ERROR: command timeout ({RUN_BASH_TIMEOUT}s). Re-ejecuta una version "
+                f"acotada: anade head, -m 1, o restringe el path para que termine antes."
+            )
         except asyncio.CancelledError:
             _kill_process_group(proc)
             raise
@@ -801,8 +804,30 @@ async def _execute_tool(workdir: str, name: str, args: dict[str, Any]) -> str:
                     )
             except OSError:
                 pass
-            with open(fpath, encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+            try:
+                with open(fpath, encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                # F4: antes solo decia "no existe" y el agente gastaba turnos adivinando.
+                # Mostrarle el directorio le deja corregir el path en el mismo turno.
+                parent = os.path.dirname(fpath) or "."
+                try:
+                    vecinos = sorted(os.listdir(parent))[:20]
+                    pista = ", ".join(vecinos) if vecinos else "(directorio vacio)"
+                    return (
+                        f"ERROR: no existe {args['path']!r}. En {parent} hay: {pista}. "
+                        f"Usa run_bash con ls o find si necesitas buscarlo en otro sitio."
+                    )
+                except OSError:
+                    return (
+                        f"ERROR: no existe {args['path']!r} y su directorio padre tampoco. "
+                        f"Usa run_bash con find para ubicarlo."
+                    )
+            except IsADirectoryError:
+                return (
+                    f"ERROR: {args['path']!r} es un directorio, no un archivo. "
+                    f"Usa run_bash con ls para listarlo."
+                )
             total = len(lines)
             try:
                 offset = max(1, int(args.get("offset") or 1))
@@ -975,16 +1000,24 @@ def _openai_to_anthropic_response(openai_resp: dict) -> dict:
     if text:
         content.append({"type": "text", "text": text})
     for tc in msg.get("tool_calls") or []:
+        truncated = False
         try:
             args = json.loads(tc.get("function", {}).get("arguments", "{}"))
         except (json.JSONDecodeError, TypeError):
+            # F4: antes se ejecutaba con args={} en silencio, y el agente veia un error
+            # incomprensible sobre parametros faltantes. Marcarlo permite decirle la verdad:
+            # su llamada llego cortada y tiene que re-emitirla.
             args = {}
-        content.append({
+            truncated = True
+        block = {
             "type": "tool_use",
             "id": tc.get("id", ""),
             "name": tc.get("function", {}).get("name", ""),
             "input": args,
-        })
+        }
+        if truncated:
+            block["_input_truncated"] = True
+        content.append(block)
 
     stop_map = {"stop": "end_turn", "tool_calls": "tool_use", "length": "max_tokens"}
     finish = choice.get("finish_reason", "")
@@ -1652,7 +1685,15 @@ async def _delegate_one_impl(
             name = tu.get("name")
             args = tu.get("input", {})
             tu_id = tu.get("id")
-            if name not in {"read_file", "write_file", "run_bash"} or not isinstance(args, dict):
+            if tu.get("_input_truncated"):
+                # F4: no es que falten parametros — el JSON llego cortado por el backend.
+                malformed += 1
+                result = (
+                    f"ERROR: tu llamada a '{name}' llego con el JSON de argumentos incompleto "
+                    f"(truncado en transito). Re-emitela completa; si los argumentos son muy "
+                    f"largos, acortalos."
+                )
+            elif name not in {"read_file", "write_file", "run_bash"} or not isinstance(args, dict):
                 malformed += 1
                 # F4: decir QUE falta, no solo que fallo. El schema ya esta en AGENT_TOOLS.
                 schema = next(
@@ -1897,7 +1938,7 @@ async def delegate_batch(
         tasks: List of task dicts. Each dict has the same keys as delegate_to_local_agent's
                parameters: {agent_name, task, workdir?, max_turns?, model?, max_tokens?}.
                agent_name and task are required; rest use defaults.
-               Hard cap MAX_BATCH_SIZE (default 2) tasks per call. For more, split into
+               Hard cap MAX_BATCH_SIZE (default 12) tasks per call. For more, split into
                multiple calls or use sequential delegate_to_local_agent calls.
 
     Returns:
