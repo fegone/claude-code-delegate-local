@@ -189,3 +189,71 @@ def test_read_file_sobre_directorio_lo_dice(tmp_path):
     import asyncio
     out = asyncio.run(server._execute_tool(str(tmp_path), "read_file", {"path": "sub"}))
     assert "directorio" in out.lower()
+
+
+# ------------------------------------------- F3 regresión: la clave de dedup no es la API key
+
+
+def test_dedup_no_pisa_la_api_key_del_backend(tmp_path):
+    """El despacho debe sobrevivir a ejecutar una tool: la clave de dedup y la API key
+    del backend son cosas distintas.
+
+    Bug real (2026-08-18, encontrado despachando en vivo tras mergear #28): la clave de
+    dedup se llamaba `key`, el mismo nombre que el parámetro de `_delegate_one_impl` que
+    lleva la API key. Ejecutada UNA tool, el turno siguiente mandaba la tupla
+    ``('read_file', '{...}')`` como header ``x-api-key`` y httpx reventaba con
+    "Header value must be str or bytes, not <class 'tuple'>". O sea: cualquier despacho
+    con tool-calling moría en el turno 2. Los tests existentes no lo vieron porque sus
+    backends falsos cerraban en el primer turno, sin ejecutar herramientas.
+    """
+    import asyncio
+
+    def run_coro(coro):
+        # asyncio.run deja el loop cerrado y rompe los tests async de test_streaming.py
+        try:
+            prev = asyncio.get_event_loop_policy().get_event_loop()
+        except RuntimeError:
+            prev = None
+        try:
+            return asyncio.run(coro)
+        finally:
+            if prev is not None and not prev.is_closed():
+                asyncio.set_event_loop(prev)
+
+    (tmp_path / "f.txt").write_text("contenido\n")
+    orig_load, orig_call = server._load_agent, server._call_backend
+    server._load_agent = lambda name, workdir=None: ({}, "body", "global")
+    keys_vistas = []
+    turnos = {"n": 0}
+
+    def _tool_use(tid):
+        return {
+            "content": [{
+                "type": "tool_use", "id": tid, "name": "read_file",
+                "input": {"path": "f.txt"},
+            }],
+            "stop_reason": "tool_use",
+            "usage": {},
+        }
+
+    async def fake_call(messages, system, model, tools=None, max_tokens=65536, url=None, key=None):
+        keys_vistas.append(key)
+        turnos["n"] += 1
+        if turnos["n"] < 3:  # dos turnos con tool (el 2º idéntico -> dedup)
+            return _tool_use(f"t{turnos['n']}")
+        return {"content": [{"type": "text", "text": "listo"}], "stop_reason": "end_turn", "usage": {}}
+
+    server._call_backend = fake_call
+    try:
+        out = run_coro(server._delegate_one_impl(
+            "coder", "lee f.txt", workdir=str(tmp_path), max_turns=6,
+            model="m1", url="http://A/v1/messages", key="KA",
+        ))
+    finally:
+        server._load_agent, server._call_backend = orig_load, orig_call
+
+    assert len(keys_vistas) >= 3, f"debía llegar al 3er turno, llegó a {len(keys_vistas)}"
+    assert keys_vistas == ["KA"] * len(keys_vistas), f"la API key se corrompió entre turnos: {keys_vistas}"
+    assert all(isinstance(k, str) for k in keys_vistas), "un header no-str revienta httpx"
+    assert out["success"] is True, out.get("error")
+    assert out["deduped_calls"] == 1, "la 2ª llamada idéntica debía deduplicarse"

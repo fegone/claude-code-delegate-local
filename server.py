@@ -1715,8 +1715,12 @@ async def _delegate_one_impl(
             else:
                 # F3: misma llamada, mismos args -> el resultado ya viaja en el contexto.
                 # write_file se excluye a proposito: re-escribir es legitimo.
-                key = (str(name), json.dumps(args, sort_keys=True, default=str))
-                prev_turn = seen_calls.get(key) if name != "write_file" else None
+                # OJO con el nombre: `key` es el parametro de esta funcion con la API
+                # key del backend. Llamar `key` a la clave de dedup la pisaba, y el turno
+                # siguiente mandaba la tupla como x-api-key -> TypeError de httpx y muerte
+                # del despacho apenas se ejecutaba una tool con exito.
+                call_key = (str(name), json.dumps(args, sort_keys=True, default=str))
+                prev_turn = seen_calls.get(call_key) if name != "write_file" else None
                 if prev_turn is not None:
                     deduped_calls += 1
                     result = (
@@ -1725,7 +1729,7 @@ async def _delegate_one_impl(
                         f"cambia offset/limit o el comando."
                     )
                 else:
-                    seen_calls[key] = turn
+                    seen_calls[call_key] = turn
                     result = await _execute_tool(workdir_abs, name, args)
             tool_results.append({
                 "type": "tool_result",
