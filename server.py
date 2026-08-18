@@ -103,11 +103,21 @@ DISPATCH_MIN_SLICE = 30
 # 2 is deliberate: one nudge catches the common "announced but didn't act" case, a second
 # covers a model that acknowledges the nudge in prose before acting. Beyond that it is
 # almost certainly genuinely done and further prodding just burns turns.
-MAX_COMPLETION_NUDGES = int(os.getenv("DELEGATE_MAX_NUDGES", "2"))
+# Bajado a 1 el 2026-08-18: el system prompt ahora dice explicitamente "no anuncies,
+# actua", que es el caso que cazaba el primer nudge. El segundo casi siempre solo
+# repetia la respuesta anterior — medido en auditorias con GLM-5.3 y qwen-3-8-max,
+# ambas gastaron 2 turnos para obtener dos veces la misma declaracion de completitud.
+MAX_COMPLETION_NUDGES = int(os.getenv("DELEGATE_MAX_NUDGES", "1"))
 # Kill switch for the cache_control breakpoints (see _apply_cache_control). On by default:
 # without it, Anthropic-format backends reprocess the entire growing conversation on every
 # turn of an agentic loop.
 DELEGATE_PROMPT_CACHING = os.getenv("DELEGATE_PROMPT_CACHING", "1") not in ("0", "false", "False")
+# F1a: reenviar el reasoning de turnos pasados solo infla la entrada — el provider no lo
+# reaprovecha, solo lo cobra. Off por defecto; ponlo a 1 si un backend llegara a exigirlo.
+RESEND_REASONING = os.getenv("DELEGATE_RESEND_REASONING", "0") in ("1", "true", "True")
+# F1b: cuantos tool_result recientes se mandan integros. Los mas viejos se reemplazan por
+# una linea que dice que existieron. 0 desactiva el desalojo.
+KEEP_TOOL_RESULTS = int(os.getenv("DELEGATE_KEEP_TOOL_RESULTS", "6"))
 NUDGE_TEXT = (
     "You ended your turn without calling a tool. If the task is fully complete AND you "
     "have verified it (tests run and passing, files actually written), say so plainly and "
@@ -919,7 +929,11 @@ def _anthropic_to_openai_request(
             text_joined = "\n".join(t for t in text_parts if t)
             asst["content"] = text_joined or None
             reasoning_joined = "\n".join(r for r in reasoning_parts if r)
-            if reasoning_joined:
+            # F1a: el reasoning de turnos YA COMPLETADOS se cobra como entrada y no se
+            # reaprovecha (DeepSeek lo documenta). En modelos thinking son 5-30K tokens por
+            # turno que vuelven a viajar en cada request posterior. Se puede reactivar con
+            # DELEGATE_RESEND_REASONING=1 si algun provider llegara a exigirlo.
+            if reasoning_joined and RESEND_REASONING:
                 asst["reasoning_content"] = reasoning_joined
             if tool_calls:
                 asst["tool_calls"] = tool_calls
@@ -1176,6 +1190,42 @@ async def _raise_for_status_streamed(response: httpx.Response) -> None:
         response.raise_for_status()
 
 
+def _evict_old_tool_results(messages: list[dict], keep: int) -> int:
+    """Reemplaza el contenido de los tool_result viejos por una linea-resumen.
+
+    F1b: sin esto el historial solo crece — un read_file puede meter ~50.000 chars
+    (~13K tokens) y volver a viajar en CADA turno posterior. Medido en el propio harness:
+    241 requests con 10.5M tokens de entrada contra 247K de salida (ratio 42:1).
+
+    Conserva integros los ``keep`` mensajes de tool mas recientes, que son los que el
+    modelo esta usando para decidir el turno actual. Los anteriores dejan una marca de que
+    existieron, para que el modelo sepa que ya leyo ese archivo y no lo pida otra vez.
+
+    Muta ``messages`` in place y devuelve cuantos bloques desalojo.
+    """
+    if keep <= 0:
+        return 0
+    # indices de los mensajes que llevan tool_result, de mas viejo a mas nuevo
+    idxs = [
+        i for i, m in enumerate(messages)
+        if m.get("role") == "user" and isinstance(m.get("content"), list)
+        and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in m["content"])
+    ]
+    evicted = 0
+    for i in idxs[:-keep] if len(idxs) > keep else []:
+        for block in messages[i]["content"]:
+            if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                continue
+            body = block.get("content")
+            if not isinstance(body, str) or body.startswith("[desalojado"):
+                continue
+            block["content"] = (
+                f"[desalojado para ahorrar contexto: {len(body)} chars de un turno anterior. "
+                f"Si necesitas ese contenido otra vez, vuelve a pedirlo]"
+            )
+            evicted += 1
+    return evicted
+
 def _supports_prompt_caching(model: str) -> bool:
     """True for Anthropic-format backends known to honour ``cache_control``.
 
@@ -1384,7 +1434,19 @@ async def _delegate_one_impl(
         f"You are running as the '{agent_name}' agent.\n"
         f"Workdir: {workdir_abs} (use relative paths or absolute).\n"
         f"You have 3 tools: read_file, write_file, run_bash. Use them iteratively.\n"
-        f"When the task is complete, respond with a final text message WITHOUT tool_use.\n\n"
+        f"When the task is complete, respond with a final text message WITHOUT tool_use.\n"
+        # F6: sin esto el agente no sabe cuanto presupuesto le queda y lo gasta por inercia.
+        f"Turn budget: {max_turns} tool-calling turns (hard stop). Plan to finish with margin.\n"
+        # F5: nada empujaba a la brevedad, y el harness da un presupuesto enorme por turno.
+        # Despachos reales generaron 20.000-38.000 tokens de salida sin que la tarea lo pidiera.
+        f"Keep every intermediate message short (1-3 lines). Put large artifacts in FILES via "
+        f"write_file, never paste long content into a response. Your final answer should be a "
+        f"compact summary (under ~200 words) pointing at what you wrote or verified, unless the "
+        f"task explicitly asks for inline long-form text.\n"
+        # Del hallazgo del auditor GLM: el nudge existe porque los modelos anuncian en vez de
+        # actuar. Decirlo aqui evita pagar el turno extra del nudge.
+        f"Do not announce what you are about to do: just call the tool. Announcing without "
+        f"acting costs an extra round-trip.\n\n"
         f"{CONTEXT_SCOPE_HINT}\n"
         f"--- AGENT DEFINITION ---\n{body}"
     )
@@ -1401,10 +1463,17 @@ async def _delegate_one_impl(
     stop_reason = "unknown"
     nudges = 0
     resumed_after_nudge = False
+    # F3: re-lecturas y re-greps identicos pagan I/O otra vez Y re-arrastran su resultado
+    # (hasta ~13K tokens) por el resto del despacho. Clave -> turno en que se vio.
+    seen_calls: dict[tuple[str, str], int] = {}
+    deduped_calls = 0
     t0 = time.time()
     deadline = t0 + DISPATCH_TIMEOUT
 
+    evicted_blocks = 0
     while turn < max_turns:
+        # F1b: podar antes de armar el request, no despues — lo que se manda es lo que se cobra.
+        evicted_blocks += _evict_old_tool_results(messages, KEEP_TOOL_RESULTS)
         if time.time() >= deadline:
             return {
                 "success": False,
@@ -1553,6 +1622,18 @@ async def _delegate_one_impl(
             # needed prodding.
             resumed_after_nudge = True
 
+        # F2: en el ultimo turno permitido el modelo ya no vera ningun tool_result, asi que
+        # ejecutar sus llamadas es trabajo tirado: I/O + hasta K x RUN_BASH_TIMEOUT de reloj
+        # por despacho. Salimos con un diagnostico accionable en vez de gastarlo.
+        if turn >= max_turns:
+            wanted = ", ".join(sorted({str(tu.get("name")) for tu in tool_uses}))
+            stop_reason = "turn_limit_pending_tools"
+            final_text = (
+                f"hit turn limit still wanting to run: {wanted} "
+                f"(sube max_turns o acota la tarea; no se ejecutaron para no gastar tiempo)"
+            )
+            break
+
         messages.append({"role": "assistant", "content": content})
         tool_results = []
         for tu in tool_uses:
@@ -1573,9 +1654,38 @@ async def _delegate_one_impl(
             tu_id = tu.get("id")
             if name not in {"read_file", "write_file", "run_bash"} or not isinstance(args, dict):
                 malformed += 1
-                result = f"ERROR: tool inválida o args mal formados ({name=})"
+                # F4: decir QUE falta, no solo que fallo. El schema ya esta en AGENT_TOOLS.
+                schema = next(
+                    (t.get("input_schema", {}) for t in AGENT_TOOLS if t.get("name") == name),
+                    None,
+                )
+                if schema is not None and isinstance(args, dict):
+                    required = ", ".join(schema.get("required", [])) or "(ninguno)"
+                    got = ", ".join(sorted(args.keys())) or "(vacio)"
+                    result = (
+                        f"ERROR: args mal formados para '{name}'. "
+                        f"Recibi: {got}. Requeridos: {required}. Re-emite la llamada completa."
+                    )
+                else:
+                    valid = "read_file, write_file, run_bash"
+                    result = (
+                        f"ERROR: tool invalida ({name!r}). Las disponibles son: {valid}."
+                    )
             else:
-                result = await _execute_tool(workdir_abs, name, args)
+                # F3: misma llamada, mismos args -> el resultado ya viaja en el contexto.
+                # write_file se excluye a proposito: re-escribir es legitimo.
+                key = (str(name), json.dumps(args, sort_keys=True, default=str))
+                prev_turn = seen_calls.get(key) if name != "write_file" else None
+                if prev_turn is not None:
+                    deduped_calls += 1
+                    result = (
+                        f"NOTA: llamada identica a la del turno {prev_turn}; su resultado ya "
+                        f"esta en tu contexto y no se re-ejecuto. Si necesitas algo distinto, "
+                        f"cambia offset/limit o el comando."
+                    )
+                else:
+                    seen_calls[key] = turn
+                    result = await _execute_tool(workdir_abs, name, args)
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": tu_id,
@@ -1609,6 +1719,8 @@ async def _delegate_one_impl(
         "max_turns": max_turns,
         "tool_calls": tool_calls,
         "malformed_calls": malformed,
+        "deduped_calls": deduped_calls,
+        "evicted_tool_results": evicted_blocks,
         # How many times the agent stopped without calling a tool and had to be prodded,
         # and whether prodding actually made it resume work. A run with
         # resumed_after_nudge=True would have been reported as a clean success by the old
@@ -2331,7 +2443,7 @@ async def delegate_to_provider(
     agent_name: str,
     task: str,
     workdir: str = ".",
-    max_turns: int = DEFAULT_MAX_TURNS,
+    max_turns: int = 0,  # F8: 0 = AUTO (resuelto por modelo), igual que delegate_to_local_agent
     max_tokens: int | None = None,
     mode_tag: str = "MODE:LOCAL",
     ctx: Context | None = None,
