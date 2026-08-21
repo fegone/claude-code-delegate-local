@@ -1509,6 +1509,15 @@ async def _delegate_one_impl(
     # (hasta ~13K tokens) por el resto del despacho. Clave -> turno en que se vio.
     seen_calls: dict[tuple[str, str], int] = {}
     deduped_calls = 0
+    # Verdad de campo sobre los comandos: el runtime los EJECUTA, asi que conoce su codigo
+    # de salida real. Hasta ahora esa informacion solo se le enseñaba al modelo y se perdia.
+    # Es la unica defensa posible contra el fallo ya medido en julio con Ornith y repetido
+    # el 2026-08-20 con qwen: el agente se auto-reporta exito con comandos que fallaron, o
+    # dice que no pudo correr algo que si corrio limpio. Reportarlo NO interpreta el texto
+    # del modelo: son hechos del subproceso.
+    bash_calls = 0
+    bash_failures = 0
+    last_bash_exit: int | None = None
     t0 = time.time()
     deadline = t0 + DISPATCH_TIMEOUT
 
@@ -1740,6 +1749,17 @@ async def _delegate_one_impl(
                 else:
                     seen_calls[call_key] = turn
                     result = await _execute_tool(workdir_abs, name, args)
+                    if name == "run_bash":
+                        # _execute_tool devuelve "exit_code: N\n--- stdout ---..."
+                        bash_calls += 1
+                        first = result.split("\n", 1)[0]
+                        if first.startswith("exit_code: "):
+                            try:
+                                last_bash_exit = int(first.split(": ", 1)[1].strip())
+                            except ValueError:
+                                last_bash_exit = None
+                            if last_bash_exit not in (0, None):
+                                bash_failures += 1
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": tu_id,
@@ -1819,6 +1839,14 @@ async def _delegate_one_impl(
         "stop_reason": stop_reason,
         "hit_turn_limit": hit_turn_limit,
         "incomplete": incomplete,
+        # Hechos del subproceso, NO afirmaciones del modelo. Si el agente dice "tests
+        # verdes" y last_bash_exit no es 0, esta reportando algo que no ocurrio.
+        # OJO: un codigo != 0 no siempre es un fallo (grep sin coincidencias sale 1),
+        # por eso se exponen los hechos y no se marca incomplete automaticamente: una
+        # bandera con falsos positivos deja de mirarse.
+        "bash_calls": bash_calls,
+        "bash_failures": bash_failures,
+        "last_bash_exit": last_bash_exit,
     }
 
 
