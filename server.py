@@ -146,6 +146,15 @@ HIGH_REASONING_PREFIXES = ("deepseek-v4-flash", "deepseek-v4-pro")
 # 2026-07-08: GLM/Z.ai (Anthropic endpoint) returns error 1210 "range [1,131072]"
 # for max_tokens > 131072; DeepSeek V4 accepted 200000 without error → no cap here.
 # Keyed by alias prefix; models not listed are treated as unbounded/unknown.
+# F6b: avisar cuando quedan pocos turnos, no solo al principio.
+# El presupuesto se anuncia UNA vez en el system prompt ("Turn budget: N"), pero el agente
+# no lleva la cuenta: quema turnos en suites lentas (una de 2 min = un turno entero) y se
+# entera de que se quedo sin margen cuando ya no puede escribir nada. Medido en Peptides
+# 2026-08-20: 7 despachos, la mayoria muertos con `turn_limit_pending_tools`; el que siguio
+# la regla "commitea antes de verificar" dejo el trabajo salvado y el que la ignoro perdio
+# 20 minutos sin una linea. Esto pone esa regla en el mecanismo en vez de en el prompt.
+TURN_WARN_REMAINING = 3
+
 PROVIDER_MAX_TOKENS_CAP = {
     "glm-": 131_072,  # GLM-5.2 via Z.ai Anthropic-native endpoint
     # Alibaba Token Plan (qwen3.8-max y familia). Verificado live 2026-08-09:
@@ -1736,6 +1745,29 @@ async def _delegate_one_impl(
                 "tool_use_id": tu_id,
                 "content": result,
             })
+        # El aviso va DENTRO del ultimo tool_result, no como bloque de texto aparte: un
+        # content mixto (tool_result + text) sobrevive en la ruta Anthropic nativa pero
+        # puede perderse al traducir a formato OpenAI, y este aviso es justo el que no
+        # puede perderse.
+        turns_left = max_turns - turn
+        if tool_results and turns_left <= TURN_WARN_REMAINING:
+            if turns_left <= 1:
+                aviso = (
+                    "\n\n[ULTIMO TURNO] No se ejecutara ninguna herramienta mas: las que "
+                    "pidas ahora se descartan sin correr. Si tienes trabajo sin guardar, "
+                    "ya no puedes guardarlo. Responde AHORA con tu resultado final y di "
+                    "explicitamente que quedo a medias."
+                )
+            else:
+                aviso = (
+                    f"\n\n[QUEDAN {turns_left} TURNOS] Guarda tu trabajo AHORA: haz commit "
+                    f"de lo que llevas antes de seguir verificando. Una suite lenta consume "
+                    f"un turno entero, y al agotarlos se pierde todo lo que no este "
+                    f"commiteado."
+                )
+            last = tool_results[-1]
+            last["content"] = f"{last.get('content', '')}{aviso}"
+
         messages.append({"role": "user", "content": tool_results})
 
     elapsed = time.time() - t0
