@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (2026-08-21 — the agent could not see its turn budget running out)
+
+The turn budget was announced **once**, in the system prompt (`Turn budget: N tool-calling
+turns`), and never again. An agent does not keep count: it burns turns on slow suites — one
+2-minute test run costs a whole turn — and finds out it is out of room when it can no longer
+write anything. The result is `turn_limit_pending_tools` with real, uncommitted work lost.
+
+Measured in a sibling session against a 3,085-test project, 10 dispatches across GLM and
+qwen at `max_turns` 30–40: **6 of 10 died on the turn limit**. The dispatch that followed a
+"commit before verifying" instruction left its work on the branch; the one that interpreted
+it loosely **lost 20 minutes without a single line**.
+
+- **A countdown now rides inside the last `tool_result`.** At 3 turns left it says to stop
+  and names the command (`git add -A && git commit -m "wip: …"`); on the final turn it says
+  no further tools will run and asks the agent to declare what is unfinished. Below the
+  threshold it stays silent, so it does not add noise to every result.
+  The warning goes **inside the `tool_result` and not as a separate text block**: mixed
+  content survives the Anthropic-native path but can be dropped when translating to OpenAI
+  format, and this is precisely the message that cannot be lost.
+  Re-measured on the same real tasks: **`turn_limit_pending_tools` 6/10 → 0/2**, with one
+  dispatch reaching 40/40 turns and still closing `end_turn`, stating which step it left out.
+  ⭐ The gain came from **warning at all**, not from the wording — the jump was measured with
+  the first, vaguer phrasing.
+- **The result now carries the commands' real exit codes**: `bash_calls`, `bash_failures`,
+  `last_bash_exit`. The runtime already read `proc.returncode` to show the model and then
+  discarded it, so a caller only had the model's word. This is the counterweight to a failure
+  measured twice — July with Ornith (self-reported success over red tests) and 2026-08-20 with
+  qwen (claimed it could not run `tsc`; a human ran it clean, 3,092 tests green). If a
+  dispatch says "tests green" and `last_bash_exit` is not 0, it is reporting something that
+  did not happen.
+  `incomplete` is **deliberately not** set automatically: a non-zero exit is not always a
+  failure (`grep` with no matches exits 1), and a flag with false positives stops being read.
+
+⚠️ **The MCP loads this code once, not per dispatch.** A sibling session ran three rounds on
+the old version after the merge without noticing. Restart Claude Code for any change here to
+take effect; a cheap check is to ask an agent to quote the warning verbatim and look for
+`git add -A`.
+
+
 ### Fixed (2026-08-08, second pass — why strong models looked weak)
 
 Two bugs that made capable models appear to stall or produce sloppy work on agentic coding
