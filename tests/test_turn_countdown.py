@@ -72,8 +72,11 @@ def test_avisa_antes_de_quedarse_sin_turnos(tmp_path):
     vistos, _ = _avisos_vistos(tmp_path, max_turns=6)
     con_aviso = [v for v in vistos if "QUEDAN" in v]
     assert con_aviso, f"nunca se le avisó de la cuenta regresiva. tool_results: {vistos}"
-    assert any("commit" in v.lower() for v in con_aviso), \
-        "el aviso debe decirle que commitee, que es la accion que salva el trabajo"
+    # No basta con insinuar "guarda tu trabajo": medido en Peptides, el aviso rinde en
+    # proporcion a lo concreto que sea el comando. El que lo interpreto a su manera
+    # perdio 20 minutos; los que ejecutaron el comando dejaron el trabajo en la rama.
+    assert any("git add -A && git commit" in v for v in con_aviso), \
+        "el aviso tiene que NOMBRAR el comando, no solo pedir que se guarde el trabajo"
 
 
 def test_el_ultimo_turno_se_anuncia_como_tal(tmp_path):

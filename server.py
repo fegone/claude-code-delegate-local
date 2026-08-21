@@ -1759,11 +1759,15 @@ async def _delegate_one_impl(
                     "explicitamente que quedo a medias."
                 )
             else:
+                # Medido en Peptides: el aviso rinde en proporcion a lo concreto que sea
+                # el comando. El despacho que siguio "commitea antes de verificar" dejo el
+                # trabajo en la rama; el que la interpreto a su manera perdio 20 minutos.
+                # Por eso se nombra el comando, no la intencion.
                 aviso = (
-                    f"\n\n[QUEDAN {turns_left} TURNOS] Guarda tu trabajo AHORA: haz commit "
-                    f"de lo que llevas antes de seguir verificando. Una suite lenta consume "
-                    f"un turno entero, y al agotarlos se pierde todo lo que no este "
-                    f"commiteado."
+                    f"\n\n[QUEDAN {turns_left} TURNOS] PARA. No corras otra suite todavia.\n"
+                    f"Ejecuta AHORA: git add -A && git commit -m \"wip: <lo que llevas>\"\n"
+                    f"Una suite lenta consume un turno entero. Todo lo que no este commiteado "
+                    f"cuando se acaben los turnos se pierde entero."
                 )
             last = tool_results[-1]
             last["content"] = f"{last.get('content', '')}{aviso}"
