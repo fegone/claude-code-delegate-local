@@ -178,8 +178,26 @@ PROVIDER_MAX_TOKENS_CAP = {
 # sin que ninguno le robe slots al otro ni al backend local.
 # Override por proveedor: DELEGATE_CONCURRENCY_GLM, _DEEPSEEK, _LOCAL, _CODEX, ...
 PROVIDER_CONCURRENCY = {
+    # Per MODEL, not per provider (Felix, 2026-08-27). Longest prefix wins,
+    # so these specific entries take precedence over the family ones below and
+    # each model gets its own pool of six, shared across every open session.
+    #
+    # Two DeepSeek models at six each is twelve concurrent against DeepSeek.
+    # z.ai measured clean at 6 and rate-limited at 9 (2026-08-18); there is no
+    # equivalent measurement for DeepSeek, so this is the first number to
+    # revisit if 429s start appearing.
+    "deepseek-v4-flash": 6,
+    "deepseek-v4-pro": 6,
+    "qwen-3-8-max": 6,
+    "glm-coding-plan": 6,
+    # ornith and local- are the SAME GPU in two separate buckets, so this is
+    # eight concurrent against oMLX. Measured 2026-08-27, clinic closed:
+    # aggregate throughput PEAKS at 6 concurrent (121 tok/s) and DROPS at 8
+    # (112 tok/s), while each individual request falls from 56 to 19 tok/s.
+    # Nicole answers patients on this same lane and already drops to 20 tok/s
+    # whenever Edgar runs OCR. This trades patient latency for agent throughput.
+    "ornith": 6,
     "local-": 2,
-    "ornith": 2,
     "glm-": 6,
     "deepseek-": 6,
     "minimax": 4,
@@ -195,6 +213,70 @@ PROVIDER_CONCURRENCY = {
     "qwen-": 6,
 }
 DEFAULT_PROVIDER_CONCURRENCY = int(os.getenv("DELEGATE_CONCURRENCY_DEFAULT", "4"))
+
+# ── Failover when a model's pool is full (Felix, 2026-08-27) ────────────────────
+#
+# Six slots per model are shared across every open session. When all six are
+# taken, a dispatch used to sit in the queue and then fail. Instead it now walks
+# a chain of equivalent models.
+#
+# 🔴 LOCAL MODELS AND CODEX NEVER FAIL OVER, by explicit instruction:
+#   * local-/ornith run on the Mac Studio and see PHI. A silent hop to a cloud
+#     provider would take patient data off-premise and nobody would notice — the
+#     whole point of running them locally. Enforced in code below, not in docs.
+#   * codex/gpt- bill against the ChatGPT Plus plan, not an API key. Falling
+#     over from it is meaningless; falling over TO it would burn plan quota.
+#
+# ⚠️ "The same level of thinking" is a NOMINAL mapping, not a measured one.
+# Measured on these very models: GLM's -max does not think more than -think;
+# Qwen 3.8's reasoning_effort does not scale at all (low 1,910 tk vs high 1,220);
+# DeepSeek's medium/high/max are indistinguishable (7x variance inside one
+# level). The chain preserves the NAME of the tier because that is the best
+# available, not because the models were shown to reason alike.
+#
+# ⚠️ GLM and Qwen bill $0 (flat plans); DeepSeek bills per token. DeepSeek sits
+# LAST in every chain so a busy afternoon does not quietly turn into an invoice.
+NO_FAILOVER_PREFIXES = ("local-", "ornith", "codex", "gpt-")
+
+FAILOVER_CHAINS = {
+    "glm-coding-plan":       ["qwen-3-8-max", "deepseek-v4-flash", "deepseek-v4-pro"],
+    "glm-coding-plan-think": ["qwen-3-8-max", "deepseek-v4-flash", "deepseek-v4-pro"],
+    "glm-coding-plan-max":   ["qwen-3-8-max", "deepseek-v4-flash-max", "deepseek-v4-pro-max"],
+    "qwen-3-8-max":          ["glm-coding-plan-think", "deepseek-v4-flash", "deepseek-v4-pro"],
+    "qwen-3-8-max-think":    ["glm-coding-plan-think", "deepseek-v4-flash", "deepseek-v4-pro"],
+    "deepseek-v4-flash":     ["deepseek-v4-pro", "glm-coding-plan-think", "qwen-3-8-max"],
+    "deepseek-v4-flash-max": ["deepseek-v4-pro-max", "glm-coding-plan-max", "qwen-3-8-max"],
+    "deepseek-v4-pro":       ["glm-coding-plan-think", "qwen-3-8-max", "deepseek-v4-flash"],
+    "deepseek-v4-pro-max":   ["glm-coding-plan-max", "qwen-3-8-max", "deepseek-v4-flash-max"],
+    "minimax-m3":            ["glm-coding-plan-think", "qwen-3-8-max", "deepseek-v4-flash"],
+    "grok-4-5":              ["glm-coding-plan-think", "qwen-3-8-max", "deepseek-v4-flash"],
+}
+
+# Seconds a FALLBACK waits for its own slot. Short on purpose: the point is to
+# find a model with room now, not to queue four times over.
+FAILOVER_GRACE = float(os.getenv("DELEGATE_FAILOVER_GRACE", "10"))
+
+
+def _is_no_failover(model: str) -> bool:
+    """Local models and Codex are pinned to themselves, in both directions."""
+    if not isinstance(model, str):
+        return True
+    m = model.lower()
+    return any(m.startswith(p) for p in NO_FAILOVER_PREFIXES)
+
+
+def _failover_candidates(model: str) -> list[str]:
+    """Models to try after `model`, once its pool is full.
+
+    Returns [] for anything local or Codex. Also filters the chain itself, so a
+    chain edited later can never route a local model outward or a remote model
+    into the GPU: the guard holds even if the table above is wrong.
+    """
+    if _is_no_failover(model):
+        return []
+    chain = FAILOVER_CHAINS.get((model or "").lower(), [])
+    return [m for m in chain if not _is_no_failover(m)]
+
 
 _provider_semaphores: dict[str, asyncio.Semaphore] = {}
 _provider_sem_lock: asyncio.Lock | None = None
@@ -1894,13 +1976,42 @@ async def _dispatch_bounded(
                     mode_tag=mode_tag,
                 )
         except SlotWaitTimeout as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "timeout_scope": "provider_queue",
-                "agent_name": agent_name,
-                "model": model,
-            }
+            queue_error = str(e)
+
+    # Pool full. Walk the chain — outside the first model's semaphore, so waiting
+    # here does not hold a slot the queue behind us could be using.
+    tried = [eff_model]
+    for alt in _failover_candidates(eff_model):
+        alt_sem, alt_prov = await _get_provider_semaphore(alt)
+        async with alt_sem:
+            try:
+                async with _cross_process_slot(
+                        alt_prov, _provider_concurrency(alt_prov), FAILOVER_GRACE):
+                    out = await _delegate_one_impl(
+                        agent_name=agent_name, task=task, workdir=workdir,
+                        max_turns=max_turns, model=alt, max_tokens=max_tokens,
+                        ctx=ctx, url=url, key=key, mode_tag=mode_tag,
+                    )
+                    # Say so. A result that silently came from another model is
+                    # how you end up comparing two models and measuring one.
+                    if isinstance(out, dict):
+                        out["failed_over_from"] = eff_model
+                        out["model_used"] = alt
+                    return out
+            except SlotWaitTimeout:
+                tried.append(alt)
+                continue
+
+    return {
+        "success": False,
+        "error": queue_error + (
+            " — failover probado sin hueco en: " + ", ".join(tried[1:])
+            if len(tried) > 1 else ""),
+        "timeout_scope": "provider_queue",
+        "agent_name": agent_name,
+        "model": model,
+        "failover_tried": tried[1:],
+    }
 
 
 # ────────────────────────────────────────────────────────────────────────────────
