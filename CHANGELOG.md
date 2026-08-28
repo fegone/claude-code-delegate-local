@@ -6,6 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (2026-08-27 — one pool per provider became one pool per model, and a full pool now hops)
+
+Six slots were held **per provider**, so `deepseek-v4-flash` and `deepseek-v4-pro` shared a
+single pool of six, as did every GLM variant. A dispatch that found the pool full waited out
+the grace period and then failed — which, from outside, is indistinguishable from a hung
+agent. Felix had been reporting exactly that: models "getting stuck".
+
+- **A pool of six per MODEL.** `_provider_key` already picks the longest matching prefix, so
+  adding specific entries (`deepseek-v4-flash`, `deepseek-v4-pro`, `qwen-3-8-max`,
+  `glm-coding-plan`, `ornith`) makes each one carry its own six while the family entries stay
+  as the fallback. Variants of one model still share a pool — `glm-coding-plan`, `-think` and
+  `-max` sit behind the same flat plan, so they should queue together.
+  The pools remain **global across every open session**: six real files under
+  `~/.cache/claude-delegate-local/slots/<bucket>/`, each needing an exclusive `flock`.
+
+- **Failover when a pool is full.** Instead of returning `provider_queue`, the dispatch walks
+  a chain of equivalent models: GLM → Qwen 3.8 → DeepSeek Flash → Pro, and Flash **straight to
+  Pro** — Flash already bills per token, so hopping to Pro does not turn a flat plan into an
+  invoice. For the same reason DeepSeek sits last in every other chain: GLM and Qwen bill $0.
+  Fallbacks wait only `DELEGATE_FAILOVER_GRACE` (10s) for their own slot, and wait **outside**
+  the first model's semaphore so queuing does not hold a slot others could use.
+
+- **A result that failed over says so**, in `failed_over_from` and `model_used`. A result that
+  silently came from another model is how you end up comparing two models and measuring one.
+
+### Security (2026-08-27 — local models and Codex are pinned to themselves)
+
+`NO_FAILOVER_PREFIXES = ("local-", "ornith", "codex", "gpt-")`.
+
+`local-`/`ornith` run on hardware that sees PHI. A silent hop to a cloud provider would take
+patient data off-premise and **nobody would notice** — the failure mode of an automatic
+fallback is precisely that it does not announce itself. `codex`/`gpt-` bill against a
+ChatGPT Plus plan: failing over from it is meaningless, and failing over *to* it would burn
+plan quota.
+
+The guard filters **the chain itself**, not just the origin, so a table edited later still
+cannot route a local model outward. Tested by deliberately putting `ornith` in GLM's chain
+and watching it get dropped — the protection does not depend on the table being right.
+
+### Fixed (2026-08-27 — the no-failover path crashed instead of returning its error)
+
+Testing the case that must *not* hop (a full `ornith` pool) surfaced an `UnboundLocalError`:
+Python deletes the `except ... as X` target when the block ends, so the variable was gone by
+the `return` below. It would have fired exactly when the local GPU was saturated — the moment
+the delegate most needs to report cleanly.
+
+Caught by taking every `flock` of a bucket for real and exercising all three paths: GLM full
+hops to Qwen, GLM and Qwen full reaches DeepSeek, and `ornith` full fails without leaving the
+machine.
+
+
 ### Added (2026-08-21 — the agent could not see its turn budget running out)
 
 The turn budget was announced **once**, in the system prompt (`Turn budget: N tool-calling

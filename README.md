@@ -18,6 +18,7 @@ Built for users who want to keep their main Claude Code session on Anthropic (Ma
 - [Features](#features)
 - [Quick install](#quick-install)
 - [Configuration](#configuration)
+- [Concurrency pools and failover](#concurrency-pools-and-failover)
 - [Tools exposed](#tools-exposed)
 - [3-tier agent lookup](#3-tier-agent-lookup)
 - [Dual-format backend routing](#dual-format-backend-routing)
@@ -81,6 +82,64 @@ All env vars are optional; defaults assume a LiteLLM proxy on `localhost:4000`.
 | `DELEGATE_LOCAL_AGENTS_DIR` | `~/.claude/agents` | Where to look for global agent definitions. |
 
 See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for full details and example setups with LiteLLM, llama.cpp, Ollama, DeepSeek direct, and AWS Bedrock.
+
+## Concurrency pools and failover
+
+Each **model** gets a pool of six concurrent dispatches, shared across every open Claude Code
+session — not per session, and not per provider. The pools are real files under
+`~/.cache/claude-delegate-local/slots/<bucket>/`, each requiring an exclusive `flock`; the
+kernel releases the lock if a process dies, so a crashed session leaves no phantom slots.
+
+The bucket is chosen by **longest matching prefix**, so specific entries win over family ones:
+
+| Bucket | Slots | Covers |
+|---|---|---|
+| `deepseek-v4-flash` | 6 | `-flash`, `-flash-max` |
+| `deepseek-v4-pro` | 6 | `-pro`, `-pro-max` |
+| `qwen-3-8-max` | 6 | `-max`, `-max-think` |
+| `glm-coding-plan` | 6 | plain, `-think`, `-max` |
+| `ornith` | 6 | `ornith*` |
+| `local-` | 2 | everything else local |
+
+Variants of one model share a pool on purpose: they sit behind the same flat plan.
+
+Override any of them with `DELEGATE_CONCURRENCY_<BUCKET>` (e.g.
+`DELEGATE_CONCURRENCY_GLM_CODING_PLAN=4`).
+
+### Failover
+
+When a pool is full, the dispatch walks a chain of equivalent models rather than failing:
+
+```
+glm-coding-plan-think → qwen-3-8-max → deepseek-v4-flash → deepseek-v4-pro
+deepseek-v4-flash     → deepseek-v4-pro → glm-coding-plan-think → qwen-3-8-max
+```
+
+Flash goes straight to Pro because Flash already bills per token — hopping to Pro does not
+turn a flat plan into an invoice. For the same reason DeepSeek sits **last** in the other
+chains: GLM and Qwen bill $0 against their plans, so a busy afternoon should not quietly
+become a bill.
+
+Fallbacks wait only `DELEGATE_FAILOVER_GRACE` (default 10s) for their own slot — the point is
+to find room now, not to queue four times over. A result that failed over carries
+`failed_over_from` and `model_used`.
+
+> ⚠️ **The chain preserves the NAME of a thinking tier, not measured equivalence.** GLM's
+> `-max` does not reason more than `-think`; Qwen 3.8's `reasoning_effort` does not scale;
+> DeepSeek's `medium`/`high`/`max` are indistinguishable. The mapping is the best available,
+> not a claim that the models reason alike.
+
+### Local models and Codex never fail over
+
+`local-`, `ornith`, `codex` and `gpt-` are pinned to themselves, in both directions.
+
+Local models run on hardware that may see regulated data; a silent hop to a cloud provider
+would move that data off-premise and **nobody would notice**, because the failure mode of an
+automatic fallback is that it does not announce itself. Codex bills against a ChatGPT
+subscription, where failing over means nothing and failing over *to* it burns plan quota.
+
+The guard filters the chain itself, not just the origin, so editing `FAILOVER_CHAINS` later
+cannot route a local model outward.
 
 ## Tools exposed
 
