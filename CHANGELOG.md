@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (2026-08-28 — every GLM alias shares one pool of six)
+
+The previous change gave `glm-coding-plan` its own pool of six. When `glm-5-3-flash` was
+registered the next day it did not match that entry, so it fell through to the `glm-` family
+entry and got a **second** pool of six: twelve concurrent against z.ai, which measured clean
+at 6 and rate-limited at 9 (2026-08-18). Both aliases also bill the same flat coding plan, so
+two pools only meant spending one quota twice as fast.
+
+- **The `glm-coding-plan` entry is gone, on purpose.** Every `glm-*` alias now resolves to the
+  `glm-` family pool, so `glm-coding-plan`, `-think`, `-max` and `glm-5-3-flash` queue against
+  the same six slots. `tests/test_provider_pools.py` fails if that entry comes back.
+- **`glm-5-3-flash` gained a failover chain** (Qwen 3.8 → DeepSeek Flash → Pro). No GLM appears
+  in it: a hop inside the shared pool would queue for the slot that is already full.
+- **`glm-5-3-flash` gained an explicit token budget** (65,536). Thinking cannot be disabled on
+  this model — z.ai only accepts `thinking.type: "enabled"` — so on the bare default it can
+  spend its whole allowance reasoning and return an empty response with no error.
+
+Note for operators: this is a delegate-side pool, not a LiteLLM one. A new alias in
+`config.yaml` is only half the job — the proxy key carries its own explicit model allowlist,
+and anything missing from it returns `key_model_access_denied` even though the model loaded.
+
+
 ### Changed (2026-08-27 — one pool per provider became one pool per model, and a full pool now hops)
 
 Six slots were held **per provider**, so `deepseek-v4-flash` and `deepseek-v4-pro` shared a
