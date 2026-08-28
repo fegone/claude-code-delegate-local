@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed (2026-08-28 — el backoff ahora sobrevive a un reinicio del proxy)
+
+Reiniciar LiteLLM (`launchctl kickstart -k`) lo deja **rechazando conexiones nuevas 55-65 s**
+— medido en el proxy de Neola: 65,3 s en un reinicio y 55,4 s en otro, contando el hueco entre
+la última petición servida y la primera de después. uvicorn hace apagado ordenado
+(`Waiting for connections to close`), así que deja terminar lo que ya iba a mitad de stream y
+rechaza **solo lo nuevo**.
+
+La escalera transitoria sumaba 1+2+4 = 7 s de base, con equal-jitter **hacia abajo**: en la
+práctica se rendía entre los 3,5 y los 7 s. Un minuto caído contra siete segundos de
+paciencia. Tres despachos de 10-15 turnos murieron por esto en una sola noche, con
+`ConnectError: All connection attempts failed`, y el turno en que morían parecía aleatorio
+porque marcaba el instante del reinicio, no un punto de ruptura del modelo. Se le echó la
+culpa al modelo que tocara estar corriendo.
+
+- **Escalera propia para los fallos de conexión** (`httpx.ConnectError` / `ConnectTimeout`):
+  8 intentos con 1+2+4+8+16+32+32 = **95 s** de espera base. No poder abrir el socket casi
+  siempre significa "el backend está levantando", no "el backend está roto", y reintentarlo no
+  gasta tokens ni pierde trabajo — mientras que rendirse tira el despacho entero.
+- **El jitter de ese caso va hacia ARRIBA**, nunca por debajo de la base: volver antes de
+  tiempo es justo el fallo que se quiere evitar.
+- **El resto de transitorios no cambian.** Un 429, un 5xx o un corte a mitad de stream siguen
+  con la escalera corta; un test lo fija para que nadie los alargue sin querer.
+- **La rama transitoria ahora respeta el deadline del despacho** antes de dormir, como ya hacía
+  la de errores HTTP. Con esperas de 32 s eso pasó de detalle a necesario.
+
+`tests/test_connect_backoff.py` fija las dos decisiones. El primer intento fue de 63 s y **el
+test lo rechazó**: quedaba 2,3 s por debajo del peor reinicio medido.
+
+
 ### Changed (2026-08-28 — every GLM alias shares one pool of six)
 
 The previous change gave `glm-coding-plan` its own pool of six. When `glm-5-3-flash` was

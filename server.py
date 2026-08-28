@@ -466,6 +466,26 @@ BACKEND_MAX_RETRIES = 3
 # 2026-08-17: z.ai devolvió 529 siete veces seguidas bajo concurrencia 3.
 RETRYABLE_STATUS = {429, 500, 502, 503, 504, 529}
 RETRY_BACKOFF = (1.0, 2.0, 4.0, 8.0)
+# "No pude ni abrir el socket" casi siempre significa "el backend esta levantando", no
+# "el backend esta roto". Medido en el proxy LiteLLM de Neola el 2026-08-28: un
+# `launchctl kickstart -k` lo deja rechazando conexiones nuevas 65,3 s una vez y 55,4 s
+# otra (hueco entre la ultima peticion servida y la primera de despues). uvicorn hace
+# apagado ordenado -- "Waiting for connections to close" -- asi que deja terminar lo que
+# ya iba a mitad de stream y rechaza SOLO lo nuevo; por eso se lo comen los despachos
+# largos, que abren una conexion por turno.
+#
+# La escalera normal suma 1+2+4 = 7 s y ademas usa equal-jitter hacia ABAJO, o sea que en
+# la practica se rinde entre los 3,5 y los 7 s. Un minuto caido contra siete segundos de
+# paciencia: tres despachos de 10-15 turnos murieron por esto en una sola noche.
+#
+# Aqui el jitter va hacia ARRIBA: volver antes de tiempo es exactamente el fallo que se
+# quiere evitar, y reintentar una conexion rechazada no gasta tokens ni pierde trabajo.
+# La escalera se clampa en su ultimo escalon, asi que 7 reintentos dan
+# 1+2+4+8+16+32+32 = 95 s de base (hasta ~119 s con jitter). El primer intento fue de 63 s
+# y el test lo rechazo: quedaba 2,3 s POR DEBAJO del peor reinicio medido (65,3 s). Un
+# margen que solo cubre el caso promedio no cubre nada.
+CONNECT_MAX_RETRIES = 7
+CONNECT_BACKOFF = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
 # Techo del Retry-After del servidor. El cap viejo de 30s hacía que, cuando GLM pedía
 # esperar 60-120s, el delegate volviera antes de tiempo y agravara el 429.
 RETRY_AFTER_MAX = 120.0
@@ -512,7 +532,7 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
     return None
 
 
-def _retry_delay(attempt: int, retry_after: float | None = None) -> float:
+def _retry_delay(attempt: int, retry_after: float | None = None, *, connect: bool = False) -> float:
     """Segundos a esperar antes del próximo intento, con jitter.
 
     Sin jitter, varios agentes rebotados por el mismo 429 vuelven a golpear el backend
@@ -522,6 +542,11 @@ def _retry_delay(attempt: int, retry_after: float | None = None) -> float:
     """
     if retry_after is not None:
         return retry_after + random.uniform(0.0, min(retry_after * 0.25, 5.0))
+    if connect:
+        # Jitter hacia ARRIBA, nunca hacia abajo: con equal-jitter el peor caso vuelve a
+        # los 31,5 s y no cubre una ventana de reinicio de 55-65 s.
+        base = CONNECT_BACKOFF[min(attempt, len(CONNECT_BACKOFF) - 1)]
+        return base + random.uniform(0.0, base * 0.25)
     base = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
     return random.uniform(base * 0.5, base)
 
@@ -1641,7 +1666,7 @@ async def _delegate_one_impl(
 
         resp = None
         last_transient = None
-        for attempt in range(BACKEND_MAX_RETRIES + 1):
+        for attempt in range(max(BACKEND_MAX_RETRIES, CONNECT_MAX_RETRIES) + 1):
             try:
                 remaining = deadline - time.time()
                 if remaining < DISPATCH_MIN_SLICE:
@@ -1698,9 +1723,29 @@ async def _delegate_one_impl(
                 # (TURN_TIMEOUT) / mid-stream SSE error after 200 OK. A BackendStreamError
                 # flagged non-retryable (auth/invalid_request/not_found) fails fast.
                 retryable = getattr(e, "retryable", True)
-                if retryable and attempt < BACKEND_MAX_RETRIES:
+                # No poder ABRIR el socket es su propio caso: el backend esta levantando,
+                # no roto. Se le da una escalera mas larga (ver CONNECT_BACKOFF) porque
+                # reintentar aqui no gasta tokens ni pierde trabajo, y rendirse tira el
+                # despacho entero. El resto de transitorios mantienen la escalera corta.
+                is_connect = isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout))
+                max_tries = CONNECT_MAX_RETRIES if is_connect else BACKEND_MAX_RETRIES
+                if retryable and attempt < max_tries:
                     last_transient = f"{type(e).__name__}: {e}"
-                    await asyncio.sleep(_retry_delay(attempt))
+                    delay = _retry_delay(attempt, connect=is_connect)
+                    # Dormir mas de lo que queda del deadline es tiempo tirado: el proximo
+                    # intento moriria en el chequeo de DISPATCH_MIN_SLICE igual.
+                    if delay > (deadline - time.time()) - DISPATCH_MIN_SLICE:
+                        return {
+                            "success": False,
+                            "error": (
+                                f"backend {type(e).__name__}; la espera de {delay:.1f}s no "
+                                f"cabe en lo que queda del deadline de {DISPATCH_TIMEOUT}s"
+                            ),
+                            "timeout_scope": "dispatch",
+                            "turn_failed": turn,
+                            "final_response": final_text,
+                        }
+                    await asyncio.sleep(delay)
                     continue
                 return {
                     "success": False,
@@ -1716,7 +1761,7 @@ async def _delegate_one_impl(
         if resp is None:
             return {
                 "success": False,
-                "error": f"backend unavailable after {BACKEND_MAX_RETRIES + 1} attempts (last: {last_transient})",
+                "error": f"backend unavailable after {max(BACKEND_MAX_RETRIES, CONNECT_MAX_RETRIES) + 1} attempts (last: {last_transient})",
                 "turn_failed": turn,
             }
 
