@@ -189,7 +189,13 @@ PROVIDER_CONCURRENCY = {
     "deepseek-v4-flash": 6,
     "deepseek-v4-pro": 6,
     "qwen-3-8-max": 6,
-    "glm-coding-plan": 6,
+    # 🚨 GLM is the DELIBERATE exception: every glm-* alias shares ONE pool of six
+    # (Felix, 2026-08-28). There is no "glm-coding-plan" entry on purpose, so the
+    # family prefix below catches all of them — glm-coding-plan, -think, -max AND
+    # glm-5-3-flash. Giving glm-5-3-flash its own six would have meant twelve
+    # concurrent against z.ai, which measured clean at 6 and rate-limited at 9
+    # (2026-08-18). They also bill the same flat coding plan, so separate pools
+    # would only spend one quota twice as fast.
     # ornith and local- are the SAME GPU in two separate buckets, so this is
     # eight concurrent against oMLX. Measured 2026-08-27, clinic closed:
     # aggregate throughput PEAKS at 6 concurrent (121 tok/s) and DROPS at 8
@@ -242,6 +248,9 @@ FAILOVER_CHAINS = {
     "glm-coding-plan":       ["qwen-3-8-max", "deepseek-v4-flash", "deepseek-v4-pro"],
     "glm-coding-plan-think": ["qwen-3-8-max", "deepseek-v4-flash", "deepseek-v4-pro"],
     "glm-coding-plan-max":   ["qwen-3-8-max", "deepseek-v4-flash-max", "deepseek-v4-pro-max"],
+    # No GLM in this chain: every glm-* alias shares one pool, so a hop from one
+    # GLM to another would queue for the very slot that is already full.
+    "glm-5-3-flash":         ["qwen-3-8-max", "deepseek-v4-flash", "deepseek-v4-pro"],
     "qwen-3-8-max":          ["glm-coding-plan-think", "deepseek-v4-flash", "deepseek-v4-pro"],
     "qwen-3-8-max-think":    ["glm-coding-plan-think", "deepseek-v4-flash", "deepseek-v4-pro"],
     "deepseek-v4-flash":     ["deepseek-v4-pro", "glm-coding-plan-think", "qwen-3-8-max"],
@@ -349,6 +358,10 @@ MODEL_BUDGET_POLICY = {
     "glm-coding-plan-max": 131_072,  # budget de thinking 64K
     "glm-coding-plan-think": 65_536,  # budget de thinking 16K
     "glm-coding-plan": 65_536,
+    # Thinking CANNOT be disabled on glm-5.3-flash (z.ai only accepts
+    # thinking.type "enabled"), and its budget is 16K. Left on the default it
+    # can spend the whole allowance reasoning and return an EMPTY response.
+    "glm-5-3-flash": 65_536,
     "deepseek-v4-flash": 150_000,
     "deepseek-v4-flash-max": 150_000,
     "deepseek-v4-pro": 150_000,
@@ -2099,7 +2112,8 @@ async def delegate_batch(
 
     Concurrency is enforced PER PROVIDER, not globally: local/ornith get 2 slots (real
     oMLX capacity, one reserved for production work), while cloud providers get their own
-    independent pools (glm 6, deepseek 6, others 4). A mixed batch of 6 GLM + 6 DeepSeek
+    independent pools (all glm-* share 6, deepseek-v4-flash 6, deepseek-v4-pro 6, others 4).
+    A mixed batch of 6 GLM + 6 DeepSeek
     runs all 12 at once. Tasks beyond a provider's slots queue instead of failing.
 
     USE WHEN you have multiple independent sub-tasks (batch cap = MAX_BATCH_SIZE, default
