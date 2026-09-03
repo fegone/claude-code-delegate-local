@@ -631,3 +631,69 @@ if __name__ == "__main__":
     test_cross_process_slot_is_really_cross_process()
     test_cross_process_slot_can_be_disabled()
     print("\nALL PASS (31/31)")
+
+
+# ── the nudge must not eat the deliverable ───────────────────────────────────
+def test_nudge_reply_does_not_overwrite_deliverable():
+    """A finished agent restating "I already delivered it" must not REPLACE the work.
+
+    Verified against production 2026-09-03: `_should_nudge` fires on every turn that
+    ends normally with text, so a completed dispatch always gets interrogated once.
+    The model answers with a meta-summary ("I delivered the 5-line report in my
+    previous message") and, because `final_text` was overwritten on every textual
+    turn, that summary became `final_response` — the report itself was dropped while
+    the run still reported success=True. Reproduced identically on qwen-3-8-max and
+    glm-coding-plan, so it degraded every model, not one.
+    """
+    _patch_agent()
+    turns = []
+
+    async def deliver_then_restate(*a, **k):
+        turns.append(1)
+        if len(turns) == 1:
+            return {"content": [{"type": "text", "text": "THE REPORT: line1 line2 line3"}],
+                    "stop_reason": "end_turn", "usage": {}}
+        return {"content": [{"type": "text", "text": "Task complete, I delivered it above."}],
+                "stop_reason": "end_turn", "usage": {}}
+
+    server._call_backend = deliver_then_restate
+    r = run_coro(server._delegate_one_impl("a", "t", model="m", max_turns=5))
+    _restore_patches()
+    assert r["nudges"] == 1, r
+    assert r["final_response"] == "THE REPORT: line1 line2 line3", r
+    # The verdict is not lost either — it moves to its own field instead of the deliverable's.
+    assert r["nudge_reply"] == "Task complete, I delivered it above.", r
+    assert r["success"] is True, r
+    print("PASS nudge restatement kept out of final_response")
+
+
+def test_nudge_that_resumes_work_still_updates_final_response():
+    """The other half: when the nudge makes the agent RESUME, later text is the answer.
+
+    Guards against over-correcting — freezing final_response at the pre-nudge text
+    would resurrect the 2026-08-08 bug where a dispatch ended on "I'll run the tests"
+    and reported success.
+    """
+    _patch_agent()
+    turns = []
+
+    async def announce_then_work(*a, **k):
+        turns.append(1)
+        if len(turns) == 1:
+            return {"content": [{"type": "text", "text": "I'll run the tests now."}],
+                    "stop_reason": "end_turn", "usage": {}}
+        if len(turns) == 2:
+            return {"content": [{"type": "text", "text": "Running them."},
+                                {"type": "tool_use", "id": "1", "name": "run_bash",
+                                 "input": {"command": "true"}}],
+                    "stop_reason": "tool_use", "usage": {}}
+        return {"content": [{"type": "text", "text": "Tests pass: 12/12."}],
+                "stop_reason": "end_turn", "usage": {}}
+
+    server._call_backend = announce_then_work
+    r = run_coro(server._delegate_one_impl("a", "t", model="m", max_turns=6))
+    _restore_patches()
+    assert r["nudges"] == 1 and r["resumed_after_nudge"] is True, r
+    assert r["final_response"] == "Tests pass: 12/12.", r
+    assert r["nudge_reply"] is None, r
+    print("PASS nudge that resumes work still updates final_response")
