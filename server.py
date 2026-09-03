@@ -1625,6 +1625,11 @@ async def _delegate_one_impl(
     stop_reason = "unknown"
     nudges = 0
     resumed_after_nudge = False
+    # El nudge pide un VEREDICTO ("¿de verdad terminaste?"), no un entregable. Su
+    # respuesta se guarda aparte para que no pise el trabajo — ver el bloque de
+    # `awaiting_nudge_reply` mas abajo.
+    awaiting_nudge_reply = False
+    nudge_reply: str | None = None
     # F3: re-lecturas y re-greps identicos pagan I/O otra vez Y re-arrastran su resultado
     # (hasta ~13K tokens) por el resto del despacho. Clave -> turno en que se vio.
     seen_calls: dict[tuple[str, str], int] = {}
@@ -1780,7 +1785,24 @@ async def _delegate_one_impl(
         texts = [b.get("text", "") for b in content if b.get("type") == "text"]
         text_join = "\n".join(t for t in texts if t.strip())
         if text_join:
-            final_text = text_join
+            if awaiting_nudge_reply and not tool_uses:
+                # Turno que SOLO contesta al nudge: es un veredicto sobre trabajo ya
+                # entregado, no el entregable. Sobreescribir aqui borraba la respuesta
+                # buena — verificado en produccion el 2026-09-03: `_should_nudge` dispara
+                # en TODO turno que acaba normal y con texto, asi que un despacho
+                # terminado siempre se interroga una vez, el modelo contesta "ya lo
+                # entregue arriba" y ese resumen se convertia en `final_response` con
+                # success=True. Reproducido igual en qwen-3-8-max y glm-coding-plan: no
+                # era de un modelo, degradaba a todos.
+                nudge_reply = text_join
+                if not final_text:
+                    final_text = text_join
+            else:
+                final_text = text_join
+
+        if awaiting_nudge_reply and tool_uses:
+            # Retomo el trabajo: lo que venga despues SI es el entregable.
+            awaiting_nudge_reply = False
 
         if not tool_uses:
             # A tool-less turn is ambiguous: the agent may be finished, or it may have
@@ -1802,6 +1824,7 @@ async def _delegate_one_impl(
             can_nudge = _should_nudge(stop_reason, text_join)
             if can_nudge and nudges < MAX_COMPLETION_NUDGES and turn < max_turns:
                 nudges += 1
+                awaiting_nudge_reply = True
                 messages.append({"role": "assistant", "content": content})
                 messages.append({"role": "user", "content": NUDGE_TEXT})
                 continue
@@ -1967,6 +1990,10 @@ async def _delegate_one_impl(
         # resumed_after_nudge=True would have been reported as a clean success by the old
         # loop while leaving the task half-done — treat those results with suspicion.
         "nudges": nudges,
+        # Veredicto del turno-nudge cuando solo restato que habia terminado. Va aparte
+        # para que no pise `final_response`; None si no hubo nudge o si el nudge lo hizo
+        # retomar el trabajo.
+        "nudge_reply": nudge_reply,
         "resumed_after_nudge": resumed_after_nudge,
         "elapsed_s": round(elapsed, 1),
         "tokens_in": total_in,
