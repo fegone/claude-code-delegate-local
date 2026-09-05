@@ -2473,12 +2473,23 @@ async def _drain_capped(stream: asyncio.StreamReader, cap_bytes: int) -> bytes:
 # en vivo con un ChatGPT Plus: los TRES sabores de GPT-5.6 (sol/terra/luna) + 5.5/5.4
 # responden nativos; gpt-5.6 "pelado" y gpt-5.6-codex devuelven 400 "not supported
 # when using Codex with a ChatGPT account" (esos requieren API key de pago).
+#
+# gpt-6-astra añadido el 2026-09-05, verificado en vivo igual que los demás: con
+# `auth_mode: chatgpt` en ~/.codex/auth.json y sin OPENAI_API_KEY, contesta.
+# ⚠️ EXIGE codex-cli >= 0.153.4: la 0.147.0 no conoce el modelo y falla. Es el
+# primer GPT-6, no un sabor de 5.6, y por eso el id NO sigue el patrón "gpt-5.6-*".
+# 💰 Razona mucho por defecto: 5.475 tokens para contestar "ASTRA-OK". En trabajo
+# real come bastante más cuota que sol; no es el default de nada.
 CODEX_PLAN_MODELS = {
+    "gpt-6-astra",
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
 }
 # Alias cortos → id real del modelo. Permite delegar diciendo solo "sol"/"terra"/"luna".
 CODEX_MODEL_ALIASES = {
+    "astra": "gpt-6-astra",
+    "gpt-6-astra": "gpt-6-astra",
+    "6-astra": "gpt-6-astra",
     "sol": "gpt-5.6-sol",
     "terra": "gpt-5.6-terra",
     "luna": "gpt-5.6-luna",
