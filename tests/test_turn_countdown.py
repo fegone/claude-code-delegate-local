@@ -37,7 +37,7 @@ def _tool_use(tid, path):
     }
 
 
-def _avisos_vistos(tmp_path, max_turns):
+def _avisos_vistos(tmp_path, max_turns, agente="coder"):
     """Corre el bucle pidiendo tool en cada turno y devuelve los tool_result que vio."""
     (tmp_path / "f.txt").write_text("contenido\n")
     orig_load, orig_call = server._load_agent, server._call_backend
@@ -60,7 +60,7 @@ def _avisos_vistos(tmp_path, max_turns):
     server._call_backend = fake_call
     try:
         out = _run(server._delegate_one_impl(
-            "coder", "lee f.txt", workdir=str(tmp_path), max_turns=max_turns,
+            agente, "lee f.txt", workdir=str(tmp_path), max_turns=max_turns,
             model="m1", url="http://A/v1/messages", key="KA",
         ))
     finally:
@@ -120,3 +120,25 @@ def test_sin_presion_no_hay_aviso(tmp_path):
 
     assert not any("QUEDAN" in v or "ULTIMO TURNO" in v for v in vistos), \
         f"con 30 turnos y uno usado no debe avisar nada: {vistos}"
+
+
+def test_a_un_revisor_no_se_le_pide_commitear(tmp_path):
+    """El aviso corre sobre el workdir de quien despacha, que puede tener cambios a
+    medio hacer. Pedirle `git add -A && git commit` a un revisor es pedirle que
+    commitee trabajo ajeno sin terminar — pasó el 2026-09-18 en LicitaRD, donde dos
+    revisores lo reportaron como intento de inyección."""
+    for agente in ("code-reviewer", "review-risk", "compliance-auditor", "Explore"):
+        vistos, _ = _avisos_vistos(tmp_path, max_turns=6, agente=agente)
+        con_aviso = [v for v in vistos if "QUEDAN" in v]
+        assert con_aviso, f"{agente}: no se le avisó de la cuenta regresiva"
+        assert not any("git add" in v for v in con_aviso), \
+            f"{agente} es de solo lectura y se le pidió commitear"
+        assert any("informe" in v for v in con_aviso), \
+            f"{agente}: el aviso tiene que decirle que entregue su informe"
+
+
+def test_a_un_implementador_se_le_sigue_pidiendo_commitear(tmp_path):
+    """Lo contrario también tiene que seguir siendo cierto: el que escribe código
+    pierde el trabajo si no lo commitea antes de quedarse sin turnos."""
+    vistos, _ = _avisos_vistos(tmp_path, max_turns=6, agente="webdev")
+    assert any("git add -A && git commit" in v for v in vistos if "QUEDAN" in v)

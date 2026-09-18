@@ -155,6 +155,20 @@ HIGH_REASONING_PREFIXES = ("deepseek-v4-flash", "deepseek-v4-pro")
 # 20 minutos sin una linea. Esto pone esa regla en el mecanismo en vez de en el prompt.
 TURN_WARN_REMAINING = 3
 
+# ...pero a un agente de SOLO LECTURA ese mismo aviso le pide justo lo que no debe
+# hacer. Medido el 2026-09-18 en LicitaRD: cuatro revisores 4R corrieron sobre el
+# workdir del orquestador, que tenía cambios a medio hacer, y el aviso les dijo
+# "ejecuta git add -A && git commit". Dos lo reportaron como intento de inyección y
+# lo ignoraron; si alguno obedece, commitea el trabajo sin terminar de OTRO agente
+# —y con `-A`, todo lo que hubiera en el árbol— firmado como suyo. El entregable de
+# un revisor es su informe, no un commit.
+AGENTES_DE_SOLO_LECTURA = ("review", "audit", "explor", "investig")
+
+
+def _es_agente_de_solo_lectura(agent_name: str) -> bool:
+    nombre = (agent_name or "").lower()
+    return any(pista in nombre for pista in AGENTES_DE_SOLO_LECTURA)
+
 PROVIDER_MAX_TOKENS_CAP = {
     "glm-": 131_072,  # GLM-5.2 via Z.ai Anthropic-native endpoint
     # Alibaba Token Plan (qwen3.8-max y familia). Verificado live 2026-08-09:
@@ -1940,6 +1954,14 @@ async def _delegate_one_impl(
                     "pidas ahora se descartan sin correr. Si tienes trabajo sin guardar, "
                     "ya no puedes guardarlo. Responde AHORA con tu resultado final y di "
                     "explicitamente que quedo a medias."
+                )
+            elif _es_agente_de_solo_lectura(agent_name):
+                # Su entregable es el informe, no un commit: ver AGENTES_DE_SOLO_LECTURA.
+                aviso = (
+                    f"\n\n[QUEDAN {turns_left} TURNOS] PARA de leer. Escribe AHORA tu informe "
+                    f"final en el mensaje de respuesta: ese es tu entregable.\n"
+                    f"NO escribas archivos ni commitees: el arbol de trabajo no es tuyo y "
+                    f"puede tener cambios a medio hacer de quien te despacho."
                 )
             else:
                 # Medido en Peptides: el aviso rinde en proporcion a lo concreto que sea
