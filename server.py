@@ -814,6 +814,69 @@ def _child_env(extra: tuple[str, ...] = ()) -> dict[str, str]:
 CROSS_PROCESS_SLOTS = os.getenv("DELEGATE_CROSS_PROCESS_SLOTS", "1").lower() not in (
     "0", "false", "no",
 )
+# ── Registro de despachos ───────────────────────────────────────────────────────
+#
+# Una linea por despacho. Nace el 2026-09-19 porque la auditoria de astra pregunto
+# cada cuanto se dan tres cosas y NO SE PUDO RESPONDER: el delegate no guardaba nada.
+# Sin esto, "arreglar el criterio de exito" es adivinar; con una semana de lineas se
+# sabe si pasa a diario o una vez al mes.
+#
+# 🔒 Lo que se escribe es METADATO Y NADA MAS: ni la tarea, ni la respuesta, ni rutas
+# del proyecto. Este fichero vive en el disco del que despacha y no debe poder
+# reconstruir el trabajo — menos aun en los proyectos con PHI.
+_LOG_PATH = pathlib.Path(
+    os.getenv("DELEGATE_LOG_PATH",
+              os.path.expanduser("~/.cache/claude-delegate-local/dispatches.jsonl"))
+)
+_LOG_MAX_BYTES = int(os.getenv("DELEGATE_LOG_MAX_BYTES", str(8 * 1024 * 1024)))
+_LOG_FIELDS = (
+    "success", "model", "response_model", "terminal_text", "agent_name", "agent_source",
+    "turns", "max_turns", "tool_calls", "malformed_calls", "deduped_calls",
+    "evicted_tool_results", "nudges", "resumed_after_nudge", "elapsed_s",
+    "tokens_in", "tokens_out", "cache_read_tokens", "cache_creation_tokens",
+    "cache_hit_pct", "stop_reason", "hit_turn_limit", "incomplete",
+    "bash_calls", "bash_failures", "last_bash_exit", "timeout_scope",
+    "failed_over_from", "model_used", "failover_tried", "turn_failed",
+)
+
+
+def _log_dispatch(result: dict, requested: str, bucket: str, queued_s: float) -> None:
+    """Anota el despacho. Best-effort a proposito: un fallo aqui NUNCA puede tumbar
+    un despacho que fue bien, asi que se traga cualquier excepcion."""
+    try:
+        if os.getenv("DELEGATE_LOG", "1") == "0":
+            return
+        rec: dict[str, Any] = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "requested_model": requested,
+            "bucket": bucket,
+            "queued_s": round(queued_s, 1),
+        }
+        for k in _LOG_FIELDS:
+            if k in result:
+                rec[k] = result[k]
+        # De un fallo interesa el TIPO, no el texto: puede llevar fragmentos de la tarea.
+        err = result.get("error")
+        if isinstance(err, str) and err:
+            rec["error_kind"] = err.split(":", 1)[0][:80]
+        # Lo que la auditoria queria contar: exito certificado por un turno anterior.
+        if result.get("success") and result.get("terminal_text") is False:
+            rec["hollow_success"] = True
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Rotacion de un solo archivo: al pasar el tope se renombra a .1 (se pisa el
+        # anterior). Sin hilos ni dependencias; si se pierde una linea en la carrera,
+        # se pierde una linea de telemetria, no trabajo.
+        try:
+            if _LOG_PATH.exists() and _LOG_PATH.stat().st_size > _LOG_MAX_BYTES:
+                _LOG_PATH.replace(_LOG_PATH.with_suffix(".jsonl.1"))
+        except OSError:
+            pass
+        with _LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    except Exception:  # noqa: BLE001 — telemetria jamas rompe un despacho
+        pass
+
+
 _SLOT_DIR = pathlib.Path(
     os.getenv("DELEGATE_SLOT_DIR", os.path.expanduser("~/.cache/claude-delegate-local/slots"))
 )
@@ -1636,6 +1699,12 @@ async def _delegate_one_impl(
     total_cache_read = 0
     total_cache_creation = 0
     final_text = ""
+    # Texto del ULTIMO turno, aparte del acumulado. `final_text` se queda con el ultimo
+    # texto no vacio de CUALQUIER turno, asi que un despacho que anuncia "voy a
+    # verificar", pide una herramienta y termina vacio se cierra con esa frase. Separar
+    # los dos no cambia todavia el veredicto: deja medirlo (`terminal_text` en el log).
+    terminal_text = ""
+    response_model: str | None = None
     stop_reason = "unknown"
     nudges = 0
     resumed_after_nudge = False
@@ -1786,6 +1855,11 @@ async def _delegate_one_impl(
 
         content = resp.get("content", [])
         stop_reason = resp.get("stop_reason", "unknown")
+        # Quien contesto DE VERDAD. El proxy puede haber caido en su propia cadena de
+        # fallbacks (glm -> glm-think -> deepseek) sin decirselo a nadie, y hasta ahora
+        # devolviamos el alias que el llamante PIDIO. Comparar dos modelos midiendo uno
+        # solo es facilisimo si este campo no existe.
+        response_model = resp.get("model") or response_model
         usage = resp.get("usage", {})
         total_in += usage.get("input_tokens", 0)
         total_out += usage.get("output_tokens", 0)
@@ -1798,6 +1872,9 @@ async def _delegate_one_impl(
         tool_uses = [b for b in content if b.get("type") == "tool_use"]
         texts = [b.get("text", "") for b in content if b.get("type") == "text"]
         text_join = "\n".join(t for t in texts if t.strip())
+        # Lo que trajo ESTE turno, se pise luego o no. Un turno final vacio deja esto
+        # vacio aunque `final_text` conserve la frase de un turno anterior.
+        terminal_text = text_join
         if text_join:
             if awaiting_nudge_reply and not tool_uses:
                 # Turno que SOLO contesta al nudge: es un veredicto sobre trabajo ya
@@ -2000,6 +2077,14 @@ async def _delegate_one_impl(
         "agent_name": agent_name,
         "agent_source": agent_source,
         "model": model,
+        # El que PIDIO el llamante vs el que CONTESTO. Si el proxy cayo en su propia
+        # cadena de fallbacks, los dos no coinciden y hasta ahora no habia forma de
+        # saberlo desde aqui.
+        "response_model": response_model,
+        # False = el ultimo turno no trajo texto y `final_response` sale de uno
+        # anterior. Hoy eso aun cuenta como exito; se registra para medir cuanto pasa
+        # antes de cambiar el veredicto.
+        "terminal_text": bool(terminal_text.strip()),
         "workdir": workdir_abs,
         "turns": turn,
         "max_turns": max_turns,
@@ -2069,6 +2154,7 @@ async def _dispatch_bounded(
     if isinstance(agent_name, str) and model == DEFAULT_MODEL \
             and agent_name.lower() in CODING_AGENTS:
         eff_model = CODING_MODEL
+    t_queue0 = time.monotonic()
     sem, prov = await _get_provider_semaphore(eff_model)
     # Dos capas: el asyncio.Semaphore acota ESTA instancia (barato, sin I/O) y el slot por
     # flock acota el total entre todas las sesiones de Claude Code abiertas. El in-process
@@ -2077,11 +2163,15 @@ async def _dispatch_bounded(
     async with sem:
         try:
             async with _cross_process_slot(prov, _provider_concurrency(prov), BATCH_QUEUE_GRACE):
-                return await _delegate_one_impl(
+                queued_s = time.monotonic() - t_queue0
+                out = await _delegate_one_impl(
                     agent_name=agent_name, task=task, workdir=workdir, max_turns=max_turns,
                     model=model, max_tokens=max_tokens, ctx=ctx, url=url, key=key,
                     mode_tag=mode_tag,
                 )
+                if isinstance(out, dict):
+                    _log_dispatch(out, eff_model, prov, queued_s)
+                return out
         except SlotWaitTimeout as e:
             queue_error = str(e)
 
@@ -2104,12 +2194,14 @@ async def _dispatch_bounded(
                     if isinstance(out, dict):
                         out["failed_over_from"] = eff_model
                         out["model_used"] = alt
+                        _log_dispatch(out, eff_model, alt_prov,
+                                      time.monotonic() - t_queue0)
                     return out
             except SlotWaitTimeout:
                 tried.append(alt)
                 continue
 
-    return {
+    out = {
         "success": False,
         "error": queue_error + (
             " — failover probado sin hueco en: " + ", ".join(tried[1:])
@@ -2119,6 +2211,8 @@ async def _dispatch_bounded(
         "model": model,
         "failover_tried": tried[1:],
     }
+    _log_dispatch(out, eff_model, prov, time.monotonic() - t_queue0)
+    return out
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -2698,15 +2792,17 @@ async def delegate_to_codex(
     # Any non-zero exit is a failure — even if Codex wrote a partial final message before
     # dying. The partial is returned as diagnostic, not passed off as a successful result.
     if proc.returncode not in (0, None):
-        return {
+        out = {
             "success": False,
             "error": f"codex salió con código {proc.returncode}",
             "final_response": final_message or None,
             "stdout_tail": stdout_text[-1500:],
             "model": model, "elapsed_s": elapsed,
         }
+        _log_dispatch(out, model, "codex", 0.0)
+        return out
 
-    return {
+    out = {
         "success": True,
         "model": model,
         "final_response": final_message or stdout_text[-4000:],
@@ -2714,6 +2810,11 @@ async def delegate_to_codex(
         "workdir": workdir_abs,
         "auth": "chatgpt-plan",
     }
+    # Codex no pasa por `_dispatch_bounded`, asi que sin esto sus despachos no
+    # aparecerian en el registro: astra auditando el delegate no habria dejado
+    # rastro de su propia corrida.
+    _log_dispatch(out, model, "codex", 0.0)
+    return out
 
 
 def _cleanup_file(path: str) -> None:
