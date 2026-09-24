@@ -180,6 +180,9 @@ PROVIDER_MAX_TOKENS_CAP = {
     # termina en "-max", asi que sin este cap el auto-bump a MAX_TIER_MAX_TOKENS
     # lo hace rechazar TODA request.
     "qwen-3-8": 131_072,
+    # Xiaomi MiMo Token Plan (2026-09-24): max_completion_tokens range [1, 131072]
+    # per its OpenAI-compatible API docs.
+    "mimo-": 131_072,
 }
 
 # ── Concurrencia POR PROVEEDOR ──────────────────────────────────────────────────
@@ -235,6 +238,9 @@ PROVIDER_CONCURRENCY = {
     # generacion. Con 6 en paralelo eso se multiplica, asi que la palanca de
     # ahorro es max_turns por despacho, NO este numero.
     "qwen-": 6,
+    # Xiaomi MiMo Token Plan (2026-09-24). ONE shared pool for every mimo-* alias,
+    # like GLM: same plan, same key, 100 RPM documented for the whole account.
+    "mimo-": 6,
 }
 DEFAULT_PROVIDER_CONCURRENCY = int(os.getenv("DELEGATE_CONCURRENCY_DEFAULT", "4"))
 
@@ -277,6 +283,10 @@ FAILOVER_CHAINS = {
     "deepseek-v4-pro-max":   ["glm-coding-plan-max", "qwen-3-8-max", "deepseek-v4-flash-max"],
     "minimax-m3":            ["glm-coding-plan-think", "qwen-3-8-max", "deepseek-v4-flash"],
     "grok-4-5":              ["glm-coding-plan-think", "qwen-3-8-max", "deepseek-v4-flash"],
+    # No MiMo inside MiMo chains: all mimo-* share one pool (see PROVIDER_CONCURRENCY).
+    "mimo-flash":            ["glm-5-3-flash", "qwen-3-8-max", "deepseek-v4-flash"],
+    "mimo-flash-think":      ["glm-coding-plan-think", "qwen-3-8-max", "deepseek-v4-flash"],
+    "mimo-pro":              ["glm-coding-plan-max", "qwen-3-8-max-think", "deepseek-v4-pro"],
 }
 
 # Seconds a FALLBACK waits for its own slot. Short on purpose: the point is to
@@ -384,6 +394,11 @@ MODEL_BUDGET_POLICY = {
     "deepseek-v4-flash-max": 150_000,
     "deepseek-v4-pro": 150_000,
     "deepseek-v4-pro-max": 150_000,
+    # MiMo reasons by default ("thinking" enabled) and caps output at 131072.
+    # mimo-flash runs with thinking disabled, so the default budget is enough.
+    "mimo-flash": 65_536,
+    "mimo-flash-think": 131_072,
+    "mimo-pro": 131_072,
 }
 
 
@@ -1166,6 +1181,7 @@ _OPENAI_FORMAT_PREFIXES: tuple[str, ...] = (
     "moonshot-",  # Kimi
     "kimi-",
     "grok-",      # xAI Grok — OpenAI-compatible (api.x.ai/v1); ruta nativa /v1/chat/completions
+    "mimo-",      # Xiaomi MiMo Token Plan — OpenAI-compatible; the alias sets thinking via extra_body
     # NOTA: "glm-" fue removido de esta lista (2026-07-06) — Z.ai's GLM Coding Plan
     # está configurado en litellm_params contra el endpoint ANTHROPIC-NATIVO de Z.ai
     # (api_base: https://api.z.ai/api/anthropic, model: anthropic/glm-5.2), no un

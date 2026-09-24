@@ -72,3 +72,27 @@ def test_glm_flash_gets_an_explicit_token_budget():
     """Thinking cannot be disabled on this model; the default allowance can be spent
     reasoning, returning an empty response with no error."""
     assert server.MODEL_BUDGET_POLICY.get("glm-5-3-flash")
+
+
+# ── Xiaomi MiMo Token Plan (2026-09-24) ─────────────────────────────────────────
+MIMO_ALIASES = ("mimo-flash", "mimo-flash-think", "mimo-pro")
+
+
+def test_every_mimo_alias_lands_in_one_pool_of_six():
+    keys = {server._provider_key(m) for m in MIMO_ALIASES}
+    assert len(keys) == 1
+    assert server._provider_concurrency(keys.pop()) == 6
+
+
+def test_mimo_never_fails_over_to_another_mimo_and_has_a_chain():
+    for model in MIMO_ALIASES:
+        chain = server._failover_candidates(model)
+        assert chain, model
+        assert not any(t.startswith("mimo-") for t in chain), (model, chain)
+
+
+def test_mimo_goes_over_chat_completions_with_its_output_cap_and_budget():
+    for model in MIMO_ALIASES:
+        assert server._is_openai_format(model)
+        assert server.MODEL_BUDGET_POLICY.get(model)
+        assert server.MODEL_BUDGET_POLICY[model] <= 131_072
