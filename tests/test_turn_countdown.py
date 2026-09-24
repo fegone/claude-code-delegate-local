@@ -2,8 +2,13 @@
 
 El presupuesto se anuncia una sola vez en el system prompt. Sin cuenta regresiva, el
 agente quema turnos en suites lentas y se queda sin margen justo cuando todavia tiene
-trabajo sin commitear. Medido en Peptides 2026-08-20: 7 despachos, la mayoria muertos
+trabajo sin guardar. Medido en Peptides 2026-08-20: 7 despachos, la mayoria muertos
 con `turn_limit_pending_tools`.
+
+ACTUALIZADO 2026-09-24 (auditoría §6, fix P0-4): el aviso a agentes de ESCRITURA ya
+no ordena `git add -A && git commit` — viajaba DENTRO del tool_result (el mensaje
+más reciente, gana al system prompt) y commiteaba trabajo a medio hacer de otro
+agente. Ahora pide persistir con write_file y declarar el estado.
 """
 import asyncio
 import os
@@ -72,11 +77,13 @@ def test_avisa_antes_de_quedarse_sin_turnos(tmp_path):
     vistos, _ = _avisos_vistos(tmp_path, max_turns=6)
     con_aviso = [v for v in vistos if "QUEDAN" in v]
     assert con_aviso, f"nunca se le avisó de la cuenta regresiva. tool_results: {vistos}"
-    # No basta con insinuar "guarda tu trabajo": medido en Peptides, el aviso rinde en
-    # proporcion a lo concreto que sea el comando. El que lo interpreto a su manera
-    # perdio 20 minutos; los que ejecutaron el comando dejaron el trabajo en la rama.
-    assert any("git add -A && git commit" in v for v in con_aviso), \
-        "el aviso tiene que NOMBRAR el comando, no solo pedir que se guarde el trabajo"
+    # No basta con insinuar "guarda tu trabajo": el aviso rinde en proporción a lo
+    # CONCRETO que sea la instrucción. Desde el fix P0-4 (2026-09-24) lo concreto es
+    # write_file + declarar estado — nunca git dentro de un tool_result.
+    assert any("write_file" in v for v in con_aviso), \
+        "el aviso tiene que NOMBRAR cómo persistir (write_file), no solo pedirlo"
+    assert any("falta" in v for v in con_aviso), \
+        "y tiene que pedir el estado: qué quedó hecho y qué falta"
 
 
 def test_el_ultimo_turno_se_anuncia_como_tal(tmp_path):
@@ -137,8 +144,29 @@ def test_a_un_revisor_no_se_le_pide_commitear(tmp_path):
             f"{agente}: el aviso tiene que decirle que entregue su informe"
 
 
-def test_a_un_implementador_se_le_sigue_pidiendo_commitear(tmp_path):
-    """Lo contrario también tiene que seguir siendo cierto: el que escribe código
-    pierde el trabajo si no lo commitea antes de quedarse sin turnos."""
+def test_a_un_implementador_se_le_pide_persistir_sin_commitear(tmp_path):
+    """El que escribe código pierde el trabajo si no lo persiste antes de quedarse
+    sin turnos — pero el aviso se lo pide con write_file, no con git: el dispatch
+    corre sobre el workdir de quien despacha (auditoría 2026-09-24 §6, fix P0-4)."""
     vistos, _ = _avisos_vistos(tmp_path, max_turns=6, agente="webdev")
-    assert any("git add -A && git commit" in v for v in vistos if "QUEDAN" in v)
+    con_aviso = [v for v in vistos if "QUEDAN" in v]
+    assert con_aviso, "el countdown tiene que dispararse para un agente de escritura"
+    assert not any("git commit" in v or "git add" in v for v in vistos), \
+        "nada de instrucciones de git dentro de un tool_result"
+    assert any("write_file" in v for v in con_aviso)
+
+
+def test_countdown_sin_instruccion_de_commit_para_agente_de_escritura(tmp_path):
+    """P0-4 (auditoría 2026-09-24 §6, test listado en §9.4): el aviso viaja DENTRO del
+    tool_result — el mensaje más reciente, gana contra el system prompt — así que un
+    agente de ESCRITURA lo obedece aunque el dispatch le haya dicho que no commitee, y
+    `git add -A` se lleva trabajo a medio hacer de OTRO agente firmado como suyo. El
+    complemento inverso del que motivó ebce68a (que solo eximió por nombre)."""
+    for agente in ("webdev", "coder", "db-migrator"):
+        vistos, _ = _avisos_vistos(tmp_path, max_turns=6, agente=agente)
+        con_aviso = [v for v in vistos if "QUEDAN" in v]
+        assert con_aviso, f"{agente}: el countdown tiene que dispararse"
+        assert not any("git commit" in v for v in vistos), \
+            f"{agente}: un agente de escritura NO puede recibir 'git commit' en el tool_result"
+        assert any("write_file" in v for v in con_aviso), \
+            f"{agente}: el aviso tiene que decir cómo persistir (write_file) y qué queda"
