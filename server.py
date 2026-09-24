@@ -70,8 +70,12 @@ LOCAL_MAX_TURNS = int(os.getenv("DELEGATE_LOCAL_MAX_TURNS", "25"))
 # Cloud backends (MiniMax M3, DeepSeek API, Sonnet/Opus) tienen contextos grandes
 # (M3 = 512K) y aguantan más turnos de análisis multi-archivo sin saturar.
 # Se resuelve por modelo en _delegate_one_impl cuando max_turns no se pasa explícito.
-CLOUD_MAX_TURNS = int(os.getenv("DELEGATE_CLOUD_MAX_TURNS", "25"))
-HARD_MAX_TURNS = 40
+CLOUD_MAX_TURNS = int(os.getenv("DELEGATE_CLOUD_MAX_TURNS", "60"))
+# Auditoría 2026-09-24 §1: antes era 40 plano y cortaba tareas reales que un
+# subagente resuelve en 90-180 tool calls (25-60 turnos). Deja de ser restricción
+# operativa y pasa a guard-rail; los DEFAULTS por backend siguen conservadores
+# (local 25: los MoE pequeños de oMLX saturan su contexto mucho antes de 40 turnos).
+HARD_MAX_TURNS = int(os.getenv("DELEGATE_HARD_MAX_TURNS", "150"))
 # Hard per-turn wall-clock ceiling. httpx read= only bounds the gap BETWEEN chunks, so a
 # backend that dribbles one chunk every few minutes could otherwise keep a single turn
 # alive indefinitely. This caps the whole backend call per turn; a hit is treated as a
@@ -593,6 +597,45 @@ ALLOW_PATH_ESCAPE = os.getenv("DELEGATE_ALLOW_PATH_ESCAPE", "0").lower() in ("1"
 # run_bash kill-switch (default ON — coding agents need it to run tests) + bounds.
 RUN_BASH_ENABLED = os.getenv("DELEGATE_RUN_BASH", "1").lower() not in ("0", "false", "no")
 RUN_BASH_TIMEOUT = int(os.getenv("DELEGATE_RUN_BASH_TIMEOUT", "120"))
+# Auditoría 2026-09-24 §3: una suite real (pytest -q sobre ~20 archivos de tests)
+# tarda 160-190s, MÁS que el timeout plano de 120s: el process group moría a media
+# suite y el agente no podía verificar su trabajo. Defaults por backend: cloud 600
+# (DELEGATE_CLOUD_RUN_BASH_TIMEOUT), local 120 — conservador a propósito: los slots
+# oMLX comparten GPU/event-loop y el semáforo _BASH_MAX_CONCURRENCY; un turno con K
+# llamadas x 600s lo retendría K×600s. DELEGATE_RUN_BASH_TIMEOUT sigue siendo el
+# override global explícito y gana sobre ambos defaults.
+CLOUD_RUN_BASH_TIMEOUT = int(os.getenv("DELEGATE_CLOUD_RUN_BASH_TIMEOUT", "600"))
+# Techo absoluto del `timeout` por llamada de run_bash (clamp [1, RUN_BASH_MAX]).
+RUN_BASH_MAX = int(os.getenv("DELEGATE_RUN_BASH_MAX", "1800"))
+
+
+def _is_local_backend(model: str | None) -> bool:
+    """True para los backends locales (oMLX): alias `local-*` y `ornith*`."""
+    m = str(model or "").lower()
+    return m.startswith("local-") or m.startswith("ornith")
+
+
+def _default_bash_timeout(model: str | None) -> int:
+    """Timeout default de run_bash para el backend de ESTE despacho.
+
+    El override global DELEGATE_RUN_BASH_TIMEOUT (si está seteada) gana sobre los
+    defaults por backend, para no romper despliegues que ya la usan.
+    """
+    env = os.getenv("DELEGATE_RUN_BASH_TIMEOUT")
+    if env is not None:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    return RUN_BASH_TIMEOUT if _is_local_backend(model) else CLOUD_RUN_BASH_TIMEOUT
+
+
+def _resolve_bash_timeout(timeout, default) -> int:
+    """`timeout` explícito (>0) clampeado a [1, RUN_BASH_MAX]; cualquier otra cosa
+    (ausente, 0, negativo, basura del modelo) cae en el default del dispatch."""
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 1:
+        timeout = default
+    return max(1, min(int(timeout), RUN_BASH_MAX))
 # Per-task ceiling inside delegate_batch. A hung provider (quota-saturated
 # plan, dead endpoint) must return a clean per-task error instead of hanging
 # the whole batch until the client gives up and cancels the MCP request
@@ -736,10 +779,25 @@ AGENT_TOOLS = [
     },
     {
         "name": "run_bash",
-        "description": "Ejecuta comando bash en el workdir. Devuelve exit_code, stdout, stderr. Timeout 120s.",
+        "description": (
+            "Ejecuta comando bash en el workdir. Devuelve exit_code, stdout, stderr. "
+            "Timeout default 600s (cloud) / 120s (local). Para una suite lenta pasa "
+            "`timeout` (1-1800) en vez de fragmentar el comando."
+        ),
         "input_schema": {
             "type": "object",
-            "properties": {"command": {"type": "string"}},
+            "properties": {
+                "command": {"type": "string"},
+                "timeout": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1800,
+                    "description": (
+                        "Timeout en segundos para ESTE comando (1-1800). "
+                        "Default: 600 cloud / 120 local."
+                    ),
+                },
+            },
             "required": ["command"],
         },
     },
@@ -946,7 +1004,8 @@ def _get_bash_semaphore() -> asyncio.Semaphore:
     return _bash_semaphore
 
 
-async def _run_bash(workdir: str, command: str) -> str:
+async def _run_bash(workdir: str, command: str, timeout=None,
+                    default_timeout: int | None = None) -> str:
     """Run a shell command non-blockingly (own process group, bounded concurrency,
     hard timeout). Never blocks the event loop the way subprocess.run(shell=True) did."""
     if not RUN_BASH_ENABLED:
@@ -962,8 +1021,11 @@ async def _run_bash(workdir: str, command: str) -> str:
             )
         except Exception as e:
             return f"ERROR: {type(e).__name__}: {e}"
+        eff_timeout = _resolve_bash_timeout(
+            timeout, default_timeout if default_timeout else RUN_BASH_TIMEOUT
+        )
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=RUN_BASH_TIMEOUT)
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=eff_timeout)
         except asyncio.TimeoutError:
             _kill_process_group(proc)
             try:
@@ -971,8 +1033,10 @@ async def _run_bash(workdir: str, command: str) -> str:
             except (asyncio.TimeoutError, ProcessLookupError):
                 pass
             return (
-                f"ERROR: command timeout ({RUN_BASH_TIMEOUT}s). Re-ejecuta una version "
-                f"acotada: anade head, -m 1, o restringe el path para que termine antes."
+                f"ERROR: command timeout ({eff_timeout}s). Re-ejecuta una version "
+                f"acotada: anade head, -m 1, o restringe el path para que termine antes. "
+                f"Si el comando NECESITA ese tiempo, re-emitelo con timeout (hasta "
+                f"{RUN_BASH_MAX}s)."
             )
         except asyncio.CancelledError:
             _kill_process_group(proc)
@@ -994,7 +1058,8 @@ async def _run_bash(workdir: str, command: str) -> str:
         )
 
 
-async def _execute_tool(workdir: str, name: str, args: dict[str, Any]) -> str:
+async def _execute_tool(workdir: str, name: str, args: dict[str, Any],
+                        default_timeout: int | None = None) -> str:
     """Ejecuta una tool del agente local. Devuelve string (limitado en tamaño)."""
     try:
         if name == "read_file":
@@ -1078,7 +1143,10 @@ async def _execute_tool(workdir: str, name: str, args: dict[str, Any]) -> str:
             cmd = args.get("command")
             if not isinstance(cmd, str):
                 return "ERROR: command must be a string"
-            return await _run_bash(workdir, cmd)
+            return await _run_bash(
+                workdir, cmd,
+                timeout=args.get("timeout"), default_timeout=default_timeout,
+            )
         return f"ERROR: unknown tool {name}"
     except Exception as e:
         return f"ERROR: {type(e).__name__}: {e}"
@@ -1429,7 +1497,11 @@ async def _raise_for_status_streamed(response: httpx.Response) -> None:
         response.raise_for_status()
 
 
-def _evict_old_tool_results(messages: list[dict], keep: int) -> int:
+def _evict_old_tool_results(
+    messages: list[dict], keep: int,
+    seen_calls: dict[tuple[str, str], int] | None = None,
+    call_key_by_id: dict[str, tuple[str, str]] | None = None,
+) -> int:
     """Reemplaza el contenido de los tool_result viejos por una linea-resumen.
 
     F1b: sin esto el historial solo crece — un read_file puede meter ~50.000 chars
@@ -1463,6 +1535,16 @@ def _evict_old_tool_results(messages: list[dict], keep: int) -> int:
                 f"Si necesitas ese contenido otra vez, vuelve a pedirlo]"
             )
             evicted += 1
+            # Auditoría 2026-09-24 §2 (fix P0-1): si este resultado es la única copia
+            # que justificaba el dedup F3, su entrada de `seen_calls` DEBE morir con él.
+            # Si no, el marker invita a re-pedir la llamada y el dedup responde "ya la
+            # tenés" — falso, la evicción la borró — y el agente queda atrapado hasta
+            # quemar todos los turnos (solo escapa cambiando offset/limit, que casi
+            # nunca hace).
+            if seen_calls is not None and call_key_by_id is not None:
+                evicted_key = call_key_by_id.pop(block.get("tool_use_id"), None)
+                if evicted_key is not None:
+                    seen_calls.pop(evicted_key, None)
     return evicted
 
 def _supports_prompt_caching(model: str) -> bool:
@@ -1640,9 +1722,9 @@ async def _delegate_one_impl(
         model = CODING_MODEL
 
     # max_turns=0 (sentinel) => resolver por modelo: local 25 (benchmark 2026-07-03: 15
-    # rompe tareas iterativas), cloud 25.
+    # rompe tareas iterativas; conservalo), cloud 60 (auditoría 2026-09-24 §1).
     if not max_turns or max_turns <= 0:
-        max_turns = LOCAL_MAX_TURNS if str(model).lower().startswith("local-") else CLOUD_MAX_TURNS
+        max_turns = LOCAL_MAX_TURNS if _is_local_backend(model) else CLOUD_MAX_TURNS
     max_turns = max(1, min(max_turns, HARD_MAX_TURNS))
 
     # max_tokens=None (sentinel) => resolver por alias: "-max" tiers get more headroom
@@ -1672,6 +1754,9 @@ async def _delegate_one_impl(
         f"{eff_mode}\n\n"
         f"You are running as the '{agent_name}' agent.\n"
         f"Workdir: {workdir_abs} (use relative paths or absolute).\n"
+        # Auditoría 2026-09-24 §5: sin fecha, el modelo solo conoce la de sus pesos y
+        # fechaba informes con meses de viejo.
+        f"Today's date: {time.strftime('%Y-%m-%d')}.\n"
         f"You have 3 tools: read_file, write_file, run_bash. Use them iteratively.\n"
         f"When the task is complete, respond with a final text message WITHOUT tool_use.\n"
         # F6: sin esto el agente no sabe cuanto presupuesto le queda y lo gasta por inercia.
@@ -1716,6 +1801,9 @@ async def _delegate_one_impl(
     # F3: re-lecturas y re-greps identicos pagan I/O otra vez Y re-arrastran su resultado
     # (hasta ~13K tokens) por el resto del despacho. Clave -> turno en que se vio.
     seen_calls: dict[tuple[str, str], int] = {}
+    # tool_use_id -> clave de dedup: lo que le permite a la evicción (F1b) limpiar la
+    # entrada CORRECTA de seen_calls cuando desaloja SU tool_result (§2, fix P0-1).
+    call_key_by_id: dict[str, tuple[str, str]] = {}
     deduped_calls = 0
     # Verdad de campo sobre los comandos: el runtime los EJECUTA, asi que conoce su codigo
     # de salida real. Hasta ahora esa informacion solo se le enseñaba al modelo y se perdia.
@@ -1730,9 +1818,15 @@ async def _delegate_one_impl(
     deadline = t0 + DISPATCH_TIMEOUT
 
     evicted_blocks = 0
+    # Auditoría 2026-09-24 §3: timeout default de run_bash según el backend de ESTE
+    # despacho (cloud 600 / local 120); cada llamada puede pedir más vía `timeout`.
+    bash_default_timeout = _default_bash_timeout(model)
     while turn < max_turns:
         # F1b: podar antes de armar el request, no despues — lo que se manda es lo que se cobra.
-        evicted_blocks += _evict_old_tool_results(messages, KEEP_TOOL_RESULTS)
+        evicted_blocks += _evict_old_tool_results(
+            messages, KEEP_TOOL_RESULTS,
+            seen_calls=seen_calls, call_key_by_id=call_key_by_id,
+        )
         if time.time() >= deadline:
             return {
                 "success": False,
@@ -2002,7 +2096,11 @@ async def _delegate_one_impl(
                     )
                 else:
                     seen_calls[call_key] = turn
-                    result = await _execute_tool(workdir_abs, name, args)
+                    if tu_id is not None:
+                        call_key_by_id[tu_id] = call_key
+                    result = await _execute_tool(
+                        workdir_abs, name, args, default_timeout=bash_default_timeout,
+                    )
                     if name == "run_bash":
                         # _execute_tool devuelve "exit_code: N\n--- stdout ---..."
                         bash_calls += 1
@@ -2041,15 +2139,18 @@ async def _delegate_one_impl(
                     f"puede tener cambios a medio hacer de quien te despacho."
                 )
             else:
-                # Medido en Peptides: el aviso rinde en proporcion a lo concreto que sea
-                # el comando. El despacho que siguio "commitea antes de verificar" dejo el
-                # trabajo en la rama; el que la interpreto a su manera perdio 20 minutos.
-                # Por eso se nombra el comando, no la intencion.
+                # Auditoría 2026-09-24 §6 (fix P0-4): el texto viejo ordenaba `git add -A &&
+                # git commit` DENTRO del tool_result — el mensaje más reciente, gana al
+                # system prompt — aunque el dispatch corriera sobre el árbol de OTRO, con
+                # cambios a medio hacer (lo que ebce68a dejó afuera al eximir solo por
+                # nombre de agente). Instrucción neutral para TODOS: persistir el estado
+                # con write_file y declarar qué queda. Nada de git dentro de un tool_result.
                 aviso = (
                     f"\n\n[QUEDAN {turns_left} TURNOS] PARA. No corras otra suite todavia.\n"
-                    f"Ejecuta AHORA: git add -A && git commit -m \"wip: <lo que llevas>\"\n"
-                    f"Una suite lenta consume un turno entero. Todo lo que no este commiteado "
-                    f"cuando se acaben los turnos se pierde entero."
+                    f"Persiste AHORA tu trabajo con write_file (informe/estado en un archivo "
+                    f"del workdir) y responde que quedo hecho y que falta.\n"
+                    f"Una suite lenta consume un turno entero. Lo que no persistas cuando se "
+                    f"acaben los turnos se pierde."
                 )
             last = tool_results[-1]
             last["content"] = f"{last.get('content', '')}{aviso}"
@@ -2244,11 +2345,14 @@ async def delegate_to_local_agent(
         task: Tarea concreta para el agente. Sé específico, el agente leerá ese prompt.
         workdir: Directorio de trabajo del agente (default: '.' del MCP). Recomendado pasar
                  ruta absoluta al proyecto donde trabajará.
-        max_turns: Tope de iteraciones de tool-calling (hard cap 40). Default 0 = AUTO:
-               25 para backends locales (local-*; benchmark 2026-07-03: 15 rompe tareas
-               iterativas de coding) y 25 para cloud (MiniMax M3 512K, DeepSeek, Sonnet/Opus).
-               Pasar un valor explícito lo fuerza. Para tareas cortas conocidas: 5-10.
-               Para review/análisis multi-archivo pesado en cloud: 25-30.
+        max_turns: Tope de iteraciones de tool-calling. Default 0 = AUTO: 25 para
+               backends locales (local-*/ornith; benchmark 2026-07-03: 15 rompe tareas
+               iterativas de coding — consérvalo) y 60 para cloud (DELEGATE_CLOUD_MAX_
+               TURNS; MiniMax M3 512K, DeepSeek, Sonnet/Opus). Un valor explícito se
+               respeta dentro del guard-rail DELEGATE_HARD_MAX_TURNS (default 150;
+               antes era un hard cap 40 plano que cortaba tareas reales de 90-180 tool
+               calls — auditoría 2026-09-24 §1). Para tareas cortas conocidas: 5-10.
+               Para review/análisis multi-archivo pesado en cloud: 25-60.
         model: Model alias as configured in your LiteLLM proxy (or direct provider).
                Default 'local-qwen-3-6-35b'. Override via DELEGATE_LOCAL_MODEL env var.
         max_tokens: Tope de tokens por turno del modelo. Default = 65536, EXCEPTO para
