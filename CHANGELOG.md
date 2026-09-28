@@ -354,3 +354,33 @@ Initial implementation. Not yet published.
 - Internal Anthropic-style content block normalization for uniform agent loop.
 - `delegate_to_provider` for ad-hoc routing to non-default backends.
 - Agent tool calling: `read_file`, `write_file`, `run_bash` with size/timeout caps.
+
+## T09 · conmutador de gateway (mock-only)
+
+- **Nuevo** `DELEGATE_GATEWAY=litellm|bifrost` (default `litellm`, hoy sin cambios; valor
+  desconocido = error de arranque) + `DELEGATE_BIFROST_URL`, `DELEGATE_BIFROST_VK_LOCAL` y
+  `DELEGATE_BIFROST_VK_CODE` (virtual key por carril: local/ornith → LOCAL, resto → CODE).
+  Ruta siempre `/litellm/...` (design §4.2). Volver a litellm = un env var.
+- **`response_model` ya no va vacío** (hallazgo 4): los dos lectores SSE capturan el
+  `model` del `message_start`/primer chunk, se leen las cabeceras `x-bifrost-routing-info-*`
+  y el tool devuelve `response_model` + `fallback_note` (`answered_by: X (requested Y)`)
+  cuando contesta otro modelo, además de `routing_info` y el campo en el dispatch log.
+- **`DELEGATE_RESEND_REASONING` pasa a `auto`** (hallazgo 15): replay del reasoning del
+  assistant previo solo para `deepseek-*`; `1` lo fuerza a todos y `0` lo apaga. A los
+  providers que rechazan esos campos nunca se les envían.
+- Tests con mocks: `tests/test_gateway_t09.py` (23) y suite completa en verde.
+
+### Fixed (revisión de Security sobre T09)
+
+- **Tests restaurados**: el commit de T09 borró 10 tests de `tests/test_context_pruning.py`
+  (dedup de args, json truncado, `read_file`, la que protege la API key del backend…). Vuelven
+  todos, idénticos a `main` salvo la expectativa de
+  `test_reasoning_de_turnos_pasados_no_se_reenvia_por_default`, que codificaba el default viejo
+  y ahora espera el replay de `auto` para `deepseek-*` (se conserva el nombre por historia).
+- **Suite independiente del orden**: `tests/test_gateway_t09.py` usa loop propio por test (y
+  `run_coro` ya no lee el loop global que otros ficheros dejan cerrado). En orden inverso
+  también se restauran los parches de `test_hardening.py`, que fugaban `_load_agent`.
+- **El replay del reasoning lo decide el modelo que RESPONDIÓ, no el pedido** (hallazgo 15):
+  cada turno del historial se marca con su `response_model`; si el gateway hizo fallback
+  (pedimos `deepseek-*` y contestó `glm`), el reasoning no viaja. Ruteo desconocido => no se
+  envía nada (fail-safe).

@@ -169,27 +169,34 @@ def _patch_agent():
 
 
 def test_success_gating_turn_limit():
+    # Orden-independiente: si el test falla a mitad, `_load_agent`/`_call_backend` se
+    # restauran igual. Sin esto la lambda fugada rompía
+    # test_agent_name_rejects_traversal cuando la suite corre en orden inverso.
     _patch_agent()
+    try:
+        async def always_tooluse(*a, **k):
+            return {"content": [{"type": "tool_use", "id": "1", "name": "read_file", "input": {}}],
+                    "stop_reason": "tool_use", "usage": {}}
 
-    async def always_tooluse(*a, **k):
-        return {"content": [{"type": "tool_use", "id": "1", "name": "read_file", "input": {}}],
-                "stop_reason": "tool_use", "usage": {}}
-
-    server._call_backend = always_tooluse
-    r = run_coro(server._delegate_one_impl("a", "t", model="m", max_turns=2))
-    assert r["success"] is False and r["hit_turn_limit"] and r["incomplete"], r
+        server._call_backend = always_tooluse
+        r = run_coro(server._delegate_one_impl("a", "t", model="m", max_turns=2))
+        assert r["success"] is False and r["hit_turn_limit"] and r["incomplete"], r
+    finally:
+        _restore_patches()
     print("PASS hit-turn-limit -> success=False")
 
 
 def test_success_gating_max_tokens():
     _patch_agent()
+    try:
+        async def cutoff(*a, **k):
+            return {"content": [{"type": "text", "text": "partial"}], "stop_reason": "max_tokens", "usage": {}}
 
-    async def cutoff(*a, **k):
-        return {"content": [{"type": "text", "text": "partial"}], "stop_reason": "max_tokens", "usage": {}}
-
-    server._call_backend = cutoff
-    r = run_coro(server._delegate_one_impl("a", "t", model="m", max_turns=3))
-    assert r["success"] is False and r["stop_reason"] == "max_tokens", r
+        server._call_backend = cutoff
+        r = run_coro(server._delegate_one_impl("a", "t", model="m", max_turns=3))
+        assert r["success"] is False and r["stop_reason"] == "max_tokens", r
+    finally:
+        _restore_patches()
     print("PASS max_tokens cutoff -> success=False")
 
 

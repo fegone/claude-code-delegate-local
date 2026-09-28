@@ -102,8 +102,12 @@ def test_reasoning_de_turnos_pasados_no_se_reenvia_por_default():
     )
     asst = [m for m in payload["messages"] if m.get("role") == "assistant"]
     assert asst, "debe haber un mensaje de assistant"
-    assert "reasoning_content" not in asst[0], (
-        "el reasoning de turnos completados no debe reenviarse con el default"
+    # T09 (hallazgo 15): el default pasó de False a "auto"; para deepseek-* el replay
+    # AHORA es esperado. Se conserva el test restaurado (nombre histórico) y se adapta
+    # únicamente la expectativa. El caso completo vive en
+    # test_reasoning_de_deepseek_si_se_reenvia_y_el_resto_no.
+    assert "reasoning_content" in asst[0], (
+        "con el default auto un turno respondido por deepseek SÍ recibe su reasoning"
     )
     assert asst[0].get("content") == "respuesta", "el texto sí se conserva"
 
@@ -124,6 +128,49 @@ def test_args_distintos_no_colisionan():
     assert a != b, "cambiar offset debe permitir re-leer"
 
 
+def test_reasoning_de_deepseek_si_se_reenvia_y_el_resto_no(monkeypatch):
+    """Hallazgo 15 (T09): DeepSeek EXIGE recibir su reasoning_content de vuelta al seguir
+    con tools; sin él se desincroniza. Al resto solo le cobra entrada. El default es
+    "auto": replay SOLO en deepseek-*, y DELEGATE_RESEND_REASONING sigue mandando
+    (0 lo apaga hasta en DeepSeek, 1 lo fuerza en todos)."""
+    anthropic_msgs = [
+        {"role": "user", "content": "hola"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "razonamiento largo " * 200},
+                {"type": "text", "text": "respuesta"},
+            ],
+        },
+    ]
+
+    def assistant_for(model: str) -> dict:
+        payload = server._anthropic_to_openai_request(
+            model=model,
+            system="sys",
+            messages=anthropic_msgs,
+            tools=None,
+            max_tokens=1000,
+        )
+        asst = [m for m in payload["messages"] if m.get("role") == "assistant"]
+        assert asst, "debe haber un mensaje de assistant"
+        return asst[0]
+
+    # auto (default): se lo devolvemos a deepseek-* y solo a ellos
+    deepseek = assistant_for("deepseek-v4-flash")
+    assert "reasoning_content" in deepseek, "deepseek lo exige: sin él se desincroniza"
+    assert deepseek.get("content") == "respuesta", "el texto sí se conserva"
+    assert "reasoning_content" not in assistant_for("mimo-pro"), (
+        "al resto no lo pide y con el default no se le manda"
+    )
+
+    monkeypatch.setattr(server, "RESEND_REASONING", "0")
+    assert "reasoning_content" not in assistant_for("deepseek-v4-flash")
+    monkeypatch.setattr(server, "RESEND_REASONING", "1")
+    assert "reasoning_content" in assistant_for("mimo-pro")
+
+
+
 # ------------------------------------------------- config: defaults esperados
 
 
@@ -133,7 +180,11 @@ def test_nudges_por_default_es_uno():
 
 
 def test_defaults_de_las_banderas_nuevas():
-    assert server.RESEND_REASONING is False
+    # T09: el replay de reasoning del assistant previo es `auto` — solo a deepseek-*
+    # (hallazgo 15); `1`/`0` lo fuerzan a todos/apagan. Y el conmutador por defecto
+    # sigue en litellm: hoy nada cambia.
+    assert server.RESEND_REASONING == "auto"
+    assert server.GATEWAY in server.GATEWAY_VALUES
     assert server.KEEP_TOOL_RESULTS == 6
 
 
