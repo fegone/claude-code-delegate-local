@@ -51,13 +51,40 @@ def _load_server(env: dict, name: str):
     return module
 
 
-def run_coro(coro):
-    default_loop = asyncio.get_event_loop()
-    asyncio.set_event_loop(asyncio.new_event_loop())
+@pytest.fixture(autouse=True)
+def loop_por_test():
+    """Loop propio para CADA test de este fichero (versión explícita del contrato
+    ``asyncio_mode = "auto"`` + ``asyncio_default_fixture_loop_scope = "function"`` de
+    pyproject.toml). No se comparte ningún loop global entre tests."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        return asyncio.run(coro)
+        yield loop
     finally:
-        asyncio.set_event_loop(default_loop)
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+def run_coro(coro):
+    """Corre `coro` en un loop NUEVO y aislado, nunca en el loop global del proceso.
+
+    En la suite completa, otros ficheros (los tests restaurados de
+    test_context_pruning.py usan ``asyncio.run``) dejan el loop global cerrado o en
+    None, y ``asyncio.get_event_loop()`` levantaba RuntimeError: estos 9 tests fallaban
+    solo según el ORDEN. Aquí el loop es de este test y se cierra al terminar, así que
+    el orden ya no importa.
+    """
+    try:
+        prev = asyncio.get_event_loop()
+    except RuntimeError:
+        prev = None
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        asyncio.set_event_loop(prev) if prev is not None else asyncio.set_event_loop(None)
+        loop.close()
 
 
 def _con_bifrost(monkeypatch, url: str = "http://127.0.0.1:4010/litellm/v1/messages"):
@@ -447,3 +474,139 @@ def test_politica_de_replay_default_en_arranque():
     assert mod.RESEND_REASONING == "auto"
     assert mod._should_resend_reasoning("deepseek-v4-flash") is True
     assert mod._should_resend_reasoning("glm-5-3-flash") is False
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 5b. Revisión de Security (T09): el replay lo decide quien RESPONDIÓ el turno
+# ────────────────────────────────────────────────────────────────────────────
+
+def _payload_con_procedencia(answered, requested="deepseek-v4-flash"):
+    """Convierte un histórico de un turno assistant marcado con `_answered_model`."""
+    return server._anthropic_to_openai_request(
+        [
+            {"role": "user", "content": "hola"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "razonamiento largo " * 200},
+                    {"type": "text", "text": "respuesta"},
+                ],
+                server.ANSWERED_MODEL_KEY: answered,
+            },
+        ],
+        "sys",
+        None,
+        requested,
+        1000,
+    )
+
+
+def _assistant_de(payload) -> dict:
+    msgs = [m for m in payload["messages"] if m.get("role") == "assistant"]
+    assert msgs, "debe haber un assistant"
+    return msgs[0]
+
+
+def test_replay_de_reasoning_lo_decide_el_modelo_que_respondio():
+    """Security: pedido deepseek + respondido deepseek => replay; pedido deepseek +
+    respondido glm (fallback del gateway) => NO replay."""
+    # pedido deepseek, respondido deepseek: su reasoning vuelve
+    assert "reasoning_content" in _assistant_de(
+        _payload_con_procedencia("deepseek-v4-flash")
+    )
+    # pedido deepseek, respondido glm: el gateway hizo fallback, no se le manda el campo
+    assert "reasoning_content" not in _assistant_de(
+        _payload_con_procedencia("glm-5-3-flash")
+    )
+    # y manda quien respondió, no quien se pidió: pedido glm, respondido deepseek
+    assert "reasoning_content" in _assistant_de(
+        _payload_con_procedencia("deepseek-chat", requested="glm-5-3-flash")
+    )
+    assert "reasoning_content" not in _assistant_de(
+        _payload_con_procedencia("glm-5-3-flash", requested="deepseek-v4-flash")
+    )
+
+
+def test_replay_con_ruteo_desconocido_es_fail_safe():
+    """Sin saber quién respondió no se reenvía nada: mejor no mandar un campo a quien
+    no consta que lo exija."""
+    for desconocido in (None, "", "modelo-desconocido"):
+        payload = _payload_con_procedencia(desconocido)
+        assert "reasoning_content" not in _assistant_de(payload), desconocido
+    # el fail-safe no pisa el override explícito del env var
+    assert server._should_resend_reasoning(None) is False
+    assert server._reasoning_target_for_turn(
+        {server.ANSWERED_MODEL_KEY: None}, "deepseek-v4-flash"
+    ) is None
+    # histórico sin marca (viene del cliente): se sigue decidiendo con el modelo pedido
+    payload = server._anthropic_to_openai_request(
+        [
+            {"role": "user", "content": "hola"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "razonamiento largo " * 200},
+                    {"type": "text", "text": "respuesta"},
+                ],
+            },
+        ],
+        "sys",
+        None,
+        "deepseek-v4-flash",
+        1000,
+    )
+    assert "reasoning_content" in _assistant_de(payload)
+
+
+def test_el_bucle_marca_quien_respondio_cada_turno(monkeypatch, tmp_path):
+    """Integración: pedimos deepseek, el gateway contesta glm; el assistant que queda en
+    el historial se marca con glm y por eso el siguiente payload no lleva reasoning."""
+    vistos: list[list[dict]] = []
+
+    async def _fake(messages, system, model, tools=None, max_tokens=65536, url=None, key=None):
+        vistos.append([dict(m) for m in messages])
+        if len(vistos) == 1:
+            return {
+                "content": [
+                    {"type": "thinking", "thinking": "pienso mucho " * 200},
+                    {"type": "text", "text": "vamos"},
+                    {"type": "tool_use", "id": "t1", "name": "read_file",
+                     "input": {"path": "x"}},
+                ],
+                "stop_reason": "tool_use",
+                "usage": {},
+                "model": "glm-5-3-flash",  # fallback: pedimos deepseek y contestó glm
+            }
+        return {
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {},
+            "model": "glm-5-3-flash",
+        }
+
+    async def _fake_tool(*args, **kwargs):
+        return "resultado"
+
+    monkeypatch.setattr(server, "_call_backend", _fake)
+    monkeypatch.setattr(server, "_execute_tool", _fake_tool)
+    monkeypatch.setattr(
+        server, "_load_agent", lambda name, workdir=None: ({}, "body", "global")
+    )
+    run_coro(
+        server._delegate_one_impl(
+            "a", "hola", workdir=str(tmp_path), model="deepseek-v4-flash"
+        )
+    )
+
+    assert len(vistos) >= 2, "el turno con tool_use debe provocar una segunda llamada"
+    turnos = [m for m in vistos[-1] if m.get("role") == "assistant"]
+    assert turnos, "el historial de la segunda llamada lleva el turno anterior"
+    assert turnos[0][server.ANSWERED_MODEL_KEY] == "glm-5-3-flash"
+    payload = server._anthropic_to_openai_request(
+        vistos[-1], "sys", None, "deepseek-v4-flash", 65536
+    )
+    historial = [m for m in payload["messages"] if m.get("role") == "assistant"]
+    assert historial, "debe estar el assistant del turno anterior"
+    assert "reasoning_content" not in historial[0], (
+        "el reasoning de un turno respondido por glm no se le reenvía a nadie"
+    )

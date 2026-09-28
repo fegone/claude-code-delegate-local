@@ -176,6 +176,30 @@ def _should_resend_reasoning(model: str | None) -> bool:
     if RESEND_REASONING in ("0", "false", "no", "never"):
         return False
     return _is_deepseek_model(model)
+
+
+# T09 (hallazgo 15, revisión de Security): el replay del reasoning lo decide el modelo que
+# RESPONDIÓ el turno, no el que se pidió. El bucle agéntico marca cada mensaje assistant con
+# el `response_model`/`_served` real de ese turno; si el gateway hizo fallback (pedimos
+# deepseek y contestó glm), devolverle el reasoning a glm es mandarle un campo que no pidió.
+ANSWERED_MODEL_KEY = "_answered_model"
+# Marca ausente = mensaje que no viene del bucle (histórico del cliente): se decide con el
+# modelo pedido, como antes de este cambio.
+_NO_PROVENANCE = object()
+
+
+def _reasoning_target_for_turn(msg: dict, requested_model: str | None) -> str | None:
+    """Modelo al que pertenece el reasoning de este turno del historial.
+
+    Con ``_answered_model`` presente se usa ese valor tal cual: si está vacío/None (ruteo
+    desconocido) devuelve None y ``_should_resend_reasoning(None)`` no reenvía nada —
+    fail-safe: mejor no mandar un campo a quien no consta que lo exija.
+    Sin la marca (histórico ajeno al bucle) se cae al modelo pedido.
+    """
+    answered = msg.get(ANSWERED_MODEL_KEY, _NO_PROVENANCE)
+    if answered is _NO_PROVENANCE:
+        return requested_model
+    return answered or None
 # F1b: cuantos tool_result recientes se mandan integros. Los mas viejos se reemplazan por
 # una linea que dice que existieron. 0 desactiva el desalojo.
 KEEP_TOOL_RESULTS = int(os.getenv("DELEGATE_KEEP_TOOL_RESULTS", "6"))
@@ -1367,7 +1391,12 @@ def _anthropic_to_openai_request(
             # turnos con tools, si no se desincroniza; al resto solo le cobra entrada (los
             # thinking son 5-30K tokens por turno). `_should_resend_reasoning` aplica la
             # política DELEGATE_RESEND_REASONING (auto = solo deepseek-*, 1 = todos, 0 = nadie).
-            if reasoning_joined and _should_resend_reasoning(model):
+            # T09 (revisión de Security): se decide con el modelo que RESPONDIÓ ese turno
+            # (`_answered_model`), no con el pedido. Un fallback de deepseek a glm ya no
+            # recibe el reasoning de deepseek.
+            if reasoning_joined and _should_resend_reasoning(
+                _reasoning_target_for_turn(msg, model)
+            ):
                 asst["reasoning_content"] = reasoning_joined
             if tool_calls:
                 asst["tool_calls"] = tool_calls
@@ -2148,6 +2177,12 @@ async def _delegate_one_impl(
             or served.get("x-bifrost-resolved-model")
             or response_model
         )
+        # T09 (revisión de Security): quién RESPONDIÓ este turno, sin arrastrar el valor del
+        # turno anterior. Es lo que decide si su reasoning viaja en el próximo payload del
+        # historial. Sin dato (ruteo desconocido) queda None => no se reenvía (fail-safe).
+        answered_model = (
+            resp.get("model") or served.get("x-bifrost-resolved-model") or None
+        )
         usage = resp.get("usage", {})
         total_in += usage.get("input_tokens", 0)
         total_out += usage.get("output_tokens", 0)
@@ -2204,7 +2239,11 @@ async def _delegate_one_impl(
             if can_nudge and nudges < MAX_COMPLETION_NUDGES and turn < max_turns:
                 nudges += 1
                 awaiting_nudge_reply = True
-                messages.append({"role": "assistant", "content": content})
+                messages.append({
+                    "role": "assistant",
+                    "content": content,
+                    ANSWERED_MODEL_KEY: answered_model,
+                })
                 messages.append({"role": "user", "content": NUDGE_TEXT})
                 continue
             break  # finished, or out of nudges
@@ -2227,7 +2266,11 @@ async def _delegate_one_impl(
             )
             break
 
-        messages.append({"role": "assistant", "content": content})
+        messages.append({
+            "role": "assistant",
+            "content": content,
+            ANSWERED_MODEL_KEY: answered_model,
+        })
         tool_results = []
         for tu in tool_uses:
             # El deadline del despacho también acota la ejecución de tools: sin este
