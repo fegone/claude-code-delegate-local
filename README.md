@@ -251,3 +251,25 @@ Validation tasks: SQL injection review (security-engineer agent), HTML calculato
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Conmutador de gateway (T09)
+
+`DELEGATE_GATEWAY` decide por dónde sale el tráfico del delegate. **Un solo env var para
+cambiar y otro para volver: hoy el default es `litellm` y nada cambia.**
+
+| Env var | Default | Descripción |
+| --- | --- | --- |
+| `DELEGATE_GATEWAY` | `litellm` | `litellm` (usa `DELEGATE_LOCAL_URL`, comportamiento actual) o `bifrost` (`DELEGATE_BIFROST_URL`). Un valor desconocido es **error de arranque**. Volver = quitar el env var. |
+| `DELEGATE_BIFROST_URL` | — | Solo con `bifrost`: base URL de Bifrost. La ruta sale siempre `/litellm/...` (design §4.2), p. ej. `http://127.0.0.1:4010/litellm/v1/messages`. |
+| `DELEGATE_BIFROST_VK_LOCAL` | — | Virtual key del carril **local** con bifrost: alias `local-*` y `ornith*`. |
+| `DELEGATE_BIFROST_VK_CODE` | — | Virtual key del carril de **código** con bifrost: todo lo demás (deepseek, glm, qwen, mimo…). |
+
+Además (T09):
+
+- **`response_model` real**: los dos lectores SSE capturan el `model` del `message_start`
+  / primer chunk y, con bifrost, las cabeceras `x-bifrost-routing-info-*`. Si el que
+  contestó no es el alias pedido, el resultado del tool lleva la nota visible
+  `fallback_note` = `answered_by: deepseek-flash (requested glm-5-3-flash)` (hallazgo 4).
+- **`DELEGATE_RESEND_REASONING`** (hallazgo 15): `auto` (default) = reenviar el
+  `reasoning_content` del assistant previo **solo** a `deepseek-*` (que lo exige); `1` =
+  a todos; `0` = a nadie. A los providers que lo rechazan nunca se le manda.

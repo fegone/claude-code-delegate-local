@@ -49,6 +49,40 @@ AGENTS_DIR = pathlib.Path(
 )
 LITELLM_URL = os.getenv("DELEGATE_LOCAL_URL", "http://localhost:4000/v1/messages")
 LITELLM_KEY = os.getenv("DELEGATE_LOCAL_KEY", "")  # inyectado vía env desde Claude Code MCP config
+
+# T09 · Conmutador de gateway (design §4.2, puntos 1-3; plan T09). UN env var para cambiar
+# de orígen y otro para volver: `litellm` (default) no cambia absolutamente nada de lo que
+# ya funciona hoy; `bifrost` toma el base URL de DELEGATE_BIFROST_URL y la autenticación de
+# las virtual keys por carril. El resto del server (formato, streaming, caché, nudge, log)
+# no se entera: el conmutador decide solo la URL y la key del despacho.
+GATEWAY_LITELLM = "litellm"
+GATEWAY_BIFROST = "bifrost"
+GATEWAY_VALUES = (GATEWAY_LITELLM, GATEWAY_BIFROST)
+
+
+def _gateway_from_env(raw: str | None) -> str:
+    """Valida DELEGATE_GATEWAY. Un valor desconocido es error de ARRANQUE, no un fallback
+    silencioso: es mejor caer aquí que despachar un día entero al gateway equivocado sin
+    que nadie se dé cuenta."""
+    val = (raw or GATEWAY_LITELLM).strip().lower()
+    if not val:
+        return GATEWAY_LITELLM
+    if val not in GATEWAY_VALUES:
+        raise ValueError(
+            f"DELEGATE_GATEWAY desconocido: {raw!r} (validos: {' | '.join(GATEWAY_VALUES)})"
+        )
+    return val
+
+
+GATEWAY = _gateway_from_env(os.getenv("DELEGATE_GATEWAY"))
+# Solo se exigen con el gateway bifrost; con litellm ni se miran.
+BIFROST_URL = os.getenv("DELEGATE_BIFROST_URL", "").strip()
+# Virtual keys por carril (design §4.2): local/ornith → LOCAL; el resto (código en la
+# nube) → CODE. Los aliases openai-* que en realidad son deepseek van al carril de código.
+BIFROST_VK_LOCAL = os.getenv("DELEGATE_BIFROST_VK_LOCAL", "").strip()
+BIFROST_VK_CODE = os.getenv("DELEGATE_BIFROST_VK_CODE", "").strip()
+if GATEWAY == GATEWAY_BIFROST and not BIFROST_URL:
+    raise ValueError("DELEGATE_GATEWAY=bifrost exige DELEGATE_BIFROST_URL (design §4.2)")
 DEFAULT_MODEL = os.getenv("DELEGATE_LOCAL_MODEL", "local-qwen-3-6-35b")
 # Optional: auto-route coding agents to a coder-tuned alias when the caller does
 # NOT pass model explicitly (i.e., model still == DEFAULT_MODEL). OPT-IN — defaults
@@ -116,9 +150,32 @@ MAX_COMPLETION_NUDGES = int(os.getenv("DELEGATE_MAX_NUDGES", "1"))
 # without it, Anthropic-format backends reprocess the entire growing conversation on every
 # turn of an agentic loop.
 DELEGATE_PROMPT_CACHING = os.getenv("DELEGATE_PROMPT_CACHING", "1") not in ("0", "false", "False")
-# F1a: reenviar el reasoning de turnos pasados solo infla la entrada — el provider no lo
-# reaprovecha, solo lo cobra. Off por defecto; ponlo a 1 si un backend llegara a exigirlo.
-RESEND_REASONING = os.getenv("DELEGATE_RESEND_REASONING", "0") in ("1", "true", "True")
+# F1a/T09 (hallazgo 15): a quién se le reenvía el reasoning de los turnos pasados.
+#   - "auto" (default): solo a los providers que lo EXIGEN (deepseek-*: si no se le
+#     devuelve su reasoning_content al continuar con tools, se desincroniza con él).
+#   - "1": a todos (el override original de F1a).
+#   - "0": a nadie: donde no lo piden solo infla la entrada.
+# En "auto" NUNCA se manda a quien lo rechaza; solo deepseek-* lo necesita.
+RESEND_REASONING = os.environ.get("DELEGATE_RESEND_REASONING", "auto").strip().lower()
+
+
+def _is_deepseek_model(model: str | None) -> bool:
+    """DeepSeek exige que se le reenvíe su reasoning_content previo (hallazgo 15)."""
+    return str(model or "").lower().startswith("deepseek")
+
+
+def _should_resend_reasoning(model: str | None) -> bool:
+    """¿Se le manda al provider el reasoning de los turnos anteriores?
+
+    DELEGATE_RESEND_REASONING: "auto" (default) = solo a quien lo necesita (deepseek-*),
+    "1" = a todos, "0" = a nadie. Un valor desconocido cae en auto: mejor no mandar un
+    campo a quien lo rechaza que caer en desincronización con quien lo exige.
+    """
+    if RESEND_REASONING in ("1", "true", "yes", "always"):
+        return True
+    if RESEND_REASONING in ("0", "false", "no", "never"):
+        return False
+    return _is_deepseek_model(model)
 # F1b: cuantos tool_result recientes se mandan integros. Los mas viejos se reemplazan por
 # una linea que dice que existieron. 0 desactiva el desalojo.
 KEEP_TOOL_RESULTS = int(os.getenv("DELEGATE_KEEP_TOOL_RESULTS", "6"))
@@ -630,6 +687,68 @@ def _is_local_backend(model: str | None) -> bool:
     return m.startswith("local-") or m.startswith("ornith")
 
 
+def _bifrost_endpoint() -> str:
+    """DELEGATE_BIFROST_URL convertido en endpoint de mensajes. La rama Anthropic usa la
+    URL tal cual y la rama OpenAI la deriva con `_derive_base` (corta en `/v1/` y deja
+    `.../litellm` → `.../litellm/v1/chat/completions`, auditoría §2.6 / design §4.2), así
+    que la ruta es siempre `/litellm/...` y nunca `/anthropic/...`."""
+    if not BIFROST_URL:
+        raise ValueError("DELEGATE_GATEWAY=bifrost exige DELEGATE_BIFROST_URL (design §4.2)")
+    base = BIFROST_URL.rstrip("/")
+    if base.endswith("/v1/messages"):
+        return base
+    if base.endswith("/litellm"):
+        return f"{base}/v1/messages"
+    return f"{base}/litellm/v1/messages"
+
+
+def _gateway_for(
+    model: str | None, url: str | None = None, key: str | None = None
+) -> tuple[str, str]:
+    """(endpoint, key) a los que va ESTE despacho según DELEGATE_GATEWAY (design §2.3).
+
+    - `url`/`key` explícitos por despacho (`delegate_to_provider`) mandan sobre el
+      conmutador: quien pide un backend propio lo recibe tal cual.
+    - `litellm` (default): LITELLM_URL/LITELLM_KEY, idéntico a antes del T09.
+    - `bifrost`: DELEGATE_BIFROST_URL + virtual key del carril — `local-*`/`ornith*` →
+      DELEGATE_BIFROST_VK_LOCAL, todo lo demás → DELEGATE_BIFROST_VK_CODE.
+    """
+    if GATEWAY == GATEWAY_BIFROST and not url:
+        lane = BIFROST_VK_LOCAL if _is_local_backend(model) else BIFROST_VK_CODE
+        return _bifrost_endpoint(), lane if key is None else key
+    return url if url else LITELLM_URL, key if key is not None else LITELLM_KEY
+
+
+def _served_from_headers(headers: object) -> dict[str, str]:
+    """Cabeceras con las que Bifrost dice QUIÉN contestó de verdad (design §4.2, punto 4):
+    `x-bifrost-provider`, `x-bifrost-resolved-model` y cualquier `x-bifrost-routing-info-*`.
+    En LiteLLM no existen y sale vacío, así que hoy no cambia nada."""
+    try:
+        items = list(headers.items())  # type: ignore[union-attr]
+    except Exception:
+        return {}
+    served: dict[str, str] = {}
+    for k, v in items:
+        lk = str(k).lower()
+        if lk.startswith("x-bifrost-routing-info") or lk in (
+            "x-bifrost-provider",
+            "x-bifrost-resolved-model",
+        ):
+            served[lk] = str(v)
+    return served
+
+
+def _answered_by_note(requested: str | None, answered: str | None) -> str | None:
+    """`answered_by: deepseek-flash (requested glm-5-3-flash)` cuando el que contestó NO es
+    el alias pedido, None cuando coinciden o cuando no sabemos quién contestó (hallazgo 4:
+    un fallback del gateway/proxy nunca más queda escondido)."""
+    req = str(requested or "").strip()
+    ans = str(answered or "").strip()
+    if not req or not ans or ans.casefold() == req.casefold():
+        return None
+    return f"answered_by: {ans} (requested {req})"
+
+
 def _default_bash_timeout(model: str | None) -> int:
     """Timeout default de run_bash para el backend de ESTE despacho.
 
@@ -903,7 +1022,7 @@ _LOG_PATH = pathlib.Path(
 )
 _LOG_MAX_BYTES = int(os.getenv("DELEGATE_LOG_MAX_BYTES", str(8 * 1024 * 1024)))
 _LOG_FIELDS = (
-    "success", "model", "response_model", "terminal_text", "agent_name", "agent_source",
+    "success", "model", "response_model", "fallback_note", "terminal_text", "agent_name", "agent_source",
     "turns", "max_turns", "tool_calls", "malformed_calls", "deduped_calls",
     "evicted_tool_results", "nudges", "resumed_after_nudge", "elapsed_s",
     "tokens_in", "tokens_out", "cache_read_tokens", "cache_creation_tokens",
@@ -1244,11 +1363,11 @@ def _anthropic_to_openai_request(
             text_joined = "\n".join(t for t in text_parts if t)
             asst["content"] = text_joined or None
             reasoning_joined = "\n".join(r for r in reasoning_parts if r)
-            # F1a: el reasoning de turnos YA COMPLETADOS se cobra como entrada y no se
-            # reaprovecha (DeepSeek lo documenta). En modelos thinking son 5-30K tokens por
-            # turno que vuelven a viajar en cada request posterior. Se puede reactivar con
-            # DELEGATE_RESEND_REASONING=1 si algun provider llegara a exigirlo.
-            if reasoning_joined and RESEND_REASONING:
+            # Hallazgo 15 / F1a: a DeepSeek hay que devolverle su reasoning_content en los
+            # turnos con tools, si no se desincroniza; al resto solo le cobra entrada (los
+            # thinking son 5-30K tokens por turno). `_should_resend_reasoning` aplica la
+            # política DELEGATE_RESEND_REASONING (auto = solo deepseek-*, 1 = todos, 0 = nadie).
+            if reasoning_joined and _should_resend_reasoning(model):
                 asst["reasoning_content"] = reasoning_joined
             if tool_calls:
                 asst["tool_calls"] = tool_calls
@@ -1314,7 +1433,7 @@ def _openai_to_anthropic_response(openai_resp: dict) -> dict:
     usage = openai_resp.get("usage", {})
     prompt_toks = usage.get("prompt_tokens", 0)
     cached_toks = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-    return {
+    out = {
         "content": content,
         "stop_reason": stop_map.get(finish, finish or "unknown"),
         "usage": {
@@ -1326,6 +1445,11 @@ def _openai_to_anthropic_response(openai_resp: dict) -> dict:
             "cache_read_input_tokens": cached_toks,
         },
     }
+    # Hallazgo 4: el `model` que dijo el provider. Sin esto el loop devuelve siempre un
+    # response_model vacío (streaming es el default) y un fallback pasa desapercibido.
+    if openai_resp.get("model"):
+        out["model"] = openai_resp["model"]
+    return out
 
 
 # Streaming al backend (default ON). Con stream:true el read-timeout de httpx aplica
@@ -1388,6 +1512,7 @@ async def _consume_anthropic_stream(response: httpx.Response) -> dict:
     partial_json: dict[int, list[str]] = {}
     usage: dict[str, int] = {}
     stop_reason = "unknown"
+    model: str | None = None
 
     def _block(idx: int) -> dict:
         while len(content) <= idx:
@@ -1397,7 +1522,12 @@ async def _consume_anthropic_stream(response: httpx.Response) -> dict:
     async for ev in _iter_sse_data(response):
         etype = ev.get("type")
         if etype == "message_start":
-            for k, v in ((ev.get("message") or {}).get("usage") or {}).items():
+            msg0 = ev.get("message") or {}
+            # Hallazgo 4: el `model` real llega en el primer evento del stream; antes se
+            # tiraba aquí y response_model volvía siempre vacío con streaming activado.
+            if isinstance(msg0.get("model"), str) and msg0["model"]:
+                model = msg0["model"]
+            for k, v in (msg0.get("usage") or {}).items():
                 if isinstance(v, int):
                     usage[k] = v
         elif etype == "content_block_start":
@@ -1443,11 +1573,14 @@ async def _consume_anthropic_stream(response: httpx.Response) -> dict:
             content[idx]["input"] = json.loads(raw) if raw.strip() else {}
         except json.JSONDecodeError:
             content[idx]["input"] = {}
-    return {
+    out = {
         "content": [b for b in content if b.get("type")],
         "stop_reason": stop_reason,
         "usage": usage,
     }
+    if model:
+        out["model"] = model
+    return out
 
 
 async def _consume_openai_stream(response: httpx.Response) -> dict:
@@ -1458,6 +1591,7 @@ async def _consume_openai_stream(response: httpx.Response) -> dict:
     tool_calls: dict[int, dict] = {}
     finish_reason = None
     usage: dict = {}
+    model: str | None = None
 
     async for ev in _iter_sse_data(response):
         if ev.get("error"):
@@ -1468,6 +1602,10 @@ async def _consume_openai_stream(response: httpx.Response) -> dict:
             )
         if isinstance(ev.get("usage"), dict):
             usage = ev["usage"]
+        # Hallazgo 4: cada chunk OpenAI trae `model` (en el primer chunk es el que
+        # importa; después de un continue por chunk sin choices ya no se leería).
+        if isinstance(ev.get("model"), str) and ev["model"]:
+            model = ev["model"]
         choices = ev.get("choices") or []
         if not choices:
             continue
@@ -1499,10 +1637,13 @@ async def _consume_openai_stream(response: httpx.Response) -> dict:
         message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
     # finish_reason=None (stream cortado sin evento final) se queda None → el mapper
     # lo reporta como "unknown" en vez de fingir un end_turn limpio sobre texto truncado.
-    return {
+    out = {
         "choices": [{"message": message, "finish_reason": finish_reason}],
         "usage": usage,
     }
+    if model:
+        out["model"] = model
+    return out
 
 
 async def _raise_for_status_streamed(response: httpx.Response) -> None:
@@ -1649,14 +1790,23 @@ async def _call_backend(
       - resto (bedrock-*, local-qwen-*, etc.) → /v1/messages (Anthropic)
     Devuelve estructura Anthropic-like en ambos casos para que el loop sea uniforme.
     Con DELEGATE_STREAMING (default) consume el backend por SSE y acumula localmente.
+    DELEGATE_GATEWAY (T09) elige el gateway: `litellm` (default, LITELLM_URL/KEY) o
+    `bifrost` (DELEGATE_BIFROST_URL + virtual key del carril, ver `_gateway_for`).
 
     `url`/`key` se pasan EXPLÍCITAMENTE por dispatch (default = globals LITELLM_URL/KEY).
     Antes se mutaban globals para rutear a otro provider — una carrera bajo concurrencia
     (delegate_batch, delegate_to_provider) podía cruzar la key de un request con la URL de
     otro. Ahora son parámetros locales, nunca estado compartido.
     """
-    endpoint = url if url else LITELLM_URL
-    eff_key = key if key is not None else LITELLM_KEY
+    # T09 · aquí DELEGATE_GATEWAY decide URL y virtual key del carril; el resto del
+    # despacho (formato, streaming, caché, log) no se entera. Ver `_gateway_for`.
+    endpoint, eff_key = _gateway_for(model, url=url, key=key)
+    if isinstance(endpoint, str) and not endpoint.startswith("http"):
+        # Un base URL sin esquema no sirve. En bifrost es error de config: caer en
+        # silencio al otro gateway sería exactamente lo que el conmutador evita.
+        if GATEWAY == GATEWAY_BIFROST and not url:
+            raise ValueError(f"DELEGATE_BIFROST_URL sin esquema http(s): {BIFROST_URL!r}")
+        endpoint = LITELLM_URL
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if eff_key:
         headers["x-api-key"] = eff_key
@@ -1681,11 +1831,21 @@ async def _call_backend(
             payload["stream_options"] = {"include_usage": True}
             async with client.stream("POST", oai_url, json=payload, headers=headers) as r:
                 await _raise_for_status_streamed(r)
+                # Las cabeceras de enrutado solo existen ANTES de consumir el body
+                # (design §4.2, punto 4): quién resolvió de verdad el gateway.
+                served = _served_from_headers(r.headers)
                 openai_resp = await _consume_openai_stream(r)
-            return _openai_to_anthropic_response(openai_resp)
+            out = _openai_to_anthropic_response(openai_resp)
+            if served:
+                out["_served"] = served
+            return out
         r = await client.post(oai_url, json=payload, headers=headers)
         r.raise_for_status()
-        return _openai_to_anthropic_response(r.json())
+        out = _openai_to_anthropic_response(r.json())
+        served = _served_from_headers(r.headers)
+        if served:
+            out["_served"] = served
+        return out
     else:
         # Anthropic format → /v1/messages
         headers["anthropic-version"] = "2023-06-01"
@@ -1702,10 +1862,18 @@ async def _call_backend(
             payload["stream"] = True
             async with client.stream("POST", endpoint, json=payload, headers=headers) as r:
                 await _raise_for_status_streamed(r)
-                return await _consume_anthropic_stream(r)
+                served = _served_from_headers(r.headers)
+                out = await _consume_anthropic_stream(r)
+            if served:
+                out["_served"] = served
+            return out
         r = await client.post(endpoint, json=payload, headers=headers)
         r.raise_for_status()
-        return r.json()
+        resp = r.json()
+        served = _served_from_headers(r.headers)
+        if served and isinstance(resp, dict):
+            resp["_served"] = served
+        return resp
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -1806,6 +1974,9 @@ async def _delegate_one_impl(
     # los dos no cambia todavia el veredicto: deja medirlo (`terminal_text` en el log).
     terminal_text = ""
     response_model: str | None = None
+    # Cabeceras x-bifrost-* de la última respuesta (design §4.2, punto 4): qué proveedor
+    # resolvió el gateway. Vacío con LiteLLM — ahí esas cabeceras no existen.
+    routing_info: dict[str, str] = {}
     stop_reason = "unknown"
     nudges = 0
     resumed_after_nudge = False
@@ -1969,7 +2140,14 @@ async def _delegate_one_impl(
         # fallbacks (glm -> glm-think -> deepseek) sin decirselo a nadie, y hasta ahora
         # devolviamos el alias que el llamante PIDIO. Comparar dos modelos midiendo uno
         # solo es facilisimo si este campo no existe.
-        response_model = resp.get("model") or response_model
+        served = resp.get("_served") or {}
+        if served and not routing_info:
+            routing_info = served
+        response_model = (
+            resp.get("model")
+            or served.get("x-bifrost-resolved-model")
+            or response_model
+        )
         usage = resp.get("usage", {})
         total_in += usage.get("input_tokens", 0)
         total_out += usage.get("output_tokens", 0)
@@ -2187,6 +2365,10 @@ async def _delegate_one_impl(
         # mean the dispatch produced nothing usable → not a success.
         or not final_text.strip()
     )
+    # Hallazgo 4 (design §4.2): si contestó OTRO modelo que el alias pedido, la nota sale
+    # a la vista en el resultado y en el dispatch log. Un fallback del proxy/gateway nunca
+    # más queda escondido.
+    fallback_note = _answered_by_note(model, response_model)
 
     return {
         "success": not incomplete,
@@ -2198,6 +2380,10 @@ async def _delegate_one_impl(
         # cadena de fallbacks, los dos no coinciden y hasta ahora no habia forma de
         # saberlo desde aqui.
         "response_model": response_model,
+        # "answered_by: deepseek-flash (requested glm-5-3-flash)" solo si hubo fallback.
+        "fallback_note": fallback_note,
+        # Quién resolvió el gateway (cabeceras x-bifrost-*), None con LiteLLM.
+        "routing_info": routing_info or None,
         # False = el ultimo turno no trajo texto y `final_response` sale de uno
         # anterior. Hoy eso aun cuenta como exito; se registra para medir cuanto pasa
         # antes de cambiar el veredicto.

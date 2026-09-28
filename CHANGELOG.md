@@ -354,3 +354,18 @@ Initial implementation. Not yet published.
 - Internal Anthropic-style content block normalization for uniform agent loop.
 - `delegate_to_provider` for ad-hoc routing to non-default backends.
 - Agent tool calling: `read_file`, `write_file`, `run_bash` with size/timeout caps.
+
+## T09 · conmutador de gateway (mock-only)
+
+- **Nuevo** `DELEGATE_GATEWAY=litellm|bifrost` (default `litellm`, hoy sin cambios; valor
+  desconocido = error de arranque) + `DELEGATE_BIFROST_URL`, `DELEGATE_BIFROST_VK_LOCAL` y
+  `DELEGATE_BIFROST_VK_CODE` (virtual key por carril: local/ornith → LOCAL, resto → CODE).
+  Ruta siempre `/litellm/...` (design §4.2). Volver a litellm = un env var.
+- **`response_model` ya no va vacío** (hallazgo 4): los dos lectores SSE capturan el
+  `model` del `message_start`/primer chunk, se leen las cabeceras `x-bifrost-routing-info-*`
+  y el tool devuelve `response_model` + `fallback_note` (`answered_by: X (requested Y)`)
+  cuando contesta otro modelo, además de `routing_info` y el campo en el dispatch log.
+- **`DELEGATE_RESEND_REASONING` pasa a `auto`** (hallazgo 15): replay del reasoning del
+  assistant previo solo para `deepseek-*`; `1` lo fuerza a todos y `0` lo apaga. A los
+  providers que rechazan esos campos nunca se les envían.
+- Tests con mocks: `tests/test_gateway_t09.py` (20) y suite completa en verde.
