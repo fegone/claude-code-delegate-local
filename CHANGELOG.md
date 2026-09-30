@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (2026-09-30 — Codex default is `gpt-6-luna` at effort `low`)
+
+Bench of 48 runs (4 coding tasks with hidden tests, from a one-file bugfix to a DST-aware cron
+parser, 3 reps each): luna-low scored the same as sol-low and sol-medium (94-100%), was 3.2x
+faster than sol-low and 5.6x faster than sol-medium, and used the fewest tokens; `medium` never
+beat `low` for either model. Defaults are overridable with `DELEGATE_CODEX_MODEL` and
+`DELEGATE_CODEX_EFFORT`. Escalation (by hand, visible): luna low, then sol low, then sol medium.
+
+### Added (2026-09-30 — `effort` parameter for `delegate_to_codex`)
+
+New `effort` argument (`low`, `medium`, `high`, `xhigh`, `max`; empty = `~/.codex/config.toml`
+default) passed to Codex as `-c model_reasoning_effort="..."` before the `--` terminator. Invalid
+values fail before launching. Command construction moved to the pure helper `_codex_cmd`. Result
+dicts report `effort`. Docstring fixed: `terra` → `gpt-6-sol`, quota is weekly on Felix's plan.
+Sol at low does not reason on trivial tasks (measured 2026-09-30).
+
 ### Changed (2026-09-30 — Codex catalog: gpt-6.1-sol is the new default)
 
 Codex model list synced with the live ChatGPT Plus catalog (codex-cli 0.159.2). Default is now
