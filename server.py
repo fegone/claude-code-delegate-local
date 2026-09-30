@@ -2911,7 +2911,7 @@ async def local_backend_status() -> dict:
 ## Privacy: cloud model → never use for projects with sensitive/regulated data (PHI/PII).
 ## ────────────────────────────────────────────────────────────────────────────────
 CODEX_BIN = os.environ.get("DELEGATE_CODEX_BIN", "codex")
-CODEX_DEFAULT_MODEL = os.environ.get("DELEGATE_CODEX_MODEL", "gpt-5.6-sol")
+CODEX_DEFAULT_MODEL = os.environ.get("DELEGATE_CODEX_MODEL", "gpt-6.1-sol")
 # 'danger-full-access' lets Codex run with no sandbox — gated behind an explicit env flag
 # so a routine dispatch can't request it.
 CODEX_ALLOW_DANGER = os.getenv("DELEGATE_CODEX_ALLOW_DANGER", "0").lower() in ("1", "true", "yes")
@@ -2945,19 +2945,31 @@ async def _drain_capped(stream: asyncio.StreamReader, cap_bytes: int) -> bytes:
 # primer GPT-6, no un sabor de 5.6, y por eso el id NO sigue el patrón "gpt-5.6-*".
 # 💰 Razona mucho por defecto: 5.475 tokens para contestar "ASTRA-OK". En trabajo
 # real come bastante más cuota que sol; no es el default de nada.
+# Catálogo actualizado el 2026-09-30 con el catálogo vivo de un ChatGPT Plus
+# (codex-cli 0.159.2). gpt-6.1-sol es el caballo de batalla actual y el default.
+# ⚠️ Los ids gpt-6.1-* EXIGEN codex-cli >= 0.159: una CLI anterior no los conoce y
+# falla. Se comprueba antes de lanzar (ver _codex_version_error); no se auto-actualiza.
+# Generaciones: 6.1-sol (actual) · 6-astra (frontier) · 6-sol (anterior) · 6-luna
+# (rápido y barato) · 5.6-* (viejos) · 5.5/5.4 (legacy). Los ids ocultos del catálogo
+# (reservas internas y el revisor automático) no se exponen a propósito.
 CODEX_PLAN_MODELS = {
-    "gpt-6-astra",
+    "gpt-6.1-sol",
+    "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
 }
-# Alias cortos → id real del modelo. Permite delegar diciendo solo "sol"/"terra"/"luna".
+# Alias cortos → id real del modelo. Permite delegar diciendo solo "sol"/"astra"/"luna".
+# 'terra' sigue en 5.6: no existe un terra más nuevo.
 CODEX_MODEL_ALIASES = {
+    "sol": "gpt-6.1-sol",
+    "6.1-sol": "gpt-6.1-sol",
+    "6-sol": "gpt-6-sol",
     "astra": "gpt-6-astra",
     "gpt-6-astra": "gpt-6-astra",
     "6-astra": "gpt-6-astra",
-    "sol": "gpt-5.6-sol",
+    "luna": "gpt-6-luna",
+    "6-luna": "gpt-6-luna",
     "terra": "gpt-5.6-terra",
-    "luna": "gpt-5.6-luna",
     "5.6-sol": "gpt-5.6-sol",
     "5.6-terra": "gpt-5.6-terra",
     "5.6-luna": "gpt-5.6-luna",
@@ -2965,6 +2977,9 @@ CODEX_MODEL_ALIASES = {
     "5.4": "gpt-5.4",
     "5.4-mini": "gpt-5.4-mini",
 }
+# Versión mínima de codex-cli por prefijo de modelo.
+CODEX_MIN_VERSION = {"gpt-6.1-": (0, 159)}
+_codex_version_cache: tuple | None = None
 
 
 def _resolve_codex_model(model: str) -> str:
@@ -2972,6 +2987,44 @@ def _resolve_codex_model(model: str) -> str:
     if not isinstance(model, str):
         return model
     return CODEX_MODEL_ALIASES.get(model.strip().lower(), model)
+
+
+async def _codex_installed_version() -> tuple | None:
+    """(major, minor, patch) de `codex --version`, cacheado; None si no se puede leer."""
+    global _codex_version_cache
+    if _codex_version_cache is not None:
+        return _codex_version_cache
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            CODEX_BIN, "--version",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=_child_env(("CODEX_HOME",)),
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+    except (FileNotFoundError, asyncio.TimeoutError, OSError):
+        return None
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", out.decode("utf-8", "replace"))
+    if not m:
+        return None
+    _codex_version_cache = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+    return _codex_version_cache
+
+
+async def _codex_version_error(model: str) -> str | None:
+    """Mensaje de error si la CLI instalada es demasiado vieja para `model`, o None.
+    Si la versión no se puede leer no se bloquea: que decida el propio codex."""
+    for prefix, minimum in CODEX_MIN_VERSION.items():
+        if model.startswith(prefix):
+            have = await _codex_installed_version()
+            if have is not None and have[:2] < minimum:
+                return (
+                    f"'{model}' requiere codex-cli >= {'.'.join(map(str, minimum))}, "
+                    f"instalado {'.'.join(map(str, have))}. Actualiza codex "
+                    f"(p. ej. `npm i -g @openai/codex@latest`); no se auto-actualiza."
+                )
+    return None
 
 
 @mcp.tool()
@@ -2989,13 +3042,15 @@ async def delegate_to_codex(
 
     Codex es un agente autónomo COMPLETO: lee/escribe archivos y corre comandos por su
     cuenta dentro de su sandbox. Este tool lo lanza headless, espera su mensaje final y
-    lo devuelve. Ideal para coding agéntico con GPT-5.6 usando el plan del usuario.
+    lo devuelve. Ideal para coding agéntico con GPT-6.x usando el plan del usuario.
 
-    GPT-5.6 tiene tres sabores; se pueden pedir por nombre corto (alias) o id completo:
-      - 'sol'   → gpt-5.6-sol   (default)
-      - 'terra' → gpt-5.6-terra
-      - 'luna'  → gpt-5.6-luna
-    También '5.5', '5.4', '5.4-mini'.
+    Se pueden pedir por nombre corto (alias) o id completo:
+      - 'sol'   → gpt-6.1-sol   (default; exige codex-cli >= 0.159)
+      - 'astra' → gpt-6-astra   (frontier)
+      - '6-sol' → gpt-6-sol     (generación anterior)
+      - 'luna'  → gpt-6-luna    (rápido y barato)
+      - 'terra' → gpt-5.6-terra (no hay terra más nuevo)
+    También '5.6-sol', '5.6-luna', '5.5', '5.4', '5.4-mini'.
 
     ⚠️ Privacy: modelo cloud de OpenAI → NUNCA usar en proyectos con datos sensibles/
     regulados (PHI/PII). Solo proyectos sin datos sensibles.
@@ -3006,7 +3061,7 @@ async def delegate_to_codex(
     Args:
         task: La instrucción para Codex (autónoma — incluye contexto y archivos objetivo).
         workdir: Directorio de trabajo (Codex opera aquí). Default: cwd del server.
-        model: Modelo o alias. Default 'sol' (gpt-5.6-sol). Acepta 'terra'/'luna'/'sol'
+        model: Modelo o alias. Default 'sol' (gpt-6.1-sol). Acepta 'astra'/'luna'/'terra'/'sol'
                o el id completo. Debe resolver a uno permitido por el plan.
         sandbox: 'read-only' | 'workspace-write' (default) | 'danger-full-access'.
         timeout_s: Tope de segundos para la corrida completa (default 1800 = 30 min).
@@ -3031,6 +3086,10 @@ async def delegate_to_codex(
                 f"con suscripción, esos 400ean."
             ),
         }
+
+    ver_err = await _codex_version_error(model)
+    if ver_err:
+        return {"success": False, "error": ver_err}
 
     # -o escribe SOLO el mensaje final del agente a un archivo → parseo limpio, sin
     # tener que rascar el stream de eventos. uuid en el nombre: os.getpid() es

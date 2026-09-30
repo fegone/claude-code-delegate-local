@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (2026-09-30 — Codex catalog: gpt-6.1-sol is the new default)
+
+Codex model list synced with the live ChatGPT Plus catalog (codex-cli 0.159.2). Default is now
+`gpt-6.1-sol`; added `gpt-6-sol` and `gpt-6-luna`. Aliases: `sol` → 6.1-sol, `luna` → 6-luna,
+`astra`, `6-sol`, `6.1-sol`; `terra` stays on 5.6. `gpt-6.1-*` needs codex-cli >= 0.159: an older
+CLI now gets a clear upgrade error instead of an opaque failure (no auto-upgrade).
+
 ### Fixed (2026-08-28 — el backoff ahora sobrevive a un reinicio del proxy)
 
 Reiniciar LiteLLM (`launchctl kickstart -k`) lo deja **rechazando conexiones nuevas 55-65 s**
