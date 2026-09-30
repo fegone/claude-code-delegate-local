@@ -3041,6 +3041,8 @@ CODEX_EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
 def _codex_cmd(model: str, workdir_abs: str, sandbox: str, out_file: str,
                task: str, effort: str = "") -> list[str]:
     """Build the `codex exec` argv. The task is always last, after the "--" terminator."""
+    if effort not in CODEX_EFFORTS:
+        raise ValueError(f"effort inválido: {effort!r}")
     cmd = [
         CODEX_BIN, "exec",
         "-m", model,
@@ -3210,7 +3212,7 @@ async def delegate_to_codex(
         _cleanup_file(out_file)
         return {
             "success": False,
-            "error": "límite del plan ChatGPT agotado (ventana de 5h). Espera o usa Pro/API key.",
+            "error": "límite del plan ChatGPT agotado (cuota semanal; mira used_percent en ~/.codex/sessions). Espera al reinicio de la ventana.",
             "model": model, "effort": effort or "config-default", "elapsed_s": elapsed,
         }
     if failed and "not supported when using codex with a chatgpt account" in low:

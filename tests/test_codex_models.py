@@ -23,7 +23,7 @@ def test_every_alias_target_is_allowed_and_hidden_ids_are_not():
         assert hidden not in server.CODEX_PLAN_MODELS
 
 
-def test_default_model_is_6_1_sol():
+def test_default_model_is_luna_low():
     assert server.CODEX_DEFAULT_MODEL in ("gpt-6-luna", server.os.environ.get("DELEGATE_CODEX_MODEL"))
     assert server.CODEX_DEFAULT_EFFORT in ("low", server.os.environ.get("DELEGATE_CODEX_EFFORT"))
 
@@ -69,3 +69,9 @@ def test_invalid_effort_rejected_without_spawning(monkeypatch):
     r = asyncio.run(server.delegate_to_codex(task="x", effort="turbo"))
     assert r["success"] is False
     assert "effort inválido" in r["error"]
+
+
+def test_codex_cmd_rejects_unknown_effort():
+    import pytest
+    with pytest.raises(ValueError):
+        server._codex_cmd("gpt-6-luna", "/tmp", "read-only", "/tmp/o.txt", "x", effort='low" ; x="1')
