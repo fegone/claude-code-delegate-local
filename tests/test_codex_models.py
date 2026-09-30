@@ -24,7 +24,8 @@ def test_every_alias_target_is_allowed_and_hidden_ids_are_not():
 
 
 def test_default_model_is_6_1_sol():
-    assert server.CODEX_DEFAULT_MODEL in ("gpt-6.1-sol", server.os.environ.get("DELEGATE_CODEX_MODEL"))
+    assert server.CODEX_DEFAULT_MODEL in ("gpt-6-luna", server.os.environ.get("DELEGATE_CODEX_MODEL"))
+    assert server.CODEX_DEFAULT_EFFORT in ("low", server.os.environ.get("DELEGATE_CODEX_EFFORT"))
 
 
 def test_old_cli_rejected_for_6_1_but_not_others(monkeypatch):

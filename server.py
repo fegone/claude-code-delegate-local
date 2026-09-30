@@ -2911,7 +2911,13 @@ async def local_backend_status() -> dict:
 ## Privacy: cloud model → never use for projects with sensitive/regulated data (PHI/PII).
 ## ────────────────────────────────────────────────────────────────────────────────
 CODEX_BIN = os.environ.get("DELEGATE_CODEX_BIN", "codex")
-CODEX_DEFAULT_MODEL = os.environ.get("DELEGATE_CODEX_MODEL", "gpt-6.1-sol")
+# Default = gpt-6-luna at effort low (bench 2026-09-30, 48 runs, 4 coding tasks x 3 reps:
+# luna-low scored the same as sol-low/medium (94-100% of hidden tests), 3.2-5.6x faster,
+# fewest tokens, zero reasoning tokens; "medium" never beat "low" for either model).
+# Escalate by hand, visibly: luna low -> sol low -> sol medium. Report:
+# fegone/neola-n8n .claude/reports/banco-codex-sol-luna-2026-09-30.md
+CODEX_DEFAULT_MODEL = os.environ.get("DELEGATE_CODEX_MODEL", "gpt-6-luna")
+CODEX_DEFAULT_EFFORT = os.environ.get("DELEGATE_CODEX_EFFORT", "low")
 # 'danger-full-access' lets Codex run with no sandbox — gated behind an explicit env flag
 # so a routine dispatch can't request it.
 CODEX_ALLOW_DANGER = os.getenv("DELEGATE_CODEX_ALLOW_DANGER", "0").lower() in ("1", "true", "yes")
@@ -3055,7 +3061,7 @@ async def delegate_to_codex(
     task: str,
     workdir: str = ".",
     model: str = CODEX_DEFAULT_MODEL,
-    effort: str = "",
+    effort: str = CODEX_DEFAULT_EFFORT,
     sandbox: str = "workspace-write",
     timeout_s: int = 1800,
     ctx: Context | None = None,
@@ -3069,10 +3075,10 @@ async def delegate_to_codex(
     lo devuelve. Ideal para coding agéntico con GPT-6.x usando el plan del usuario.
 
     Se pueden pedir por nombre corto (alias) o id completo:
-      - 'sol'   → gpt-6.1-sol   (default; exige codex-cli >= 0.159)
+      - 'luna'  → gpt-6-luna    (DEFAULT, con effort 'low')
+      - 'sol'   → gpt-6.1-sol   (escalada; exige codex-cli >= 0.159)
       - 'astra' → gpt-6-astra   (frontier)
       - '6-sol' → gpt-6-sol     (generación anterior)
-      - 'luna'  → gpt-6-luna    (rápido y barato)
       - 'terra' → gpt-6-sol    (compatibilidad)
     También '5.6-sol', '5.6-luna', '5.5', '5.4', '5.4-mini'.
 
@@ -3085,11 +3091,11 @@ async def delegate_to_codex(
     Args:
         task: La instrucción para Codex (autónoma — incluye contexto y archivos objetivo).
         workdir: Directorio de trabajo (Codex opera aquí). Default: cwd del server.
-        model: Modelo o alias. Default 'sol' (gpt-6.1-sol). Acepta 'astra'/'luna'/'terra'/'sol'
+        model: Modelo o alias. Default 'luna' (gpt-6-luna). Acepta 'astra'/'luna'/'terra'/'sol'
                o el id completo. Debe resolver a uno permitido por el plan.
-        effort: Esfuerzo de razonamiento (model_reasoning_effort). Default '' = el de
-               ~/.codex/config.toml (hoy 'medium'). Valores:
-               'low'    → mínimo; Sol a low no razona en tareas triviales; medido 2026-09-30
+        effort: Esfuerzo de razonamiento (model_reasoning_effort). Default 'low'
+               (DELEGATE_CODEX_EFFORT); '' = el de ~/.codex/config.toml. Valores:
+               'low'    → default; en el banco del 2026-09-30 empató a 'medium' en calidad
                'medium' → equilibrado
                'high'   → razonamiento profundo
                'xhigh'  → muy profundo
