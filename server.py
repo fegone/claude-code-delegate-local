@@ -3029,11 +3029,33 @@ async def _codex_version_error(model: str) -> str | None:
     return None
 
 
+CODEX_EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
+
+
+def _codex_cmd(model: str, workdir_abs: str, sandbox: str, out_file: str,
+               task: str, effort: str = "") -> list[str]:
+    """Build the `codex exec` argv. The task is always last, after the "--" terminator."""
+    cmd = [
+        CODEX_BIN, "exec",
+        "-m", model,
+        "-C", workdir_abs,
+        "-s", sandbox,
+        "--skip-git-repo-check",
+        "-o", out_file,
+    ]
+    if effort:
+        cmd += ["-c", f'model_reasoning_effort="{effort}"']
+    # "--" termina las opciones: un task que empiece con '-' no se parsea como flag.
+    cmd += ["--", task]
+    return cmd
+
+
 @mcp.tool()
 async def delegate_to_codex(
     task: str,
     workdir: str = ".",
     model: str = CODEX_DEFAULT_MODEL,
+    effort: str = "",
     sandbox: str = "workspace-write",
     timeout_s: int = 1800,
     ctx: Context | None = None,
@@ -3051,23 +3073,36 @@ async def delegate_to_codex(
       - 'astra' → gpt-6-astra   (frontier)
       - '6-sol' → gpt-6-sol     (generación anterior)
       - 'luna'  → gpt-6-luna    (rápido y barato)
-      - 'terra' → gpt-5.6-terra (no hay terra más nuevo)
+      - 'terra' → gpt-6-sol    (compatibilidad)
     También '5.6-sol', '5.6-luna', '5.5', '5.4', '5.4-mini'.
 
     ⚠️ Privacy: modelo cloud de OpenAI → NUNCA usar en proyectos con datos sensibles/
     regulados (PHI/PII). Solo proyectos sin datos sensibles.
 
-    ⚠️ Límite del plan: Plus da ~15-80 mensajes / ventana de 5h; una tarea pesada la
-    drena. Si se agota → error de "usage limit"; esperar o usar Pro/API key.
+    ⚠️ Límite del plan: el plan de Felix (plan_type prolite) mide la cuota por ventana SEMANAL
+    (used_percent en ~/.codex/sessions); una tarea pesada la drena. Si se agota → error de "usage limit"; esperar o usar Pro/API key.
 
     Args:
         task: La instrucción para Codex (autónoma — incluye contexto y archivos objetivo).
         workdir: Directorio de trabajo (Codex opera aquí). Default: cwd del server.
         model: Modelo o alias. Default 'sol' (gpt-6.1-sol). Acepta 'astra'/'luna'/'terra'/'sol'
                o el id completo. Debe resolver a uno permitido por el plan.
+        effort: Esfuerzo de razonamiento (model_reasoning_effort). Default '' = el de
+               ~/.codex/config.toml (hoy 'medium'). Valores:
+               'low'    → mínimo; Sol a low no razona en tareas triviales; medido 2026-09-30
+               'medium' → equilibrado
+               'high'   → razonamiento profundo
+               'xhigh'  → muy profundo
+               'max'    → máximo
         sandbox: 'read-only' | 'workspace-write' (default) | 'danger-full-access'.
         timeout_s: Tope de segundos para la corrida completa (default 1800 = 30 min).
     """
+    effort = (effort or "").strip().lower()
+    if effort not in CODEX_EFFORTS:
+        return {
+            "success": False,
+            "error": f"effort inválido: {effort!r} (válidos: low, medium, high, xhigh, max)",
+        }
     model = _resolve_codex_model(model)
     workdir_abs = os.path.abspath(workdir)
     if not os.path.isdir(workdir_abs):
@@ -3097,17 +3132,7 @@ async def delegate_to_codex(
     # tener que rascar el stream de eventos. uuid en el nombre: os.getpid() es
     # constante en este server async, dos llamadas en el mismo segundo colisionarían.
     out_file = os.path.join(workdir_abs, f".codex-last-{uuid.uuid4().hex}.txt")
-    cmd = [
-        CODEX_BIN, "exec",
-        "-m", model,
-        "-C", workdir_abs,
-        "-s", sandbox,
-        "--skip-git-repo-check",
-        "-o", out_file,
-        # "--" termina las opciones: un task que empiece con '-' no se parsea como flag.
-        "--",
-        task,
-    ]
+    cmd = _codex_cmd(model, workdir_abs, sandbox, out_file, task, effort)
     if ctx:
         try:
             await ctx.report_progress(progress=0, total=1, message=f"codex {model} corriendo…")
@@ -3154,6 +3179,7 @@ async def delegate_to_codex(
             "success": False,
             "error": f"codex timeout tras {timeout_s}s",
             "model": model,
+            "effort": effort or "config-default",
             "elapsed_s": round(time.time() - t0, 1),
         }
     except BaseException:
@@ -3179,14 +3205,14 @@ async def delegate_to_codex(
         return {
             "success": False,
             "error": "límite del plan ChatGPT agotado (ventana de 5h). Espera o usa Pro/API key.",
-            "model": model, "elapsed_s": elapsed,
+            "model": model, "effort": effort or "config-default", "elapsed_s": elapsed,
         }
     if failed and "not supported when using codex with a chatgpt account" in low:
         _cleanup_file(out_file)
         return {
             "success": False,
             "error": f"el plan ChatGPT no permite el modelo '{model}' vía Codex.",
-            "model": model, "elapsed_s": elapsed,
+            "model": model, "effort": effort or "config-default", "elapsed_s": elapsed,
         }
 
     final_message = ""
@@ -3207,7 +3233,7 @@ async def delegate_to_codex(
             "error": f"codex salió con código {proc.returncode}",
             "final_response": final_message or None,
             "stdout_tail": stdout_text[-1500:],
-            "model": model, "elapsed_s": elapsed,
+            "model": model, "effort": effort or "config-default", "elapsed_s": elapsed,
         }
         _log_dispatch(out, model, "codex", 0.0)
         return out
@@ -3215,6 +3241,7 @@ async def delegate_to_codex(
     out = {
         "success": True,
         "model": model,
+        "effort": effort or "config-default",
         "final_response": final_message or stdout_text[-4000:],
         "elapsed_s": elapsed,
         "workdir": workdir_abs,

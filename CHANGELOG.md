@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (2026-09-30 — `effort` parameter for `delegate_to_codex`)
+
+New `effort` argument (`low`, `medium`, `high`, `xhigh`, `max`; empty = `~/.codex/config.toml`
+default) passed to Codex as `-c model_reasoning_effort="..."` before the `--` terminator. Invalid
+values fail before launching. Command construction moved to the pure helper `_codex_cmd`. Result
+dicts report `effort`. Docstring fixed: `terra` → `gpt-6-sol`, quota is weekly on Felix's plan.
+Sol at low does not reason on trivial tasks (measured 2026-09-30).
+
 ### Changed (2026-09-30 — Codex catalog: gpt-6.1-sol is the new default)
 
 Codex model list synced with the live ChatGPT Plus catalog (codex-cli 0.159.2). Default is now
