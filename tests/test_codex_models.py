@@ -11,7 +11,8 @@ def test_short_aliases_resolve_to_current_catalog():
     assert r("astra") == "gpt-6-astra"
     assert r("luna") == "gpt-6-luna"
     assert r("6-luna") == "gpt-6-luna"
-    assert r("terra") == "gpt-5.6-terra"
+    assert r("terra") == "gpt-6-sol"  # terra retired 2026-09-30
+    assert r("5.6-terra") == "gpt-5.6-terra"
     assert r("5.6-sol") == "gpt-5.6-sol"
     assert r("5.5") == "gpt-5.5"
 

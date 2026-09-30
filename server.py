@@ -2959,7 +2959,9 @@ CODEX_PLAN_MODELS = {
     "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
 }
 # Alias cortos → id real del modelo. Permite delegar diciendo solo "sol"/"astra"/"luna".
-# 'terra' sigue en 5.6: no existe un terra más nuevo.
+# 'terra' se retira (2026-09-30): GPT-6 no trae terra y gpt-5.6-terra va de salida.
+# El alias corto se queda por compatibilidad y apunta a gpt-6-sol, el sabor
+# intermedio vigente. Quien necesite el viejo lo pide por id completo o '5.6-terra'.
 CODEX_MODEL_ALIASES = {
     "sol": "gpt-6.1-sol",
     "6.1-sol": "gpt-6.1-sol",
@@ -2969,7 +2971,7 @@ CODEX_MODEL_ALIASES = {
     "6-astra": "gpt-6-astra",
     "luna": "gpt-6-luna",
     "6-luna": "gpt-6-luna",
-    "terra": "gpt-5.6-terra",
+    "terra": "gpt-6-sol",
     "5.6-sol": "gpt-5.6-sol",
     "5.6-terra": "gpt-5.6-terra",
     "5.6-luna": "gpt-5.6-luna",
