@@ -55,7 +55,7 @@ def test_deepseek_flash_and_pro_keep_separate_pools():
 
 
 def test_local_and_codex_never_fail_over_outward():
-    for model in ("local-qwen-3-8", "ornith", "ornith-think", "codex-sol", "gpt-5.6-sol"):
+    for model in ("local-qwen-3-8", "ornith", "ornith-think", "codex-sol", "gpt-5.6-sol", "gpt-6.1-sol"):
         assert server._failover_candidates(model) == [], f"{model} would leave its lane"
 
 
