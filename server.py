@@ -3074,7 +3074,7 @@ async def delegate_to_codex(
 
     Codex es un agente autónomo COMPLETO: lee/escribe archivos y corre comandos por su
     cuenta dentro de su sandbox. Este tool lo lanza headless, espera su mensaje final y
-    lo devuelve. Ideal para coding agéntico con GPT-6.x usando el plan del usuario.
+    lo devuelve. Para lanzar varios sin bloquear: submit_codex / poll_codex / cancel_codex. Ideal para coding agéntico con GPT-6.x usando el plan del usuario.
 
     Se pueden pedir por nombre corto (alias) o id completo:
       - 'luna'  → gpt-6-luna    (DEFAULT, con effort 'low')
@@ -3105,23 +3105,42 @@ async def delegate_to_codex(
         sandbox: 'read-only' | 'workspace-write' (default) | 'danger-full-access'.
         timeout_s: Tope de segundos para la corrida completa (default 1800 = 30 min).
     """
+    err, norm = await _validate_codex_request(task, workdir, model, effort, sandbox)
+    if err:
+        return err
+    model, effort, workdir_abs = norm
+    if ctx:
+        try:
+            await ctx.report_progress(progress=0, total=1, message=f"codex {model} corriendo…")
+        except Exception:
+            pass
+    return await _run_codex_job(task, model, effort, workdir_abs, sandbox, timeout_s)
+
+
+async def _validate_codex_request(
+    task: str, workdir: str, model: str, effort: str, sandbox: str,
+) -> tuple[dict | None, tuple[str, str, str]]:
+    """Shared validation for delegate_to_codex and submit_codex.
+    Returns (error_dict | None, (resolved_model, normalized_effort, workdir_abs))."""
+    norm = (model, effort, workdir)
     effort = (effort or "").strip().lower()
     if effort not in CODEX_EFFORTS:
         return {
             "success": False,
             "error": f"effort inválido: {effort!r} (válidos: low, medium, high, xhigh, max)",
-        }
+        }, norm
     model = _resolve_codex_model(model)
     workdir_abs = os.path.abspath(workdir)
+    norm = (model, effort, workdir_abs)
     if not os.path.isdir(workdir_abs):
-        return {"success": False, "error": f"workdir no existe: {workdir_abs}"}
+        return {"success": False, "error": f"workdir no existe: {workdir_abs}"}, norm
     if sandbox not in ("read-only", "workspace-write", "danger-full-access"):
-        return {"success": False, "error": f"sandbox inválido: {sandbox}"}
+        return {"success": False, "error": f"sandbox inválido: {sandbox}"}, norm
     if sandbox == "danger-full-access" and not CODEX_ALLOW_DANGER:
         return {
             "success": False,
             "error": "sandbox 'danger-full-access' deshabilitado; set DELEGATE_CODEX_ALLOW_DANGER=1 para permitirlo.",
-        }
+        }, norm
     if model not in CODEX_PLAN_MODELS:
         return {
             "success": False,
@@ -3130,23 +3149,24 @@ async def delegate_to_codex(
                 f"({sorted(CODEX_PLAN_MODELS)}). Con API key de pago habría más; "
                 f"con suscripción, esos 400ean."
             ),
-        }
-
+        }, norm
     ver_err = await _codex_version_error(model)
     if ver_err:
-        return {"success": False, "error": ver_err}
+        return {"success": False, "error": ver_err}, norm
+    return None, norm
 
+
+async def _run_codex_job(
+    task: str, model: str, effort: str, workdir_abs: str, sandbox: str,
+    timeout_s: int, on_proc=None,
+) -> dict:
+    """Run one `codex exec` to completion (already-validated args). `on_proc(proc)` is
+    called right after spawn so a job manager can kill the process group on cancel."""
     # -o escribe SOLO el mensaje final del agente a un archivo → parseo limpio, sin
     # tener que rascar el stream de eventos. uuid en el nombre: os.getpid() es
     # constante en este server async, dos llamadas en el mismo segundo colisionarían.
     out_file = os.path.join(workdir_abs, f".codex-last-{uuid.uuid4().hex}.txt")
     cmd = _codex_cmd(model, workdir_abs, sandbox, out_file, task, effort)
-    if ctx:
-        try:
-            await ctx.report_progress(progress=0, total=1, message=f"codex {model} corriendo…")
-        except Exception:
-            pass
-
     t0 = time.time()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -3161,6 +3181,8 @@ async def delegate_to_codex(
             # OPENAI_API_KEY quede fuera es deseado: el plan de ChatGPT es la única ruta.
             env=_child_env(("CODEX_HOME",)),
         )
+        if on_proc is not None:
+            on_proc(proc)
     except FileNotFoundError:
         return {
             "success": False,
@@ -3268,6 +3290,301 @@ def _cleanup_file(path: str) -> None:
             os.remove(path)
     except OSError:
         pass
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Codex job manager: submit / poll / cancel
+#
+# delegate_to_codex blocks until Codex finishes. For many parallel Codex runs the
+# orchestrator needs to launch them, keep working and collect results later:
+#   submit_codex(tasks) -> job ids immediately · poll_codex(ids) · cancel_codex(id)
+# Jobs run on the server's event loop through _run_codex_job. A bounded FIFO queue and
+# a concurrency cap (DELEGATE_CODEX_MAX_CONCURRENT, default 4) apply, and only ONE job
+# runs per workdir at a time (a second one for the same workdir waits in the queue).
+# State lives in memory and is mirrored to a small JSON file so that after a server
+# restart jobs that were queued/running are reported as `lost`, never forgotten.
+# ────────────────────────────────────────────────────────────────────────────────
+CODEX_MAX_CONCURRENT = int(os.getenv("DELEGATE_CODEX_MAX_CONCURRENT", "4"))
+CODEX_MAX_QUEUE = int(os.getenv("DELEGATE_CODEX_MAX_QUEUE", "32"))  # waiting (not running) jobs
+CODEX_MAX_TIMEOUT_S = 7200
+CODEX_JOBS_KEEP = 200  # finished jobs kept in memory / on disk
+CODEX_POLL_WORDS = 300
+CODEX_JOBS_FILE = os.getenv("DELEGATE_CODEX_JOBS_FILE") or str(
+    pathlib.Path(__file__).resolve().parent / ".codex_jobs.json"
+)
+_CODEX_TERMINAL = frozenset({"done", "failed", "cancelled", "timeout", "lost"})
+_CODEX_SECRET_FREE_FIELDS = (
+    "id", "status", "model", "effort", "workdir", "sandbox", "timeout_s", "task_preview",
+    "submitted_at", "started_at", "finished_at", "pid", "error", "final_response",
+)
+
+_codex_jobs: dict[str, dict] = {}
+_codex_queue: deque = deque()
+_codex_rt: dict[str, dict] = {}  # id -> {"task": str, "proc": Process|None, "atask": Task|None}
+_codex_loaded = False
+
+
+def _truncate_words(text: str | None, limit: int = CODEX_POLL_WORDS) -> str | None:
+    if not text:
+        return text
+    words = text.split()
+    if len(words) <= limit:
+        return text
+    return " ".join(words[:limit]) + f" … [truncated, {len(words)} words total]"
+
+
+def _codex_save() -> None:
+    """Mirror job state to disk (atomic replace). Failures never break a job."""
+    try:
+        finished = [j for j in _codex_jobs.values() if j["status"] in _CODEX_TERMINAL]
+        finished.sort(key=lambda j: j.get("finished_at") or 0)
+        for j in finished[:-CODEX_JOBS_KEEP]:
+            _codex_jobs.pop(j["id"], None)
+            _codex_rt.pop(j["id"], None)
+        data = {
+            jid: {k: (_truncate_words(j.get(k)) if k == "final_response" else j.get(k))
+                  for k in _CODEX_SECRET_FREE_FIELDS}
+            for jid, j in _codex_jobs.items()
+        }
+        tmp = f"{CODEX_JOBS_FILE}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, CODEX_JOBS_FILE)
+    except OSError as e:
+        logging.getLogger(__name__).warning("codex jobs file not written: %s", e)
+
+
+def _codex_ensure_loaded() -> None:
+    """First use after process start: load the previous file; anything that was
+    queued/running then is `lost` (this process never owned it)."""
+    global _codex_loaded
+    if _codex_loaded:
+        return
+    _codex_loaded = True
+    try:
+        with open(CODEX_JOBS_FILE, "r", encoding="utf-8") as f:
+            prev = json.load(f)
+    except (OSError, ValueError):
+        return
+    if not isinstance(prev, dict):
+        return
+    changed = False
+    for jid, j in prev.items():
+        if not isinstance(j, dict) or jid in _codex_jobs:
+            continue
+        if j.get("status") in ("queued", "running"):
+            pid = j.get("pid")
+            j["status"] = "lost"
+            j["error"] = (
+                "server restarted while the job was "
+                f"{'running' if pid else 'queued'}; result unknown"
+                + (f" (codex pid {pid} may still be running)" if pid else "")
+            )
+            j["finished_at"] = time.time()
+            changed = True
+        _codex_jobs[jid] = j
+    if changed:
+        _codex_save()
+
+
+def _codex_pump() -> None:
+    """Start queued jobs (FIFO) while under the concurrency cap and the job's workdir is free."""
+    running = [j for j in _codex_jobs.values() if j["status"] == "running"]
+    busy = {j["workdir"] for j in running}
+    n = len(running)
+    for jid in list(_codex_queue):
+        if n >= max(1, CODEX_MAX_CONCURRENT):
+            break
+        j = _codex_jobs.get(jid)
+        if j is None or j["status"] != "queued":
+            _codex_queue.remove(jid)
+            continue
+        if j["workdir"] in busy:
+            continue
+        _codex_queue.remove(jid)
+        j["status"] = "running"
+        j["started_at"] = time.time()
+        busy.add(j["workdir"])
+        n += 1
+        _codex_rt[jid]["atask"] = asyncio.get_running_loop().create_task(_codex_runner(jid))
+    _codex_save()
+
+
+async def _codex_runner(jid: str) -> None:
+    j, rt = _codex_jobs[jid], _codex_rt[jid]
+
+    def on_proc(proc) -> None:
+        rt["proc"] = proc
+        j["pid"] = proc.pid
+
+    try:
+        res = await _run_codex_job(
+            rt["task"], j["model"], j["effort"], j["workdir"], j["sandbox"],
+            j["timeout_s"], on_proc=on_proc,
+        )
+        err = res.get("error") or ""
+        if res.get("success"):
+            j["status"] = "done"
+        elif err.startswith("codex timeout"):
+            j["status"] = "timeout"
+        else:
+            j["status"] = "failed"
+        j["error"] = err or None
+        j["final_response"] = res.get("final_response")
+    except asyncio.CancelledError:
+        j["status"] = "cancelled"
+        j["error"] = "cancelled"
+        raise
+    except Exception as e:  # noqa: BLE001 - a job must always reach a terminal state
+        j["status"] = "failed"
+        j["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        j["finished_at"] = time.time()
+        rt["task"] = ""  # free the (possibly large) prompt
+        rt["proc"] = None
+        _codex_pump()
+
+
+def _codex_job_view(j: dict) -> dict:
+    now = time.time()
+    status = j["status"]
+    if status == "queued":
+        elapsed = now - j["submitted_at"]
+    elif status == "running":
+        elapsed = now - (j.get("started_at") or now)
+    else:
+        elapsed = (j.get("finished_at") or now) - (j.get("started_at") or j["submitted_at"])
+    view = {
+        "id": j["id"], "status": status, "elapsed_s": round(max(elapsed, 0), 1),
+        "model": j.get("model"), "workdir": j.get("workdir"),
+        "task_preview": j.get("task_preview"),
+    }
+    if status == "queued" and j["id"] in _codex_queue:
+        view["queue_position"] = list(_codex_queue).index(j["id"]) + 1
+    if j.get("error"):
+        view["error"] = j["error"]
+    if status in ("done", "failed", "timeout") and j.get("final_response"):
+        view["final_response"] = _truncate_words(j["final_response"])
+    return view
+
+
+@mcp.tool()
+async def submit_codex(tasks: list[dict]) -> dict:
+    """
+    Lanza una o varias tareas de Codex SIN esperar y devuelve los ids de inmediato; el
+    orquestador sigue trabajando y consulta con `poll_codex(ids)`. Pensado para lanzar
+    muchas tarjetas en paralelo (ver `delegate_to_codex` para una sola y bloqueante).
+
+    Cada elemento de `tasks`: {task (obligatorio), workdir='.', model='luna',
+    effort='low', sandbox='workspace-write', timeout_s=1800}. Mismas reglas y alias que
+    `delegate_to_codex`. Un elemento inválido se rechaza solo, con su error; el resto entra.
+
+    Límites: máximo DELEGATE_CODEX_MAX_CONCURRENT (default 4) corriendo a la vez; el
+    resto espera en cola FIFO (tope DELEGATE_CODEX_MAX_QUEUE=32; pasado el tope se
+    rechaza). UN solo job por workdir a la vez: uno segundo sobre el mismo workdir queda
+    `queued` hasta que termine el primero. `timeout_s` cuenta desde que arranca.
+    ⚠️ Mismo aviso de privacidad: modelo cloud, nunca con PHI/PII.
+
+    Returns: {"jobs": [{"index", "id", "status"} | {"index", "error"}], "max_concurrent": N}
+    """
+    _codex_ensure_loaded()
+    if not isinstance(tasks, list) or not tasks:
+        return {"success": False, "error": "tasks debe ser una lista no vacía"}
+    jobs_out: list[dict] = []
+    for i, t in enumerate(tasks):
+        if not isinstance(t, dict):
+            jobs_out.append({"index": i, "error": "elemento no es un objeto"})
+            continue
+        task = t.get("task")
+        if not isinstance(task, str) or not task.strip():
+            jobs_out.append({"index": i, "error": "task vacío"})
+            continue
+        timeout_s = t.get("timeout_s", 1800)
+        if (not isinstance(timeout_s, int) or isinstance(timeout_s, bool)
+                or not 1 <= timeout_s <= CODEX_MAX_TIMEOUT_S):
+            jobs_out.append({"index": i, "error": f"timeout_s inválido (1..{CODEX_MAX_TIMEOUT_S})"})
+            continue
+        sandbox = t.get("sandbox", "workspace-write")
+        err, (model, effort, workdir_abs) = await _validate_codex_request(
+            task, t.get("workdir", "."), t.get("model", CODEX_DEFAULT_MODEL),
+            t.get("effort", CODEX_DEFAULT_EFFORT), sandbox,
+        )
+        if err:
+            jobs_out.append({"index": i, "error": err["error"]})
+            continue
+        if len(_codex_queue) >= CODEX_MAX_QUEUE:
+            jobs_out.append({"index": i, "error": f"cola llena ({CODEX_MAX_QUEUE} en espera); reintenta luego"})
+            continue
+        jid = "cx-" + uuid.uuid4().hex[:12]
+        _codex_jobs[jid] = {
+            "id": jid, "status": "queued", "model": model, "effort": effort,
+            "workdir": os.path.realpath(workdir_abs), "sandbox": sandbox,
+            "timeout_s": timeout_s, "task_preview": task.strip()[:80],
+            "submitted_at": time.time(), "started_at": None, "finished_at": None,
+            "pid": None, "error": None, "final_response": None,
+        }
+        _codex_rt[jid] = {"task": task, "proc": None, "atask": None}
+        _codex_queue.append(jid)
+        _codex_pump()  # start it now if a slot is free, so only WAITING jobs count against the queue bound
+        jobs_out.append({"index": i, "id": jid})
+    for entry in jobs_out:
+        if "id" in entry:
+            entry["status"] = _codex_jobs[entry["id"]]["status"]
+    return {"jobs": jobs_out, "max_concurrent": CODEX_MAX_CONCURRENT}
+
+
+@mcp.tool()
+async def poll_codex(ids: list[str]) -> dict:
+    """
+    Estado de jobs lanzados con `submit_codex`. Por job: status
+    (queued | running | done | failed | cancelled | timeout | lost | unknown), elapsed_s y,
+    si terminó, `final_response` recortada a ~300 palabras. `lost` = el server se reinició
+    con el job en cola/corriendo: el resultado se desconoce (revisa el workdir/git a mano).
+    `done` solo significa que la CLI de Codex salió con código 0; verifica el trabajo.
+
+    Args:
+        ids: ids devueltos por submit_codex.
+    """
+    _codex_ensure_loaded()
+    if not isinstance(ids, list):
+        return {"success": False, "error": "ids debe ser una lista"}
+    out = []
+    for jid in ids:
+        j = _codex_jobs.get(jid) if isinstance(jid, str) else None
+        out.append(_codex_job_view(j) if j else {"id": jid, "status": "unknown"})
+    return {"jobs": out}
+
+
+@mcp.tool()
+async def cancel_codex(id: str) -> dict:
+    """
+    Cancela un job de `submit_codex`: si está en cola lo saca; si corre, mata su grupo de
+    procesos. Un job ya terminado se devuelve tal cual (no-op).
+
+    Args:
+        id: id devuelto por submit_codex.
+    """
+    _codex_ensure_loaded()
+    j = _codex_jobs.get(id) if isinstance(id, str) else None
+    if j is None:
+        return {"id": id, "status": "unknown"}
+    if j["status"] == "queued":
+        try:
+            _codex_queue.remove(id)
+        except ValueError:
+            pass
+        j["status"] = "cancelled"
+        j["error"] = "cancelled"
+        j["finished_at"] = time.time()
+        _codex_rt.get(id, {})["task"] = ""
+        _codex_pump()
+    elif j["status"] == "running":
+        atask = _codex_rt[id].get("atask")
+        if atask is not None:
+            atask.cancel()
+            # The runner's CancelledError path kills the process group and sets `cancelled`.
+            await asyncio.wait({atask}, timeout=15)
+    return _codex_job_view(j)
 
 
 # SSRF guard for delegate_to_provider. If DELEGATE_PROVIDER_ALLOWED_HOSTS is set, only

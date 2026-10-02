@@ -19,3 +19,6 @@ probe_*.py
 test_coder_seq.py
 delegate_results.json
 jest_final.txt
+
+# Codex job state (runtime)
+.codex_jobs.json*
