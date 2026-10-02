@@ -88,8 +88,46 @@ Ver [docs/CONFIGURATION.md](docs/CONFIGURATION.md) para detalles completos y eje
 | `delegate_to_local_agent(agent_name, task, workdir, max_turns, model)` | Ejecuta un agente definido en un `.md` contra el backend default, con tool calling completo. `max_turns` default es **automático (v0.6.0)**: 15 para backends locales (`local-*`, MoE-A3B), 25 para cloud (MiniMax M3, DeepSeek, Sonnet/Opus). Pasar un valor explícito lo fuerza. Hard cap 40. |
 | `delegate_batch(tasks)` | **NUEVO v0.5.0** — Despacha hasta 4 tareas de agente en paralelo via `asyncio.gather`. Cada task es un dict `{agent_name, task, workdir?, max_turns?, model?, max_tokens?}`. Devuelve resultados por-task en orden de entrada. Reusar el mismo agent_name aprovecha KV-cache prefix reuse (~30-50% ahorro en prompt processing en llama.cpp local). |
 | `delegate_to_provider(provider_url, api_key, model, agent_name, task, ...)` | Ejecuta un agente contra un endpoint arbitrario (DeepSeek, OpenRouter, etc.) |
+| `delegate_to_codex(task, workdir, model, sandbox, timeout_s)` | Delega en el **Codex CLI** de OpenAI como agente autónomo, autenticado con la **suscripción de ChatGPT** (sin API key ni proxy). Codex edita archivos y corre shell en su sandbox; la herramienta ejecuta `codex exec` y devuelve el mensaje final. Modelo por defecto `gpt-6.1-sol` (pide codex-cli >= 0.159). Alias cortos: `sol`, `astra`, `luna`, entre otros (lista completa en el README en inglés). Modelo en la nube: nunca para PHI. Env: `DELEGATE_CODEX_BIN`, `DELEGATE_CODEX_MODEL`. |
+| `submit_codex(tasks)` | Lanza una o varias corridas de Codex **sin esperar** y devuelve los ids al instante. Cada tarea: `{task, workdir, model, effort, sandbox, timeout_s}` (mismas reglas y alias que `delegate_to_codex`). Es atómico: se valida cada tarea antes de arrancar ninguna. Corren a la vez como máximo `DELEGATE_CODEX_MAX_CONCURRENT` (por defecto **8**) **entre todas las sesiones** y `DELEGATE_CODEX_MAX_PER_PROJECT` (por defecto **6**, mayor que 0 y no mayor que el tope global) por proyecto; el proyecto es el `git rev-parse --git-common-dir` canónico, así que todos los worktrees de un repo comparten un tope. Un job por checkout o raíz de worktree a la vez. Los cupos son archivos flock en `~/.codex-jobs/` (se cambia con `DELEGATE_CODEX_STATE_DIR`); si ese almacenamiento falla, el servidor **falla cerrado** y no corre nada. El resto espera en una cola FIFO (`DELEGATE_CODEX_MAX_QUEUE`, 32 por defecto). Los arranques se escalonan `DELEGATE_CODEX_STAGGER_S` (2,5 s por defecto). Cada corrida tiene su propio SQLite (`-c sqlite_home=`) y el login único sigue en `CODEX_HOME`, con `forced_login_method="chatgpt"`. El `timeout_s` de cada job cuenta desde que arranca y lo impone un watchdog. Los jobs mueren con el servidor; tras un SIGKILL, el siguiente arranque mata los huérfanos verificados (`killed_on_restart`). Cuota semanal leída de `~/.codex/sessions`: por encima de 85 % (`DELEGATE_CODEX_QUOTA_WARN`) añade un `warning` y no bloquea; solo rechaza si se define `DELEGATE_CODEX_QUOTA_REFUSE_PCT` y se supera, salvo `allow_over_quota=true`. `$HOME` y `/` se rechazan como workdir. |
+| `poll_codex(ids)` | Por job: `status`, `elapsed_s` y `final_response` recortado a ~300 palabras / 4000 caracteres; también informa de los jobs de **otros servidores vivos** (solo lectura). `done` solo significa que el CLI salió con 0: no es verificación. |
+| `cancel_codex(id)` | Saca de la cola un job en espera o mata el grupo de procesos de uno en marcha; siempre termina `cancelled` y libera sus locks. No hace nada sobre jobs terminados. |
 | `list_local_agents()` | Lista los agentes en `DELEGATE_LOCAL_AGENTS_DIR` con su metadata |
 | `local_backend_status()` | Health check + lista de modelos disponibles en el backend |
+
+### Operar jobs de Codex
+
+**Regla: un worktree por job.** Crea `git worktree add ../wt-<tarjeta> -b <tarjeta>` para cada tarjeta y
+pásalo como `workdir`. Dos jobs en un mismo checkout se serializan a propósito (se pisarían y pelearían
+por `index.lock`); los worktrees del mismo repo son checkouts separados pero comparten el tope por
+proyecto. Integra las ramas de una en una.
+
+**Subir los topes.** Los valores por defecto son 8 globales y 6 por proyecto. Se suben por variable de
+entorno, un escalón a la vez y solo tras un bloque de trabajo limpio en el escalón actual (pocos
+reintentos por `throttle`, ningún `auth_failed`, memoria bien): `DELEGATE_CODEX_MAX_CONCURRENT=12` (con
+`MAX_PER_PROJECT=8`), luego 16 y luego 20 (`MAX_PER_PROJECT=10`). Todos los servidores deben usar los
+mismos topes y el mismo `DELEGATE_CODEX_STATE_DIR`.
+
+**Estados.** `queued` (con `queue_reason`: `global_cap`, `adaptive_cap`, `workspace_busy`,
+`waiting_for_slot`, `throttle_cooldown`, `auth_failed`) · `running` · `done` (CLI con salida 0) ·
+`failed` (`failure_kind`: `quota`, `throttle` tras 3 reintentos, `infra`, `other`) · `timeout` ·
+`cancelled` · `auth_failed` (login inválido: correr `codex login`; la admisión se reanuda sola cuando
+cambia `auth.json`) · `lost` / `killed_on_restart` (murió el servidor dueño). Campos extra: `queued_s`,
+`retry_count`, `retry_in_s`, `last_activity_age_s`, `exit_code`, `session_id`, `owner` `{pid, sid,
+alive}`; la respuesta de `poll_codex` trae además `account` (`ok` / `cooldown` / `auth_failed` y los
+topes efectivos).
+
+**Manejo del 429.** codex-cli 0.159.2 no reintenta los 429 HTTP directos (`retry_429: false`), así que lo
+hace el servidor: un throttle abre un cooldown de toda la cuenta, compartido por todos los servidores
+(`shared.json` en el directorio de estado), respeta una pista tipo `Retry-After` si la salida la trae y
+si no espera 5/10/20/40/60 s con jitter, y reintenta el job hasta 3 veces (el prompt se repite desde el
+principio; el `session_id` queda anotado para inspección a mano). Tres throttles en 5 minutos reducen a
+la mitad los topes efectivos durante 10 minutos. La cuota agotada y los fallos de autenticación no se
+reintentan.
+
+**`done` no es "verificado".** Que Codex salga con 0 no dice si el cambio es correcto. Corre tú las
+pruebas del proyecto en el worktree del job (o en un runner aparte) y mergea solo lo que pase; las
+pruebas saltadas o restringidas por el sandbox cuentan como sin verificar.
 
 ### Nota sobre `delegate_batch` y sub-agentes
 
