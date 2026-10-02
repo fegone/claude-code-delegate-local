@@ -202,10 +202,10 @@ async def test_watchdog_enforces_timeout_without_poll(env, monkeypatch):
 
 
 # ── M2 / M3: several server processes ────────────────────────────────────────────
-def test_global_concurrency_across_two_servers(env):
+def test_global_concurrency_across_two_servers(env, monkeypatch):
     log = str(env / "overlap.log")
-    envx = os.environ
-    envx["DELEGATE_CODEX_MAX_CONCURRENT"] = "2"
+    monkeypatch.setenv("DELEGATE_CODEX_MAX_CONCURRENT", "2")
+    monkeypatch.setenv("DELEGATE_CODEX_MAX_PER_PROJECT", "0")
     a = _run_helper(env, "submit", str(env), "1.0", log, "3")
     b = _run_helper(env, "submit", str(env), "1.0", log, "3")
     for h in (a, b):
@@ -257,27 +257,78 @@ def test_quota_reads_weekly_window_and_ignores_stale(env):
     assert server._codex_weekly_used_percent() == 91.0  # stale window skipped
 
 
-async def test_quota_warn_refuse_and_override(env):
+async def test_quota_warns_but_never_blocks_by_default(env):
     s = server.CODEX_SESSIONS_DIR
     wd = _wd(env, "w")
-    _write_session(s, 88.0)
+    _write_session(s, 99.0)
+    assert server.CODEX_QUOTA_REFUSE is None
     r = await server.submit_codex([{"task": "sleep=0", "workdir": wd}])
-    assert "warning" in r and "88" in r["warning"] and r["jobs"][0].get("id")
-    d = await server.delegate_to_codex(task="sleep=0;say=hi", workdir=wd)
-    assert d["success"] is True and "88" in d["warning"]
-    os.remove(os.path.join(s, "2026", "10", "01", "rollout-a.jsonl"))
-    _write_session(s, 97.0)
-    r = await server.submit_codex([{"task": "sleep=0", "workdir": _wd(env, "w2")}])
-    assert r["success"] is False and "97" in r["error"] and not server._codex_jobs.get("x")
-    n_before = len(server._codex_jobs)
-    d = await server.delegate_to_codex(task="sleep=0;say=hi", workdir=wd)
+    assert "warning" in r and "99" in r["warning"] and r["jobs"][0].get("id")
+    d = await server.delegate_to_codex(task="sleep=0;say=hi", workdir=_wd(env, "w2"))
+    assert d["success"] is True and "99" in d["warning"]
+
+
+async def test_quota_refusal_only_with_explicit_env_and_override(env, monkeypatch):
+    _write_session(server.CODEX_SESSIONS_DIR, 97.0)
+    monkeypatch.setattr(server, "CODEX_QUOTA_REFUSE", 95.0)
+    r = await server.submit_codex([{"task": "sleep=0", "workdir": _wd(env, "w")}])
+    assert r["success"] is False and "97" in r["error"] and not server._codex_jobs
+    d = await server.delegate_to_codex(task="x", workdir=_wd(env, "w"))
     assert d["success"] is False and "allow_over_quota" in d["error"]
-    assert len(server._codex_jobs) == n_before
     ok = await server.submit_codex(
         [{"task": "sleep=0", "workdir": _wd(env, "w3")}], allow_over_quota=True)
     assert ok["jobs"][0].get("id") and "warning" in ok
-    d = await server.delegate_to_codex(task="sleep=0;say=hi", workdir=wd, allow_over_quota=True)
+    d = await server.delegate_to_codex(task="sleep=0;say=hi", workdir=_wd(env, "w4"),
+                                       allow_over_quota=True)
     assert d["success"] is True
+
+
+def test_default_caps(monkeypatch):
+    import importlib
+    monkeypatch.delenv("DELEGATE_CODEX_MAX_CONCURRENT", raising=False)
+    monkeypatch.delenv("DELEGATE_CODEX_MAX_PER_PROJECT", raising=False)
+    monkeypatch.delenv("DELEGATE_CODEX_QUOTA_REFUSE_PCT", raising=False)
+    src = open(os.path.join(ROOT, "server.py")).read()
+    assert 'DELEGATE_CODEX_MAX_CONCURRENT", "16"' in src
+    assert 'DELEGATE_CODEX_MAX_PER_PROJECT", "8"' in src
+
+
+def test_project_is_git_toplevel(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "a" / "b").mkdir(parents=True)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    real = os.path.realpath
+    assert server._codex_project(str(repo / "a" / "b")) == real(repo)
+    assert server._codex_project(str(repo)) == real(repo)
+    assert server._codex_project(str(plain)) == real(plain)
+
+
+def test_per_project_cap_across_two_servers_global_stays_open(env, monkeypatch):
+    repo = env / "repo"
+    (repo / ".git").mkdir(parents=True)
+    log = str(env / "overlap.log")
+    monkeypatch.setenv("DELEGATE_CODEX_MAX_CONCURRENT", "16")
+    monkeypatch.setenv("DELEGATE_CODEX_MAX_PER_PROJECT", "2")
+    a = _run_helper(env, "submit", str(repo), "1.0", log, "3")
+    b = _run_helper(env, "submit", str(repo), "1.0", log, "3")
+    for h in (a, b):
+        out, err = h.communicate(timeout=60)
+        assert json.loads(out) == ["done"] * 3, err
+    peak, n = _max_overlap(log)
+    assert n == 6 and peak <= 2, f"project cap 2 but {peak} ran at once"
+    # a different project is not throttled by the first one's cap
+    log2 = str(env / "overlap2.log")
+    other, other2 = env / "other1", env / "other2"
+    for d in (other, other2):
+        (d / ".git").mkdir(parents=True)
+    procs = [_run_helper(env, "submit", str(d), "1.0", log2, "2") for d in (other, other2)]
+    for h in procs:
+        out, err = h.communicate(timeout=60)
+        assert json.loads(out) == ["done"] * 2, err
+    peak2, n2 = _max_overlap(log2)
+    assert n2 == 4 and peak2 > 2, f"separate projects were throttled (peak {peak2})"
 
 
 # ── LOWs ─────────────────────────────────────────────────────────────────────────

@@ -3117,8 +3117,8 @@ async def delegate_to_codex(
                'max'    → máximo
         sandbox: 'read-only' | 'workspace-write' (default) | 'danger-full-access'.
         timeout_s: Tope de segundos para la corrida completa (default 1800 = 30 min).
-        allow_over_quota: la cuota semanal > 95% (env DELEGATE_CODEX_QUOTA_REFUSE) rechaza
-            la llamada; true la fuerza. Entre 85% y 95% solo agrega `warning` a la respuesta.
+        allow_over_quota: si DELEGATE_CODEX_QUOTA_REFUSE_PCT está definida y la cuota la supera, se
+            rechaza; true lo fuerza. Por encima de 85% solo agrega `warning`.
     """
     err, norm = await _validate_codex_request(task, workdir, model, effort, sandbox)
     if err:
@@ -3355,12 +3355,12 @@ def _cleanup_file(path: str) -> None:
 # orchestrator needs to launch them, keep working and collect results later:
 #   submit_codex(tasks) -> job ids immediately · poll_codex(ids) · cancel_codex(id)
 # Jobs run on the server's event loop through _run_codex_job. A bounded FIFO queue and
-# a concurrency cap (DELEGATE_CODEX_MAX_CONCURRENT, default 4) apply, and only ONE job
+# a concurrency cap (DELEGATE_CODEX_MAX_CONCURRENT, default 16, plus DELEGATE_CODEX_MAX_PER_PROJECT, default 8) apply, and only ONE job
 # runs per workdir at a time (a second one for the same workdir waits in the queue).
 # State lives in memory and is mirrored to a small JSON file so that after a server
 # restart jobs that were queued/running are reported as `lost`, never forgotten.
 # ────────────────────────────────────────────────────────────────────────────────
-CODEX_MAX_CONCURRENT = int(os.getenv("DELEGATE_CODEX_MAX_CONCURRENT", "4"))
+CODEX_MAX_CONCURRENT = int(os.getenv("DELEGATE_CODEX_MAX_CONCURRENT", "16"))
 CODEX_MAX_QUEUE = int(os.getenv("DELEGATE_CODEX_MAX_QUEUE", "32"))  # waiting (not running) jobs
 CODEX_MAX_TIMEOUT_S = 7200
 CODEX_JOBS_KEEP = 200  # finished jobs kept in memory / on disk
@@ -3372,7 +3372,10 @@ CODEX_LOCK_WAIT_S = float(os.getenv("DELEGATE_CODEX_LOCK_WAIT_S", "600"))  # del
 CODEX_STATE_DIR = os.getenv("DELEGATE_CODEX_STATE_DIR") or os.path.expanduser("~/.codex-jobs")
 CODEX_SESSIONS_DIR = os.getenv("DELEGATE_CODEX_SESSIONS_DIR") or os.path.expanduser("~/.codex/sessions")
 CODEX_QUOTA_WARN = float(os.getenv("DELEGATE_CODEX_QUOTA_WARN", "85"))
-CODEX_QUOTA_REFUSE = float(os.getenv("DELEGATE_CODEX_QUOTA_REFUSE", "95"))
+CODEX_MAX_PER_PROJECT = int(os.getenv("DELEGATE_CODEX_MAX_PER_PROJECT", "8"))  # project = git toplevel
+# Quota never blocks by default (the plan resets on its own); refusal only if this env is set.
+CODEX_QUOTA_REFUSE = (float(os.environ["DELEGATE_CODEX_QUOTA_REFUSE_PCT"])
+                      if os.getenv("DELEGATE_CODEX_QUOTA_REFUSE_PCT") else None)
 CODEX_JOBS_FILE = ""  # legacy (shared file, pre-hardening); no longer written or read
 _CODEX_TERMINAL = frozenset({"done", "failed", "cancelled", "timeout", "lost", "killed_on_restart"})
 _CODEX_SECRET_FREE_FIELDS = (
@@ -3487,6 +3490,19 @@ def _flock_try(path: pathlib.Path):
         return None
 
 
+def _codex_project(workdir: str) -> str:
+    """Project = git toplevel of the workdir (walk up to a .git); the workdir itself if none."""
+    real = os.path.realpath(workdir)
+    cur = real
+    while True:
+        if os.path.exists(os.path.join(cur, ".git")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return real
+        cur = parent
+
+
 def _codex_try_locks(workdir: str) -> list | None:
     """Non-blocking: one global slot (of CODEX_MAX_CONCURRENT) + the per-workdir lock.
     None = not available now. The handles are passed to the codex child (pass_fds) so the
@@ -3499,15 +3515,25 @@ def _codex_try_locks(workdir: str) -> list | None:
         logging.getLogger(__name__).warning("codex lock dir unavailable, limits are per-process: %s", e)
         return []
     h = hashlib.sha1(os.path.realpath(workdir).encode()).hexdigest()
+    ph = hashlib.sha1(_codex_project(workdir).encode()).hexdigest()
+    (base / "slots" / f"proj-{ph}").mkdir(mode=0o700, exist_ok=True)
     wd = _flock_try(base / "wd" / f"{h}.lock")
     if wd is None:
         return None
-    for i in range(max(1, CODEX_MAX_CONCURRENT)):
-        slot = _flock_try(base / "slots" / f"slot-{i}")
-        if slot is not None:
-            return [wd, slot]
-    wd.close()
-    return None
+    held = [wd]
+    for d, n in ((base / "slots" / f"proj-{ph}", CODEX_MAX_PER_PROJECT),
+                 (base / "slots", CODEX_MAX_CONCURRENT)):
+        if n <= 0:
+            continue  # cap disabled
+        for i in range(n):
+            slot = _flock_try(d / f"slot-{i}")
+            if slot is not None:
+                held.append(slot)
+                break
+        else:
+            _codex_release(held)
+            return None
+    return held
 
 
 def _codex_release(locks: list | None) -> None:
@@ -3568,7 +3594,7 @@ def _codex_quota_gate(allow_over_quota: bool) -> tuple[dict | None, str | None]:
     pct = _codex_weekly_used_percent()
     if pct is None:
         return None, None
-    if pct > CODEX_QUOTA_REFUSE and not allow_over_quota:
+    if CODEX_QUOTA_REFUSE is not None and pct > CODEX_QUOTA_REFUSE and not allow_over_quota:
         return {
             "success": False, "quota_used_percent": pct,
             "error": (f"cuota semanal de Codex al {pct:g}% (> {CODEX_QUOTA_REFUSE:g}%): no se lanza nada. "
@@ -3815,11 +3841,12 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
     `delegate_to_codex`. ATÓMICO: se validan TODAS antes de lanzar ninguna; si una falla,
     no arranca nada y la respuesta trae el error de cada elemento inválido.
 
-    Límites: máximo DELEGATE_CODEX_MAX_CONCURRENT (default 4) corriendo a la vez EN TOTAL
-    entre todas las sesiones/servidores (flock en ~/.codex-jobs); el resto espera en cola
+    Límites: máximo DELEGATE_CODEX_MAX_CONCURRENT (default 16) corriendo a la vez EN TOTAL
+    entre todas las sesiones/servidores y DELEGATE_CODEX_MAX_PER_PROJECT (default 8) por
+    proyecto (git toplevel), ambos con flock en ~/.codex-jobs; el resto espera en cola
     FIFO (tope DELEGATE_CODEX_MAX_QUEUE=32). UN solo job por workdir a la vez, también
     entre sesiones. `timeout_s` cuenta desde que arranca. Los jobs mueren con el server.
-    Cuota semanal: > 85% agrega `warning`; > 95% rechaza salvo `allow_over_quota=true`.
+    Cuota semanal: > 85% agrega `warning`; solo rechaza si se define DELEGATE_CODEX_QUOTA_REFUSE_PCT (salvo `allow_over_quota=true`).
     ⚠️ Mismo aviso de privacidad: modelo cloud, nunca con PHI/PII.
 
     Returns: {"jobs": [{"index", "id", "status"} | {"index", "error"}], "max_concurrent": N,
