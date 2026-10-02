@@ -32,7 +32,8 @@ async def fake(tmp_path, monkeypatch):
     exe.write_text(FAKE.format(py=sys.executable))
     exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setattr(server, "CODEX_BIN", str(exe))
-    monkeypatch.setattr(server, "CODEX_JOBS_FILE", str(tmp_path / "jobs.json"))
+    monkeypatch.setattr(server, "CODEX_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(server, "CODEX_SESSIONS_DIR", str(tmp_path / "sessions"))
     monkeypatch.setattr(server, "CODEX_MAX_CONCURRENT", 4)
     monkeypatch.setattr(server, "CODEX_MAX_QUEUE", 32)
     _reset()
@@ -44,6 +45,8 @@ async def fake(tmp_path, monkeypatch):
     yield dirs
     # leave nothing running
     tasks = [rt["atask"] for rt in server._codex_rt.values() if rt.get("atask")]
+    if server._codex_ticker is not None:
+        tasks.append(server._codex_ticker)
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -54,6 +57,7 @@ def _reset():
     server._codex_rt.clear()
     server._codex_queue = deque()
     server._codex_loaded = False
+    server._codex_ticker = None
 
 
 async def _wait(ids, pred, timeout=15):
@@ -84,18 +88,21 @@ async def test_submit_poll_done(fake):
     assert not [f for f in os.listdir(fake[0]) if f.startswith(".codex-last")]
 
 
-async def test_failed_and_invalid(fake):
-    r = await server.submit_codex([
-        T(fake[0], task="exit=3"),
+async def test_failed_job_and_atomic_invalid(fake):
+    r = await server.submit_codex([T(fake[0], task="exit=3")])
+    f = (await _wait([r["jobs"][0]["id"]], lambda j: j[0]["status"] == "failed"))[0]
+    assert "código 3" in f["error"]
+    # atomic: one valid + several invalid -> nothing starts, every bad element is named
+    bad = await server.submit_codex([
+        T(fake[1]),
         T(fake[1], model="nope"),
         T("/does/not/exist"),
         {"task": ""},
         T(fake[2], timeout_s=0),
     ])
-    assert "id" in r["jobs"][0]
-    assert all("error" in e for e in r["jobs"][1:])
-    f = (await _wait([r["jobs"][0]["id"]], lambda j: j[0]["status"] == "failed"))[0]
-    assert "código 3" in f["error"]
+    assert bad["success"] is False
+    assert [("error" in e) for e in bad["jobs"]] == [False, True, True, True, True]
+    assert len(server._codex_jobs) == 1  # only the first, earlier call
 
 
 async def test_concurrency_limit(fake, monkeypatch):
@@ -119,9 +126,10 @@ async def test_concurrency_limit(fake, monkeypatch):
 async def test_queue_bound(fake, monkeypatch):
     monkeypatch.setattr(server, "CODEX_MAX_CONCURRENT", 1)
     monkeypatch.setattr(server, "CODEX_MAX_QUEUE", 1)
-    r = await server.submit_codex([T(fake[i], task="sleep=0.5") for i in range(3)])
-    assert [("id" in e) for e in r["jobs"]] == [True, True, False]
-    assert "cola llena" in r["jobs"][2]["error"]
+    ok = await server.submit_codex([T(fake[i], task="sleep=0.5") for i in range(2)])
+    assert [("id" in e) for e in ok["jobs"]] == [True, True]  # 1 running + 1 waiting
+    r = await server.submit_codex([T(fake[2], task="sleep=0.5")])
+    assert r["success"] is False and "cola llena" in r["jobs"][0]["error"]
 
 
 async def test_same_workdir_exclusion(fake):
@@ -168,22 +176,25 @@ async def test_restart_reports_lost(fake):
                                    T(fake[1], task="sleep=0.1")])
     a, b, c = (e["id"] for e in r["jobs"])
     await _wait([c], lambda j: j[0]["status"] == "done")
-    saved = json.load(open(server.CODEX_JOBS_FILE))
+    mine = server._codex_state_file()
+    saved = json.load(open(mine))
     assert saved[a]["status"] == "running" and saved[b]["status"] == "queued"
-    # simulate a restart: cancel the real tasks, wipe memory, keep the file as it was
+    # simulate a restart: cancel the real tasks (kills codex), wipe memory, and leave the
+    # file behind under the name of a session that no longer holds its owner lock
     snapshot = json.dumps(saved)
     pid = server._codex_jobs[a]["pid"]
     for rt in server._codex_rt.values():
         if rt.get("atask"):
             rt["atask"].cancel()
     await asyncio.sleep(0.2)
-    open(server.CODEX_JOBS_FILE, "w").write(snapshot)
+    os.remove(mine)
+    open(os.path.join(os.path.dirname(mine), "jobs.deadsid.json"), "w").write(snapshot)
     _reset()
     jobs = (await server.poll_codex([a, b, c]))["jobs"]
     assert [j["status"] for j in jobs] == ["lost", "lost", "done"]
-    assert "restarted" in jobs[0]["error"] and str(pid) in jobs[0]["error"]
+    assert "restarted" in jobs[0]["error"]
     # persisted as lost, so a second restart still reports it
-    assert json.load(open(server.CODEX_JOBS_FILE))[a]["status"] == "lost"
+    assert json.load(open(server._codex_state_file()))[a]["status"] == "lost"
 
 
 async def test_delegate_to_codex_still_works(fake):
