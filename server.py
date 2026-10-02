@@ -28,6 +28,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import time
 import urllib.parse
@@ -3194,6 +3195,13 @@ async def _codex_wait_locks(workdir_abs: str) -> list | None:
         await asyncio.sleep(0.5 * random.uniform(0.8, 1.2))
 
 
+def _codex_denied_dirs(home: str) -> set:
+    names = (".ssh", ".codex", ".claude", ".aws", ".config", ".gnupg", "Library", ".codex-jobs")
+    out = {os.path.realpath(os.path.join(home, n)) for n in names}
+    out.add(os.path.realpath(CODEX_STATE_DIR))
+    return out
+
+
 async def _validate_codex_request(
     task: str, workdir: str, model: str, effort: str, sandbox: str,
 ) -> tuple[dict | None, tuple[str, str, str]]:
@@ -3219,8 +3227,7 @@ async def _validate_codex_request(
     home = os.path.realpath(os.path.expanduser("~"))
     if real in ("/", home) or any(
         real == p or real.startswith(p + os.sep)
-        for p in (os.path.join(home, ".ssh"), os.path.join(home, ".codex"),
-                  os.path.join(home, ".claude"))
+        for p in _codex_denied_dirs(home)
     ):
         return {"success": False, "error": f"workdir demasiado amplio o sensible: {real}"}, norm
     if sandbox not in ("read-only", "workspace-write", "danger-full-access"):
@@ -3301,6 +3308,32 @@ def _codex_classify_failure(returncode: int | None, text: str) -> dict:
     else:
         kind = "other"
     return {"kind": kind, "retry_after_s": _codex_retry_hint(text) if kind == "throttle" else None}
+
+
+_CODEX_OWN_ERROR_TYPES = frozenset({"error", "turn.failed", "thread.error", "stream_error"})
+
+
+def _codex_own_error_text(stdout_text: str) -> str:
+    """Only what Codex ITSELF reports: its `error` / `turn.failed` JSONL events and any line
+    that is not a JSON event (stderr of the codex binary). Never command output
+    (`command_execution`) or agent messages: a `gh` "not logged in" or a curl "401" inside the
+    run must not look like a Codex auth failure."""
+    keep: list[str] = []
+    for line in stdout_text.splitlines():
+        t = line.strip()
+        if not t:
+            continue
+        if t.startswith("{"):
+            try:
+                ev = json.loads(t)
+            except ValueError:
+                keep.append(t)  # a broken line is not an event: treat as stderr text
+                continue
+            if isinstance(ev, dict) and ev.get("type") in _CODEX_OWN_ERROR_TYPES:
+                keep.append(json.dumps({k: v for k, v in ev.items() if k != "type"}))
+            continue  # every other event (items, messages, usage) is the agent's work
+        keep.append(t)
+    return "\n".join(keep)
 
 
 CODEX_AUTH_MESSAGE = (
@@ -3415,10 +3448,11 @@ async def _run_codex_core(
     # Errores conocidos del plan → mensaje claro. SOLO con exit no-cero: un run exitoso que
     # MENCIONE "rate limit" en su razonamiento no es una cuota agotada.
     if rc != 0:
-        cls = _codex_classify_failure(rc, stdout_text)
+        own = _codex_own_error_text(stdout_text)
+        cls = _codex_classify_failure(rc, own)
         kind = cls["kind"]
         extra = {"failure_kind": kind, "exit_code": rc, "retry_after_s": cls["retry_after_s"], **base}
-        low = stdout_text.lower()
+        low = own.lower()
         if kind == "auth":
             _cleanup_file(out_file)
             return {"success": False, "error": CODEX_AUTH_MESSAGE, **extra}
@@ -3551,10 +3585,13 @@ _codex_hooks_installed = False
 def _codex_state_dir() -> pathlib.Path:
     d = pathlib.Path(CODEX_STATE_DIR)
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        os.chmod(d, 0o700)
-    except OSError:
-        pass
+    st = os.lstat(d)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise OSError(f"state dir {d} is a symlink or not a directory")
+    if st.st_uid != os.getuid():
+        raise OSError(f"state dir {d} is not owned by this user")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(d, 0o700)  # raises if we cannot: refuse a dir others could write
     return d
 
 
@@ -3629,12 +3666,15 @@ def _codex_install_shutdown_hooks() -> None:
 
 
 # ── cross-process locks (flock: the kernel frees them if the holder dies) ─────────────
+def _flock_open(path: pathlib.Path):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    return os.fdopen(fd, "a+")
+
+
 def _flock_try(path: pathlib.Path):
-    fh = open(path, "a+")
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    # O_NOFOLLOW: a symlink planted as a lock/state file is refused, never followed.
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    fh = os.fdopen(fd, "a+")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return fh
@@ -3719,10 +3759,128 @@ def _codex_project(workdir: str) -> str:
 # ── shared account state (flock-guarded JSON in the state dir) ─────────────────────────
 # cooldown {not_before}, throttles [ts], adaptive {until, eff_global}, auth_failed {at},
 # last_launch. One file for ALL servers: a 429 seen by any of them slows all of them.
+def _read_nofollow(path) -> str:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _write_json_atomic(path, data) -> None:
+    """tmp file created O_EXCL|O_NOFOLLOW (never through a symlink), then atomic replace."""
+    tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _quarantine(path) -> None:
+    try:
+        os.replace(path, f"{path}.bad-{int(time.time())}")
+    except OSError:
+        pass
+
+
+def _num(v, hi: float | None = None) -> float | None:
+    """A finite non-negative number (bool is not a number here), clamped to `hi`; else None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    if v != v or v in (float("inf"), float("-inf")) or v < 0:
+        return None
+    return min(v, hi) if hi is not None else v
+
+
+_CODEX_JOB_STATUSES = frozenset({"queued", "running"}) | _CODEX_TERMINAL
+_CODEX_JOB_STR_FIELDS = ("model", "effort", "workdir", "sandbox", "task_preview", "error", "out_file",
+                         "pstart", "project", "root", "queue_reason", "session_id", "failure_kind")
+_CODEX_JOB_NUM_FIELDS = ("timeout_s", "submitted_at", "started_at", "finished_at", "retry_at",
+                         "not_before", "last_activity")
+
+
+def _codex_sanitize_job(jid, j) -> dict | None:
+    """Validate one job read from a state file (another server's, or a dead one's). Anything
+    with the wrong type is dropped field by field; a job without a usable id/status is None."""
+    if not isinstance(jid, str) or not isinstance(j, dict):
+        return None
+    st = j.get("status")
+    if not isinstance(st, str) or st not in _CODEX_JOB_STATUSES:
+        return None
+    out: dict = {"id": jid, "status": j["status"]}
+    for k in _CODEX_JOB_STR_FIELDS:
+        v = j.get(k)
+        out[k] = v if isinstance(v, str) else None
+    for k in _CODEX_JOB_NUM_FIELDS:
+        out[k] = _num(j.get(k))
+    pid = j.get("pid")
+    out["pid"] = pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 else None
+    ec = j.get("exit_code")
+    out["exit_code"] = ec if isinstance(ec, int) and not isinstance(ec, bool) else None
+    rc = j.get("retry_count")
+    out["retry_count"] = rc if isinstance(rc, int) and not isinstance(rc, bool) and rc >= 0 else 0
+    fr = j.get("final_response")
+    out["final_response"] = fr if isinstance(fr, str) else None
+    return out
+
+
+def _codex_sanitize_shared(d: dict, now: float) -> tuple[dict, bool]:
+    """(clean, was_malformed). Timestamps are clamped to now+1h so a bogus far-future value
+    cannot freeze admission or launches."""
+    clean: dict = {}
+    bad = False
+    hi = now + 3600
+    cd = d.get("cooldown")
+    if cd is not None:
+        nb = _num(cd.get("not_before"), hi) if isinstance(cd, dict) else None
+        if nb is None:
+            bad = True
+        else:
+            clean["cooldown"] = {"not_before": nb, "reason": "throttle", "at": _num(cd.get("at")) or 0.0}
+    th = d.get("throttles")
+    if th is not None:
+        if isinstance(th, list):
+            ok = [t for t in (_num(x, now) for x in th) if t is not None]
+            bad = bad or len(ok) != len(th)
+            clean["throttles"] = ok[-50:]
+        else:
+            bad = True
+    ad = d.get("adaptive")
+    if ad is not None:
+        until = _num(ad.get("until"), now + CODEX_ADAPT_HOLD_S) if isinstance(ad, dict) else None
+        if until is None:
+            bad = True
+        else:
+            clean["adaptive"] = {"since": _num(ad.get("since")) or 0.0, "until": until,
+                                 "reason": ad.get("reason") if isinstance(ad.get("reason"), str) else ""}
+    af = d.get("auth_failed")
+    if af is not None:
+        at = _num(af.get("at"), hi) if isinstance(af, dict) else None
+        if at is None:
+            bad = True
+        else:
+            clean["auth_failed"] = {"at": at, "by": af.get("by") if isinstance(af.get("by"), str) else ""}
+    ll = d.get("last_launch")
+    if ll is not None:
+        v = _num(ll, now + 60)
+        if v is None:
+            bad = True
+        else:
+            clean["last_launch"] = v
+    return clean, bad
+
+
 def _codex_shared_read() -> dict:
     base = _codex_state_dir_safe()
+    path = base / "shared.json"
     try:
-        raw = (base / "shared.json").read_text(encoding="utf-8")
+        raw = _read_nofollow(path)
     except FileNotFoundError:
         return {}
     except OSError as e:
@@ -3730,23 +3888,30 @@ def _codex_shared_read() -> dict:
     try:
         d = json.loads(raw)
     except ValueError:
-        logging.getLogger(__name__).warning("codex shared.json corrupt; treated as empty")
+        d = None
+    if not isinstance(d, dict):
+        logging.getLogger(__name__).warning("codex shared.json malformed; quarantined")
+        _quarantine(path)
         return {}
-    return d if isinstance(d, dict) else {}
+    clean, bad = _codex_sanitize_shared(d, time.time())
+    if bad:
+        logging.getLogger(__name__).warning("codex shared.json had malformed fields; quarantined")
+        _quarantine(path)
+        try:
+            _write_json_atomic(path, clean)  # keep the valid part for every other server
+        except OSError:
+            pass
+    return clean
 
 
 def _codex_shared_update(fn):
     """Read-modify-write shared.json under an exclusive flock; returns fn(state)'s result."""
     base = _codex_state_dir_safe()
     try:
-        fh = open(base / "shared.lock", "a+")
+        fh = _flock_open(base / "shared.lock")
     except OSError as e:
         raise CodexLockError(f"lock del estado compartido no disponible: {e}") from e
     try:
-        try:
-            os.chmod(base / "shared.lock", 0o600)
-        except OSError:
-            pass
         deadline = time.time() + 5
         while True:
             try:
@@ -3758,12 +3923,7 @@ def _codex_shared_update(fn):
                 time.sleep(0.005)
         st = _codex_shared_read()
         res = fn(st)
-        path = base / "shared.json"
-        tmp = f"{path}.tmp.{os.getpid()}"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(st, f)
-        os.replace(tmp, path)
+        _write_json_atomic(base / "shared.json", st)
         return res
     except OSError as e:
         raise CodexLockError(f"no se pudo escribir el estado compartido de Codex: {e}") from e
@@ -3995,12 +4155,7 @@ def _codex_save() -> None:
                 for jid, j in _codex_jobs.items()
             },
         }
-        path = _codex_state_file()
-        tmp = f"{path}.tmp.{os.getpid()}"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp, path)
+        _write_json_atomic(_codex_state_file(), data)
     except OSError as e:
         logging.getLogger(__name__).warning("codex jobs file not written: %s", e)
 
@@ -4054,33 +4209,57 @@ def _codex_ensure_loaded() -> None:
         return
     if _codex_owner_fh is not None:
         _codex_owner_fh.close()
-    _codex_owner_fh = _flock_try(base / f"owner.{_codex_sid}.lock")
+    try:
+        _codex_owner_fh = _flock_try(base / f"owner.{_codex_sid}.lock")
+    except OSError as e:
+        logging.getLogger(__name__).warning("codex owner lock unavailable: %s", e)
+        _codex_owner_fh = None
     changed = False
     for f in sorted(base.glob("jobs.*.json")):
         sid = f.name[len("jobs."):-len(".json")]
         if sid == _codex_sid:
             continue
-        lk = _flock_try(base / f"owner.{sid}.lock")
+        try:
+            lk = _flock_try(base / f"owner.{sid}.lock")
+        except OSError:
+            continue
         if lk is None:
             continue  # owner alive: not ours to touch
         try:
+            bad = False
             try:
-                prev = json.loads(f.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                prev = None
-            if isinstance(prev, dict):
-                for jid, j in _codex_split_state(prev)[0].items():
-                    if not isinstance(j, dict) or jid in _codex_jobs:
-                        continue
-                    if j.get("status") in ("queued", "running"):
-                        _codex_recover(j)
-                    _codex_jobs[jid] = j
-                    changed = True
-            for p in (f, base / f"owner.{sid}.lock"):
                 try:
-                    p.unlink()
+                    prev = json.loads(_read_nofollow(f))
+                except (OSError, ValueError):
+                    prev = None
+                if not isinstance(prev, dict):
+                    bad = True
+                else:
+                    for jid, raw_j in _codex_split_state(prev)[0].items():
+                        j = _codex_sanitize_job(jid, raw_j)
+                        if j is None:
+                            bad = True
+                            continue
+                        if jid in _codex_jobs:
+                            continue
+                        if j["status"] in ("queued", "running"):
+                            _codex_recover(j)
+                        _codex_jobs[jid] = j
+                        changed = True
+            except Exception as e:  # noqa: BLE001 - a bad file must never break this server
+                logging.getLogger(__name__).warning("codex state file %s unusable: %s", f.name, e)
+                bad = True
+            if bad:
+                _quarantine(f)  # keep the evidence, take it out of the way
+            else:
+                try:
+                    f.unlink()
                 except OSError:
                     pass
+            try:
+                (base / f"owner.{sid}.lock").unlink()
+            except OSError:
+                pass
         finally:
             lk.close()
     try:  # per-job sqlite dirs a SIGKILLed server could not remove
@@ -4305,7 +4484,10 @@ async def _codex_runner(jid: str) -> None:
 
 
 def _codex_owner_alive(base: pathlib.Path, sid: str) -> bool:
-    lk = _flock_try(base / f"owner.{sid}.lock")
+    try:
+        lk = _flock_try(base / f"owner.{sid}.lock")
+    except OSError:
+        return False
     if lk is None:
         return True
     lk.close()
@@ -4325,22 +4507,26 @@ def _codex_remote_views(ids: list) -> dict:
         if sid == _codex_sid:
             continue
         try:
-            prev = json.loads(f.read_text(encoding="utf-8"))
+            prev = json.loads(_read_nofollow(f))
         except (OSError, ValueError):
             continue
         if not isinstance(prev, dict):
             continue
         jobs, srv = _codex_split_state(prev)
-        hit = [i for i in ids if isinstance(i, str) and i in jobs and i not in found
-               and isinstance(jobs[i], dict)]
+        if not isinstance(jobs, dict) or not isinstance(srv, dict):
+            continue
+        hit = [i for i in ids if isinstance(i, str) and i in jobs and i not in found]
         if not hit:
             continue
         alive = _codex_owner_alive(base, sid)
-        owner = {"pid": srv.get("pid"), "sid": sid, "alive": alive}
+        spid = srv.get("pid")
+        owner = {"pid": spid if isinstance(spid, int) and not isinstance(spid, bool) else None,
+                 "sid": sid, "alive": alive}
         for jid in hit:
-            j = dict(jobs[jid])
-            j.setdefault("id", jid)
-            if not alive and j.get("status") in ("queued", "running"):
+            j = _codex_sanitize_job(jid, jobs[jid])
+            if j is None:
+                continue  # malformed entry: ignored (read-only, never rewritten from here)
+            if not alive and j["status"] in ("queued", "running"):
                 j["status"], j["error"] = "lost", "owner server is gone; the job can no longer progress"
             found[jid] = _codex_job_view(j, owner)
     return found

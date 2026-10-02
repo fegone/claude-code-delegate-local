@@ -35,6 +35,12 @@ if cnt:
         code = 0
 if kv.get("msg"):
     print(kv["msg"].replace("~", " "))
+ev = kv.get("ev")
+if ev == "cmd":
+    print(json.dumps({{"type": "item.completed", "item": {{"type": "command_execution",
+          "aggregated_output": "HTTP/1.1 401 Unauthorized\\\\nYou are not logged into any GitHub hosts."}}}}))
+if ev == "autherr":
+    print(json.dumps({{"type": "error", "message": "refresh_token_reused: Please log out and sign in again"}}))
 if log:
     open(log, "a").write("E %f\\n" % time.time())
 if code == 0:
@@ -470,3 +476,164 @@ def test_defaults_are_8_global_6_per_project():
     src = open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "server.py")).read()
     assert 'DELEGATE_CODEX_MAX_CONCURRENT", "8"' in src
     assert 'DELEGATE_CODEX_MAX_PER_PROJECT", "6"' in src
+
+
+# ── Security 72 M1: classify only Codex's own errors ─────────────────────────────────
+def test_own_error_text_ignores_command_output_and_agent_messages():
+    out = "\n".join([
+        json.dumps({"type": "item.completed", "item": {"type": "command_execution",
+                    "aggregated_output": "You are not logged into any GitHub hosts. 401 Unauthorized"}}),
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "refresh_token_reused"}}),
+        "plain stderr line from the binary",
+        json.dumps({"type": "error", "message": "stream error: 429 Too Many Requests"}),
+    ])
+    own = server._codex_own_error_text(out)
+    assert "GitHub" not in own and "agent_message" not in own and "refresh_token_reused" not in own
+    assert "plain stderr line" in own and "429" in own
+    assert server._codex_classify_failure(1, own)["kind"] == "throttle"
+
+
+async def test_command_output_with_401_in_a_successful_run_is_not_auth(env):
+    r = await server.submit_codex([{"task": "ev=cmd", "workdir": _wd(env, "w")}])
+    v = (await _terminal([r["jobs"][0]["id"]]))[0]
+    assert v["status"] == "done"
+    assert server._codex_gate()["state"] == "ok"
+
+
+async def test_command_output_401_then_exit_1_is_not_auth_failed(env):
+    r = await server.submit_codex([{"task": "ev=cmd;exit=1", "workdir": _wd(env, "w")}])
+    v = (await _terminal([r["jobs"][0]["id"]]))[0]
+    assert v["status"] == "failed" and v["failure_kind"] == "other"
+    assert server._codex_gate()["state"] == "ok"
+    assert "auth_failed" not in json.loads((env / "state" / "shared.json").read_text()) \
+        if (env / "state" / "shared.json").exists() else True
+
+
+async def test_codex_own_refresh_token_reused_event_is_auth_failed(env):
+    r = await server.submit_codex([{"task": "ev=autherr;exit=1", "workdir": _wd(env, "w")}])
+    v = (await _terminal([r["jobs"][0]["id"]]))[0]
+    assert v["status"] == "auth_failed" and "codex login" in v["error"]
+    assert server._codex_gate()["state"] == "auth_failed"
+
+
+# ── Security 72 M2: malformed state is ignored / quarantined, never raised ───────────
+@pytest.mark.parametrize("bad", [
+    {"cooldown": {"not_before": "x"}},
+    {"cooldown": "soon"},
+    {"throttles": 5},
+    {"throttles": ["a", None]},
+    {"adaptive": [1]},
+    {"adaptive": {"until": "never"}},
+    {"auth_failed": "yes"},
+    {"last_launch": "now"},
+    [1, 2],
+])
+def test_malformed_shared_state_is_quarantined_not_raised(env, bad):
+    state = server._codex_state_dir()
+    (state / "shared.json").write_text(json.dumps(bad))
+    g = server._codex_gate()
+    assert g["state"] == "ok"
+    assert server._codex_account_view()["state"] == "ok"
+    assert list(state.glob("shared.json.bad-*")), "malformed file was not quarantined"
+    server._codex_note_throttle({}, {})  # still writable afterwards
+    assert server._codex_gate()["state"] == "cooldown"
+
+
+def test_far_future_timestamps_are_clamped(env):
+    state = server._codex_state_dir()
+    far = time.time() + 10 ** 9
+    (state / "shared.json").write_text(json.dumps(
+        {"cooldown": {"not_before": far}, "last_launch": far}))
+    g = server._codex_gate()
+    assert g["cooldown_s_left"] <= 3601
+    assert server._codex_shared_read()["last_launch"] <= time.time() + 61
+
+
+async def test_dead_server_file_with_bad_jobs_is_adopted_partially(env):
+    state = server._codex_state_dir()
+    now = time.time()
+    good = {"id": "cx-good", "status": "done", "submitted_at": now, "model": "m", "workdir": "/w"}
+    (state / "jobs.deadsid.json").write_text(json.dumps({"v": 2, "server": {}, "jobs": {
+        "cx-good": good,
+        "cx-nostatus": {"id": "cx-nostatus"},
+        "cx-badpid": {"id": "cx-badpid", "status": "running", "pid": [1, 2], "out_file": 7,
+                      "submitted_at": "x", "timeout_s": "soon"},
+        "cx-notdict": 5,
+    }}))
+    jobs = (await server.poll_codex(["cx-good", "cx-nostatus", "cx-badpid", "cx-notdict"]))["jobs"]
+    assert jobs[0]["status"] == "done"
+    assert jobs[1]["status"] == "unknown" and jobs[3]["status"] == "unknown"
+    assert jobs[2]["status"] == "lost"  # adopted, bad fields dropped, recovered as lost
+    assert list(state.glob("jobs.deadsid.json.bad-*"))
+    await server.submit_codex([{"task": "x", "workdir": _wd(env, "w")}])  # nothing raises later
+
+
+async def test_dead_server_file_not_json_or_wrong_shape_is_quarantined(env):
+    state = server._codex_state_dir()
+    (state / "jobs.junk1.json").write_text("{not json")
+    (state / "jobs.junk2.json").write_text(json.dumps([1, 2]))
+    (state / "jobs.junk3.json").write_text(json.dumps({"v": 2, "jobs": "nope"}))
+    await server.poll_codex([])
+    assert len(list(state.glob("jobs.junk*.json.bad-*"))) == 3
+    assert not list(state.glob("jobs.junk*.json"))
+
+
+async def test_live_server_with_malformed_job_does_not_break_poll(env):
+    await server.poll_codex([])
+    state = _remote_file(env, "livesid", {
+        "cx-bad": {"id": "cx-bad", "status": ["queued"], "submitted_at": "x"},
+        "cx-ok": {"id": "cx-ok", "status": "failed", "model": 5, "exit_code": "7"},
+    })
+    owner = server._flock_try(state / "owner.livesid.lock")
+    try:
+        bad, ok = (await server.poll_codex(["cx-bad", "cx-ok"]))["jobs"]
+        assert bad["status"] == "unknown"
+        assert ok["status"] == "failed" and "exit_code" not in ok
+    finally:
+        owner.close()
+    assert (state / "jobs.livesid.json").exists()
+
+
+# ── Security 72 LOW: deny list, state dir ownership/symlinks ─────────────────────────
+@pytest.mark.parametrize("sub", [".aws", ".config", ".config/gh", ".gnupg", ".ssh", "Library",
+                                 "Library/Caches", ".codex", ".codex-jobs"])
+async def test_sensitive_home_dirs_refused_as_workdir(env, monkeypatch, sub):
+    home = env / "home"
+    (home / sub).mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    r = await server.submit_codex([{"task": "x", "workdir": str(home / sub)}])
+    assert r["success"] is False and "sensible" in json.dumps(r)
+
+
+def test_state_dir_symlink_refused(env, monkeypatch):
+    real = env / "realstate"
+    real.mkdir()
+    link = env / "linkstate"
+    link.symlink_to(real)
+    monkeypatch.setattr(server, "CODEX_STATE_DIR", str(link))
+    with pytest.raises(OSError):
+        server._codex_state_dir()
+    with pytest.raises(server.CodexLockError):
+        server._codex_try_locks(_wd(env, "w"))
+
+
+def test_symlinked_state_files_are_refused_not_followed(env):
+    state = server._codex_state_dir()
+    victim = env / "victim.txt"
+    victim.write_text("keep")
+    (state / "shared.json").symlink_to(victim)
+    with pytest.raises(server.CodexLockError):
+        server._codex_shared_read()
+    (state / "shared.lock").symlink_to(victim)
+    with pytest.raises(server.CodexLockError):
+        server._codex_shared_update(lambda st: None)
+    assert victim.read_text() == "keep"
+    with pytest.raises(OSError):
+        server._flock_try(state / "shared.lock")
+
+
+def test_state_dir_wrong_mode_is_fixed_to_0700(env):
+    state = server._codex_state_dir()
+    os.chmod(state, 0o755)
+    server._codex_state_dir()
+    assert stat.S_IMODE(os.stat(state).st_mode) == 0o700
