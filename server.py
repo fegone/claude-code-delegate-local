@@ -15,7 +15,9 @@ License: MIT
 from __future__ import annotations
 
 import asyncio
+import atexit
 import fcntl
+import hashlib
 import ipaddress
 import json
 import logging
@@ -23,8 +25,11 @@ import os
 import pathlib
 import random
 import re
+import shutil
 import signal
 import socket
+import stat
+import subprocess
 import time
 import urllib.parse
 import uuid
@@ -840,10 +845,17 @@ CONTEXT_SCOPE_HINT = (
 
 @asynccontextmanager
 async def _lifespan(_app):
-    """Close the shared httpx client on server shutdown (was leaked before)."""
+    """Close the shared httpx client on server shutdown (was leaked before) and make sure
+    no Codex job outlives the server."""
+    try:
+        _codex_install_shutdown_hooks()
+        _codex_ensure_loaded()  # kill verified orphans from a dead predecessor right at start
+    except Exception:  # noqa: BLE001 - never block server start
+        logging.getLogger(__name__).exception("codex startup recovery failed")
     try:
         yield
     finally:
+        _codex_kill_all()
         global _http_client
         if _http_client is not None and not _http_client.is_closed:
             try:
@@ -982,8 +994,10 @@ def _safe_resolve(workdir: str, path: str) -> str:
 def _kill_process_group(proc: "asyncio.subprocess.Process") -> None:
     """Kill the whole process group of a subprocess started with start_new_session=True,
     so children (shells, test runners) don't survive a timeout/cancellation."""
+    if proc.returncode is not None:
+        return  # already reaped: its pid may belong to someone else now
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        os.killpg(proc.pid, signal.SIGKILL)  # pgid == pid; a reused non-leader pid raises ESRCH
     except (ProcessLookupError, PermissionError, OSError):
         try:
             proc.kill()
@@ -2926,7 +2940,7 @@ CODEX_ALLOW_DANGER = os.getenv("DELEGATE_CODEX_ALLOW_DANGER", "0").lower() in ("
 CODEX_STDOUT_CAP = int(os.getenv("DELEGATE_CODEX_STDOUT_CAP", str(512 * 1024)))
 
 
-async def _drain_capped(stream: asyncio.StreamReader, cap_bytes: int) -> bytes:
+async def _drain_capped(stream: asyncio.StreamReader, cap_bytes: int, on_chunk=None) -> bytes:
     """Read a stream to EOF keeping only the last `cap_bytes` (ring buffer). Prevents an
     unbounded subprocess from exhausting RAM via communicate()."""
     buf: deque[bytes] = deque()
@@ -2935,6 +2949,11 @@ async def _drain_capped(stream: asyncio.StreamReader, cap_bytes: int) -> bytes:
         chunk = await stream.read(65536)
         if not chunk:
             break
+        if on_chunk is not None:
+            try:
+                on_chunk()
+            except Exception:  # noqa: BLE001 - activity tracking must never break the drain
+                pass
         buf.append(chunk)
         size += len(chunk)
         while size > cap_bytes and len(buf) > 1:
@@ -3039,8 +3058,13 @@ CODEX_EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
 
 
 def _codex_cmd(model: str, workdir_abs: str, sandbox: str, out_file: str,
-               task: str, effort: str = "") -> list[str]:
-    """Build the `codex exec` argv. The task is always last, after the "--" terminator."""
+               task: str, effort: str = "", sqlite_home: str = "") -> list[str]:
+    """Build the `codex exec` argv. The task is always last, after the "--" terminator.
+
+    - forced_login_method="chatgpt": the plan login is the only allowed path (never an API key).
+    - sqlite_home: per-job SQLite dir (codex 0.159.2 `sqlite_home` key; it wins over
+      $CODEX_SQLITE_HOME). The login (auth.json) stays in the single shared CODEX_HOME.
+    - --json: JSONL events on stdout, so the session/thread id can be recorded."""
     if effort not in CODEX_EFFORTS:
         raise ValueError(f"effort inválido: {effort!r}")
     cmd = [
@@ -3049,8 +3073,12 @@ def _codex_cmd(model: str, workdir_abs: str, sandbox: str, out_file: str,
         "-C", workdir_abs,
         "-s", sandbox,
         "--skip-git-repo-check",
+        "--json",
         "-o", out_file,
+        "-c", 'forced_login_method="chatgpt"',
     ]
+    if sqlite_home:
+        cmd += ["-c", f"sqlite_home={json.dumps(sqlite_home)}"]
     if effort:
         cmd += ["-c", f'model_reasoning_effort="{effort}"']
     # "--" termina las opciones: un task que empiece con '-' no se parsea como flag.
@@ -3066,6 +3094,7 @@ async def delegate_to_codex(
     effort: str = CODEX_DEFAULT_EFFORT,
     sandbox: str = "workspace-write",
     timeout_s: int = 1800,
+    allow_over_quota: bool = False,
     ctx: Context | None = None,
 ) -> dict:
     """
@@ -3074,7 +3103,7 @@ async def delegate_to_codex(
 
     Codex es un agente autónomo COMPLETO: lee/escribe archivos y corre comandos por su
     cuenta dentro de su sandbox. Este tool lo lanza headless, espera su mensaje final y
-    lo devuelve. Ideal para coding agéntico con GPT-6.x usando el plan del usuario.
+    lo devuelve. Para lanzar varios sin bloquear: submit_codex / poll_codex / cancel_codex. Ideal para coding agéntico con GPT-6.x usando el plan del usuario.
 
     Se pueden pedir por nombre corto (alias) o id completo:
       - 'luna'  → gpt-6-luna    (DEFAULT, con effort 'low')
@@ -3104,24 +3133,110 @@ async def delegate_to_codex(
                'max'    → máximo
         sandbox: 'read-only' | 'workspace-write' (default) | 'danger-full-access'.
         timeout_s: Tope de segundos para la corrida completa (default 1800 = 30 min).
+        allow_over_quota: si DELEGATE_CODEX_QUOTA_REFUSE_PCT está definida y la cuota la supera, se
+            rechaza; true lo fuerza. Por encima de 85% solo agrega `warning`.
     """
+    err, norm = await _validate_codex_request(task, workdir, model, effort, sandbox)
+    if err:
+        return err
+    model, effort, workdir_abs = norm
+    qerr, warning = _codex_quota_gate(allow_over_quota)
+    if qerr:
+        return qerr
+    # Same cross-process limits as submit_codex: global slots + one job per checkout.
+    try:
+        locks = await _codex_wait_locks(workdir_abs)
+    except CodexLockError as e:
+        return {"success": False, "error": f"admisión cerrada (fail closed): {e}"}
+    if locks is None:
+        return {"success": False,
+                "error": f"sin slot de Codex libre tras {CODEX_LOCK_WAIT_S:.0f}s (límite compartido entre sesiones)"}
+    if ctx:
+        try:
+            await ctx.report_progress(progress=0, total=1, message=f"codex {model} corriendo…")
+        except Exception:
+            pass
+    try:
+        await _codex_stagger()
+        res = await _run_codex_job(
+            task, model, effort, workdir_abs, sandbox, timeout_s,
+            pass_fds=tuple(h.fileno() for h in locks),
+        )
+    except CodexLockError as e:
+        return {"success": False, "error": f"admisión cerrada (fail closed): {e}"}
+    finally:
+        _codex_release(locks)
+    # Share what this run learned with every other server (no automatic retry here: the
+    # caller is blocked on a single answer; submit_codex retries throttles by itself).
+    try:
+        if res.get("failure_kind") == "throttle":
+            _codex_note_throttle(res, {"retry_count": CODEX_MAX_RETRIES})
+        elif res.get("failure_kind") == "auth":
+            _codex_mark_auth_failed()
+    except CodexLockError as e:
+        logging.getLogger(__name__).warning("codex shared state not updated: %s", e)
+    if warning:
+        res["warning"] = warning
+    return res
+
+
+async def _codex_wait_locks(workdir_abs: str) -> list | None:
+    end = time.time() + CODEX_LOCK_WAIT_S
+    ident = _codex_identity(workdir_abs)
+    while True:
+        gate = _codex_gate()
+        if gate["state"] == "auth_failed":
+            raise CodexLockError(gate["message"])
+        locks = _codex_try_locks(workdir_abs, ident, gate)
+        if locks is not None:
+            return locks
+        if time.time() >= end:
+            return None
+        await asyncio.sleep(0.5 * random.uniform(0.8, 1.2))
+
+
+def _codex_denied_dirs(home: str) -> set:
+    names = (".ssh", ".codex", ".claude", ".aws", ".config", ".gnupg", "Library", ".codex-jobs")
+    out = {os.path.realpath(os.path.join(home, n)) for n in names}
+    out.add(os.path.realpath(CODEX_STATE_DIR))
+    return out
+
+
+async def _validate_codex_request(
+    task: str, workdir: str, model: str, effort: str, sandbox: str,
+) -> tuple[dict | None, tuple[str, str, str]]:
+    """Shared validation for delegate_to_codex and submit_codex.
+    Returns (error_dict | None, (resolved_model, normalized_effort, workdir_abs))."""
+    norm = (model, effort, workdir)
+    for name, val in (("task", task), ("workdir", workdir), ("model", model),
+                      ("effort", effort), ("sandbox", sandbox)):
+        if not isinstance(val, str):
+            return {"success": False, "error": f"{name} debe ser texto"}, norm
     effort = (effort or "").strip().lower()
     if effort not in CODEX_EFFORTS:
         return {
             "success": False,
             "error": f"effort inválido: {effort!r} (válidos: low, medium, high, xhigh, max)",
-        }
+        }, norm
     model = _resolve_codex_model(model)
-    workdir_abs = os.path.abspath(workdir)
+    workdir_abs = os.path.abspath(os.path.expanduser(workdir))
+    norm = (model, effort, workdir_abs)
     if not os.path.isdir(workdir_abs):
-        return {"success": False, "error": f"workdir no existe: {workdir_abs}"}
+        return {"success": False, "error": f"workdir no existe: {workdir_abs}"}, norm
+    real = os.path.realpath(workdir_abs)
+    home = os.path.realpath(os.path.expanduser("~"))
+    if real in ("/", home) or any(
+        real == p or real.startswith(p + os.sep)
+        for p in _codex_denied_dirs(home)
+    ):
+        return {"success": False, "error": f"workdir demasiado amplio o sensible: {real}"}, norm
     if sandbox not in ("read-only", "workspace-write", "danger-full-access"):
-        return {"success": False, "error": f"sandbox inválido: {sandbox}"}
+        return {"success": False, "error": f"sandbox inválido: {sandbox}"}, norm
     if sandbox == "danger-full-access" and not CODEX_ALLOW_DANGER:
         return {
             "success": False,
             "error": "sandbox 'danger-full-access' deshabilitado; set DELEGATE_CODEX_ALLOW_DANGER=1 para permitirlo.",
-        }
+        }, norm
     if model not in CODEX_PLAN_MODELS:
         return {
             "success": False,
@@ -3130,24 +3245,137 @@ async def delegate_to_codex(
                 f"({sorted(CODEX_PLAN_MODELS)}). Con API key de pago habría más; "
                 f"con suscripción, esos 400ean."
             ),
-        }
-
+        }, norm
     ver_err = await _codex_version_error(model)
     if ver_err:
-        return {"success": False, "error": ver_err}
+        return {"success": False, "error": ver_err}, norm
+    return None, norm
 
+
+# ── failure classification (codex 0.159.2 has retry_429=false for direct requests, so a
+# 429 surfaces as a failed exit and the retry policy has to live here) ───────────────────
+_CODEX_AUTH_PAT = re.compile(
+    r"refresh_token_reused|refresh token (?:was )?already (?:been )?used|log out and sign in again"
+    r"|not logged in|\b401\b.{0,40}unauthorized|unauthorized.{0,40}\b401\b|invalid_grant",
+    re.I | re.S)
+_CODEX_QUOTA_PAT = re.compile(
+    r"usage limit|hit your .{0,20}limit|insufficient_quota|exceeded your current quota|quota exceeded",
+    re.I)
+_CODEX_THROTTLE_PAT = re.compile(
+    r"\b429\b|too many requests|rate[ _-]?limit|throttl|exceeded retry limit", re.I)
+_CODEX_INFRA_PAT = re.compile(
+    r"another codex process is using its local data|database is locked|connection (?:reset|refused|closed)"
+    r"|\b50[234]\b|service unavailable|bad gateway|gateway time-?out|stream disconnected|timed out",
+    re.I)
+_CODEX_HINT_PATS = (
+    re.compile(r"retry[-_ ]after[\"'\s:=]*(\d+(?:\.\d+)?)\s*(ms|s|sec|secs|seconds|m|min|minutes)?", re.I),
+    re.compile(r"(?:try again|retry) in (\d+(?:\.\d+)?)\s*(ms|s|sec|secs|seconds|m|min|minutes)?", re.I),
+)
+_CODEX_HINT_MAX_S = 300.0
+_CODEX_SESSION_RE = re.compile(r'"(?:thread_id|session_id)"\s*:\s*"([0-9A-Za-z-]{8,64})"')
+
+
+def _codex_retry_hint(text: str) -> float | None:
+    for pat in _CODEX_HINT_PATS:
+        m = pat.search(text)
+        if not m:
+            continue
+        val = float(m.group(1))
+        unit = (m.group(2) or "s").lower()
+        if unit == "ms":
+            val /= 1000.0
+        elif unit in ("m", "min", "minutes"):
+            val *= 60.0
+        val = min(val, _CODEX_HINT_MAX_S)
+        return int(val) if val == int(val) else val
+    return None
+
+
+def _codex_classify_failure(returncode: int | None, text: str) -> dict:
+    """kind: None (not a failure) | auth | quota | throttle | infra | other. Only a non-zero
+    exit is classified: a successful run may MENTION "rate limit" while doing its work.
+    Order matters: auth beats quota beats throttle (a quota error can also say 429)."""
+    if returncode == 0:
+        return {"kind": None, "retry_after_s": None}
+    if _CODEX_AUTH_PAT.search(text):
+        kind = "auth"
+    elif _CODEX_QUOTA_PAT.search(text):
+        kind = "quota"
+    elif _CODEX_THROTTLE_PAT.search(text):
+        kind = "throttle"
+    elif _CODEX_INFRA_PAT.search(text):
+        kind = "infra"
+    else:
+        kind = "other"
+    return {"kind": kind, "retry_after_s": _codex_retry_hint(text) if kind == "throttle" else None}
+
+
+_CODEX_OWN_ERROR_TYPES = frozenset({"error", "turn.failed", "thread.error", "stream_error"})
+
+
+def _codex_own_error_text(stdout_text: str) -> str:
+    """Only what Codex ITSELF reports: its `error` / `turn.failed` JSONL events and any line
+    that is not a JSON event (stderr of the codex binary). Never command output
+    (`command_execution`) or agent messages: a `gh` "not logged in" or a curl "401" inside the
+    run must not look like a Codex auth failure."""
+    keep: list[str] = []
+    for line in stdout_text.splitlines():
+        t = line.strip()
+        if not t:
+            continue
+        if t.startswith("{"):
+            try:
+                ev = json.loads(t)
+            except ValueError:
+                keep.append(t)  # a broken line is not an event: treat as stderr text
+                continue
+            if isinstance(ev, dict) and ev.get("type") in _CODEX_OWN_ERROR_TYPES:
+                keep.append(json.dumps({k: v for k, v in ev.items() if k != "type"}))
+            continue  # every other event (items, messages, usage) is the agent's work
+        keep.append(t)
+    return "\n".join(keep)
+
+
+CODEX_AUTH_MESSAGE = (
+    "el login de Codex ya no es válido (refresh_token_reused / 401): ejecuta `codex login` en una terminal "
+    "y relanza. Mientras tanto no se admiten jobs nuevos; se reanuda solo cuando auth.json cambie."
+)
+
+
+async def _run_codex_job(
+    task: str, model: str, effort: str, workdir_abs: str, sandbox: str,
+    timeout_s: int, on_proc=None, pass_fds: tuple = (), job_id: str | None = None,
+    on_activity=None,
+) -> dict:
+    """Run one `codex exec` to completion (already-validated args). `on_proc(proc)` is
+    called right after spawn so a job manager can kill the process group on cancel.
+    Each run gets its own SQLITE_HOME under the state dir (the shared login stays in
+    CODEX_HOME) to avoid SQLite contention between parallel agents."""
+    sqlite_home = ""
+    try:
+        sqlite_home = str(_codex_state_dir() / "sqlite" / (job_id or f"run-{uuid.uuid4().hex[:12]}"))
+        os.makedirs(sqlite_home, mode=0o700, exist_ok=True)
+    except OSError as e:
+        return {"success": False, "error": f"no se pudo crear el CODEX_SQLITE_HOME del job: {e}",
+                "failure_kind": "infra"}
+    try:
+        return await _run_codex_core(task, model, effort, workdir_abs, sandbox, timeout_s,
+                                     on_proc, pass_fds, sqlite_home, on_activity)
+    finally:
+        shutil.rmtree(sqlite_home, ignore_errors=True)
+
+
+async def _run_codex_core(
+    task, model, effort, workdir_abs, sandbox, timeout_s, on_proc, pass_fds, sqlite_home, on_activity,
+) -> dict:
     # -o escribe SOLO el mensaje final del agente a un archivo → parseo limpio, sin
     # tener que rascar el stream de eventos. uuid en el nombre: os.getpid() es
     # constante en este server async, dos llamadas en el mismo segundo colisionarían.
     out_file = os.path.join(workdir_abs, f".codex-last-{uuid.uuid4().hex}.txt")
-    cmd = _codex_cmd(model, workdir_abs, sandbox, out_file, task, effort)
-    if ctx:
-        try:
-            await ctx.report_progress(progress=0, total=1, message=f"codex {model} corriendo…")
-        except Exception:
-            pass
-
+    cmd = _codex_cmd(model, workdir_abs, sandbox, out_file, task, effort, sqlite_home)
     t0 = time.time()
+    child_env = _child_env(("CODEX_HOME",))
+    child_env["CODEX_SQLITE_HOME"] = sqlite_home
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -3157,10 +3385,13 @@ async def delegate_to_codex(
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,  # own process group -> kill the whole tree on timeout/cancel
             # Misma allowlist que run_bash. Codex se autentica con ~/.codex/auth.json, así
-            # que le basta HOME + PATH; los CODEX_* propios pasan por prefijo. Que
-            # OPENAI_API_KEY quede fuera es deseado: el plan de ChatGPT es la única ruta.
-            env=_child_env(("CODEX_HOME",)),
+            # que le basta HOME + PATH; CODEX_HOME pasa explícito (un solo login compartido).
+            # Que OPENAI_API_KEY quede fuera es deseado: el plan de ChatGPT es la única ruta.
+            env=child_env,
+            pass_fds=pass_fds,  # lock handles: held as long as the codex tree lives
         )
+        if on_proc is not None:
+            on_proc(proc, out_file)
     except FileNotFoundError:
         return {
             "success": False,
@@ -3170,10 +3401,10 @@ async def delegate_to_codex(
     try:
         # Drain capped (bounded RAM) instead of communicate() which buffers everything.
         stdout_data = await asyncio.wait_for(
-            _drain_capped(proc.stdout, CODEX_STDOUT_CAP), timeout=timeout_s
+            _drain_capped(proc.stdout, CODEX_STDOUT_CAP, on_activity), timeout=timeout_s
         )
         try:
-            await asyncio.wait_for(proc.wait(), timeout=10)
+            await asyncio.wait_for(proc.wait(), timeout=CODEX_WAIT_AFTER_EOF_S)
         except (asyncio.TimeoutError, ProcessLookupError):
             pass
     except asyncio.TimeoutError:
@@ -3200,28 +3431,42 @@ async def delegate_to_codex(
 
     stdout_text = (stdout_data or b"").decode("utf-8", "replace")
     elapsed = round(time.time() - t0, 1)
+    m = _CODEX_SESSION_RE.search(stdout_text)
+    session_id = m.group(1) if m else None
+    base = {"model": model, "effort": effort or "config-default", "elapsed_s": elapsed}
+    if session_id:
+        base["session_id"] = session_id
 
-    # Errores conocidos del plan → mensaje claro. SOLO si Codex salió con error
-    # (returncode != 0): si no, un run exitoso que MENCIONE "rate limit" en su
-    # razonamiento (comunísimo en tareas de coding: "added rate limit handling")
-    # se clasificaría falsamente como cuota agotada. El error real de OpenAI viene
-    # con exit no-cero.
-    low = stdout_text.lower()
-    failed = proc.returncode not in (0, None)
-    if failed and ("usage limit" in low or "rate limit" in low):
+    rc = proc.returncode
+    if rc is None:
+        # EOF but the process never reported an exit status: unknown is NOT success.
+        _kill_process_group(proc)
         _cleanup_file(out_file)
-        return {
-            "success": False,
-            "error": "límite del plan ChatGPT agotado (cuota semanal; mira used_percent en ~/.codex/sessions). Espera al reinicio de la ventana.",
-            "model": model, "effort": effort or "config-default", "elapsed_s": elapsed,
-        }
-    if failed and "not supported when using codex with a chatgpt account" in low:
-        _cleanup_file(out_file)
-        return {
-            "success": False,
-            "error": f"el plan ChatGPT no permite el modelo '{model}' vía Codex.",
-            "model": model, "effort": effort or "config-default", "elapsed_s": elapsed,
-        }
+        return {"success": False, "error": "codex no reportó código de salida (returncode desconocido)",
+                "failure_kind": "infra", "exit_code": None, "stdout_tail": stdout_text[-1500:], **base}
+
+    # Errores conocidos del plan → mensaje claro. SOLO con exit no-cero: un run exitoso que
+    # MENCIONE "rate limit" en su razonamiento no es una cuota agotada.
+    if rc != 0:
+        own = _codex_own_error_text(stdout_text)
+        cls = _codex_classify_failure(rc, own)
+        kind = cls["kind"]
+        extra = {"failure_kind": kind, "exit_code": rc, "retry_after_s": cls["retry_after_s"], **base}
+        low = own.lower()
+        if kind == "auth":
+            _cleanup_file(out_file)
+            return {"success": False, "error": CODEX_AUTH_MESSAGE, **extra}
+        if kind == "quota":
+            _cleanup_file(out_file)
+            return {
+                "success": False,
+                "error": "límite del plan ChatGPT agotado (cuota semanal; mira used_percent en ~/.codex/sessions). Espera al reinicio de la ventana.",
+                **extra,
+            }
+        if "not supported when using codex with a chatgpt account" in low:
+            _cleanup_file(out_file)
+            return {"success": False, "error": f"el plan ChatGPT no permite el modelo '{model}' vía Codex.",
+                    **extra}
 
     final_message = ""
     try:
@@ -3235,13 +3480,15 @@ async def delegate_to_codex(
 
     # Any non-zero exit is a failure — even if Codex wrote a partial final message before
     # dying. The partial is returned as diagnostic, not passed off as a successful result.
-    if proc.returncode not in (0, None):
+    if rc != 0:
+        err = (f"codex throttled (429) con código {rc}" if kind == "throttle"
+               else f"codex salió con código {rc}")
         out = {
             "success": False,
-            "error": f"codex salió con código {proc.returncode}",
+            "error": err,
             "final_response": final_message or None,
             "stdout_tail": stdout_text[-1500:],
-            "model": model, "effort": effort or "config-default", "elapsed_s": elapsed,
+            **extra,
         }
         _log_dispatch(out, model, "codex", 0.0)
         return out
@@ -3250,16 +3497,24 @@ async def delegate_to_codex(
         "success": True,
         "model": model,
         "effort": effort or "config-default",
-        "final_response": final_message or stdout_text[-4000:],
+        "final_response": final_message or _codex_text_from_events(stdout_text),
         "elapsed_s": elapsed,
         "workdir": workdir_abs,
         "auth": "chatgpt-plan",
+        "exit_code": 0,
     }
+    if session_id:
+        out["session_id"] = session_id
     # Codex no pasa por `_dispatch_bounded`, asi que sin esto sus despachos no
     # aparecerian en el registro: astra auditando el delegate no habria dejado
     # rastro de su propia corrida.
     _log_dispatch(out, model, "codex", 0.0)
     return out
+
+
+def _codex_text_from_events(stdout_text: str) -> str:
+    """Fallback when -o produced nothing: the tail of the JSONL stream, bounded."""
+    return stdout_text[-4000:]
 
 
 def _cleanup_file(path: str) -> None:
@@ -3268,6 +3523,1245 @@ def _cleanup_file(path: str) -> None:
             os.remove(path)
     except OSError:
         pass
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Codex job manager: submit / poll / cancel
+#
+# delegate_to_codex blocks until Codex finishes. For many parallel Codex runs the
+# orchestrator needs to launch them, keep working and collect results later:
+#   submit_codex(tasks) -> job ids immediately · poll_codex(ids) · cancel_codex(id)
+# Jobs run on the server's event loop through _run_codex_job. A bounded FIFO queue and
+# a concurrency cap (DELEGATE_CODEX_MAX_CONCURRENT, default 8, plus DELEGATE_CODEX_MAX_PER_PROJECT, default 6) apply, and only ONE job
+# runs per checkout/worktree root at a time (a second one for the same root waits in the queue).
+# State lives in memory and is mirrored to a small JSON file so that after a server
+# restart jobs that were queued/running are reported as `lost`, never forgotten.
+# ────────────────────────────────────────────────────────────────────────────────
+CODEX_MAX_CONCURRENT = int(os.getenv("DELEGATE_CODEX_MAX_CONCURRENT", "8"))
+CODEX_MAX_QUEUE = int(os.getenv("DELEGATE_CODEX_MAX_QUEUE", "32"))  # waiting (not running) jobs
+CODEX_MAX_TIMEOUT_S = 7200
+CODEX_JOBS_KEEP = 200  # finished jobs kept in memory / on disk
+CODEX_POLL_WORDS = 300
+CODEX_POLL_CHARS = 4000
+CODEX_WATCHDOG_GRACE_S = 15.0
+CODEX_LOCK_WAIT_S = float(os.getenv("DELEGATE_CODEX_LOCK_WAIT_S", "600"))  # delegate_to_codex only
+# Private state dir (0700): per-server job files, slot locks, workdir locks.
+CODEX_STATE_DIR = os.getenv("DELEGATE_CODEX_STATE_DIR") or os.path.expanduser("~/.codex-jobs")
+CODEX_SESSIONS_DIR = os.getenv("DELEGATE_CODEX_SESSIONS_DIR") or os.path.expanduser("~/.codex/sessions")
+CODEX_QUOTA_WARN = float(os.getenv("DELEGATE_CODEX_QUOTA_WARN", "85"))
+CODEX_MAX_PER_PROJECT = int(os.getenv("DELEGATE_CODEX_MAX_PER_PROJECT", "6"))  # project = git common dir
+CODEX_STAGGER_S = float(os.getenv("DELEGATE_CODEX_STAGGER_S", "2.5"))  # min gap between launches, account-wide
+CODEX_MAX_RETRIES = 3  # per job, throttle only
+CODEX_BACKOFF_S = (5, 10, 20, 40, 60)  # used when the server gives no retry hint
+CODEX_ADAPT_THROTTLES = 3  # this many throttles ...
+CODEX_ADAPT_WINDOW_S = 300  # ... within this window ...
+CODEX_ADAPT_HOLD_S = 600  # ... halve admission for this long
+CODEX_WAIT_AFTER_EOF_S = 10.0  # grace for the exit status after stdout EOF
+CODEX_AUTH_FILE = os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"), "auth.json")
+# Quota never blocks by default (the plan resets on its own); refusal only if this env is set.
+CODEX_QUOTA_REFUSE = (float(os.environ["DELEGATE_CODEX_QUOTA_REFUSE_PCT"])
+                      if os.getenv("DELEGATE_CODEX_QUOTA_REFUSE_PCT") else None)
+CODEX_JOBS_FILE = ""  # legacy (shared file, pre-hardening); no longer written or read
+_CODEX_TERMINAL = frozenset({"done", "failed", "cancelled", "timeout", "lost", "killed_on_restart",
+                             "auth_failed"})
+_CODEX_SECRET_FREE_FIELDS = (
+    "id", "status", "model", "effort", "workdir", "sandbox", "timeout_s", "task_preview",
+    "submitted_at", "started_at", "finished_at", "pid", "error", "final_response",
+    "out_file", "pstart", "project", "root", "queue_reason", "retry_count", "retry_at",
+    "not_before", "last_activity", "exit_code", "session_id", "failure_kind",
+)
+
+_codex_jobs: dict[str, dict] = {}
+_codex_queue: deque = deque()
+# id -> {"task", "proc", "atask", "locks"}
+_codex_rt: dict[str, dict] = {}
+_codex_loaded = False
+_codex_sid = f"{os.getpid()}-{uuid.uuid4().hex[:6]}"
+_codex_owner_fh = None  # flock held for the life of this server: "this session is alive"
+_codex_ticker: "asyncio.Task | None" = None
+_codex_hooks_installed = False
+
+
+def _codex_state_dir() -> pathlib.Path:
+    d = pathlib.Path(CODEX_STATE_DIR)
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.lstat(d)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise OSError(f"state dir {d} is a symlink or not a directory")
+    if st.st_uid != os.getuid():
+        raise OSError(f"state dir {d} is not owned by this user")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(d, 0o700)  # raises if we cannot: refuse a dir others could write
+    return d
+
+
+def _codex_state_file() -> str:
+    return str(_codex_state_dir() / f"jobs.{_codex_sid}.json")
+
+
+def _truncate_words(text: str | None, limit: int = CODEX_POLL_WORDS) -> str | None:
+    if not text:
+        return text
+    words = text.split()
+    if len(words) > limit:
+        text = " ".join(words[:limit]) + f" … [truncated, {len(words)} words total]"
+    if len(text) > CODEX_POLL_CHARS:
+        text = text[:CODEX_POLL_CHARS] + f" … [truncated, {len(text)} chars total]"
+    return text
+
+
+# ── process inspection (pid-reuse safe: never act on a pid alone) ───────────────────
+def _ps_field(pid: int, field: str) -> str:
+    try:
+        r = subprocess.run(["ps", "-o", f"{field}=", "-p", str(int(pid))],
+                           capture_output=True, text=True, timeout=5,
+                           env={"LC_ALL": "C", "PATH": "/bin:/usr/bin"})
+        return " ".join(r.stdout.split())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+
+
+def _codex_killpg(pid: int | None) -> None:
+    if not pid or pid <= 1:
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)  # pgid == pid (start_new_session); a reused non-leader pid -> ESRCH
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _codex_kill_all() -> None:
+    """Kill every codex group this server started. Safe to call from a signal handler/atexit."""
+    for jid, rt in list(_codex_rt.items()):
+        proc = rt.get("proc")
+        if proc is not None and proc.returncode is None:
+            _codex_killpg(proc.pid)
+            out = _codex_jobs.get(jid, {}).get("out_file")
+            if out:
+                _cleanup_file(out)
+
+
+def _codex_install_shutdown_hooks() -> None:
+    global _codex_hooks_installed
+    if _codex_hooks_installed:
+        return
+    _codex_hooks_installed = True
+    atexit.register(_codex_kill_all)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            prev = signal.getsignal(sig)
+
+            def handler(signum, frame, _prev=prev):
+                _codex_kill_all()
+                if callable(_prev):
+                    return _prev(signum, frame)
+                if _prev == signal.SIG_IGN:
+                    return None
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+
+            signal.signal(sig, handler)
+        except (ValueError, OSError):  # not the main thread
+            pass
+
+
+# ── cross-process locks (flock: the kernel frees them if the holder dies) ─────────────
+def _flock_open(path: pathlib.Path):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    return os.fdopen(fd, "a+")
+
+
+def _flock_try(path: pathlib.Path):
+    # O_NOFOLLOW: a symlink planted as a lock/state file is refused, never followed.
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    fh = os.fdopen(fd, "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh
+    except OSError:
+        fh.close()
+        return None
+
+
+class CodexLockError(RuntimeError):
+    """Lock / shared-state storage unusable or caps invalid. Callers FAIL CLOSED: a job that
+    cannot take its slot must not run (returning "no locks" would mean unlimited codex)."""
+
+
+def _codex_caps() -> tuple[int, int]:
+    g, p = CODEX_MAX_CONCURRENT, CODEX_MAX_PER_PROJECT
+    if g <= 0 or p <= 0:
+        raise CodexLockError(
+            f"DELEGATE_CODEX_MAX_CONCURRENT ({g}) y DELEGATE_CODEX_MAX_PER_PROJECT ({p}) deben ser > 0")
+    if p > g:
+        raise CodexLockError(
+            f"DELEGATE_CODEX_MAX_PER_PROJECT ({p}) no puede superar DELEGATE_CODEX_MAX_CONCURRENT ({g})")
+    return g, p
+
+
+def _codex_state_dir_safe() -> pathlib.Path:
+    try:
+        return _codex_state_dir()
+    except OSError as e:
+        raise CodexLockError(f"almacén de estado de Codex no disponible ({CODEX_STATE_DIR}): {e}") from e
+
+
+def _codex_identity_fs(real: str) -> tuple[str, str]:
+    """Filesystem fallback of `git rev-parse --git-common-dir/--show-toplevel` (git missing,
+    unsafe-directory, or a bare .git stub). (project, root); no repo -> (real, real)."""
+    cur = real
+    while True:
+        g = os.path.join(cur, ".git")
+        if os.path.isdir(g):
+            return os.path.realpath(g), cur
+        if os.path.isfile(g):  # linked worktree / submodule: "gitdir: <path>"
+            try:
+                line = open(g, encoding="utf-8").read().strip()
+                if line.startswith("gitdir:"):
+                    gd = os.path.realpath(os.path.join(cur, line[len("gitdir:"):].strip()))
+                    cdf = os.path.join(gd, "commondir")
+                    if os.path.isfile(cdf):
+                        gd = os.path.realpath(os.path.join(gd, open(cdf, encoding="utf-8").read().strip()))
+                    return gd, cur
+            except OSError:
+                pass
+            return os.path.realpath(g), cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return real, real
+        cur = parent
+
+
+def _codex_identity(workdir: str) -> tuple[str, str]:
+    """(project, root). project = canonical git common dir: every linked worktree of one repo
+    shares it, so they count toward ONE per-project cap. root = the checkout/worktree top
+    level: the exclusion unit, so two subdirs of one checkout conflict."""
+    real = os.path.realpath(workdir)
+    try:
+        r = subprocess.run(
+            ["git", "-C", real, "rev-parse", "--git-common-dir", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+            env={"LC_ALL": "C", "HOME": os.path.expanduser("~"),
+                 "PATH": os.environ.get("PATH", "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin")},
+        )
+        lines = r.stdout.splitlines()
+        if r.returncode == 0 and len(lines) >= 2:
+            return os.path.realpath(os.path.join(real, lines[0])), os.path.realpath(lines[1])
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return _codex_identity_fs(real)
+
+
+def _codex_project(workdir: str) -> str:
+    return _codex_identity(workdir)[0]
+
+
+# ── shared account state (flock-guarded JSON in the state dir) ─────────────────────────
+# cooldown {not_before}, throttles [ts], adaptive {until, eff_global}, auth_failed {at},
+# last_launch. One file for ALL servers: a 429 seen by any of them slows all of them.
+def _read_nofollow(path) -> str:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _write_json_atomic(path, data) -> None:
+    """tmp file created O_EXCL|O_NOFOLLOW (never through a symlink), then atomic replace."""
+    tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _quarantine(path) -> None:
+    try:
+        os.replace(path, f"{path}.bad-{int(time.time())}")
+    except OSError:
+        pass
+
+
+def _num(v, hi: float | None = None) -> float | None:
+    """A finite non-negative number (bool is not a number here), clamped to `hi`; else None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    if v != v or v in (float("inf"), float("-inf")) or v < 0:
+        return None
+    return min(v, hi) if hi is not None else v
+
+
+_CODEX_JOB_STATUSES = frozenset({"queued", "running"}) | _CODEX_TERMINAL
+_CODEX_JOB_STR_FIELDS = ("model", "effort", "workdir", "sandbox", "task_preview", "error", "out_file",
+                         "pstart", "project", "root", "queue_reason", "session_id", "failure_kind")
+_CODEX_JOB_NUM_FIELDS = ("timeout_s", "submitted_at", "started_at", "finished_at", "retry_at",
+                         "not_before", "last_activity")
+
+
+def _codex_sanitize_job(jid, j) -> dict | None:
+    """Validate one job read from a state file (another server's, or a dead one's). Anything
+    with the wrong type is dropped field by field; a job without a usable id/status is None."""
+    if not isinstance(jid, str) or not isinstance(j, dict):
+        return None
+    st = j.get("status")
+    if not isinstance(st, str) or st not in _CODEX_JOB_STATUSES:
+        return None
+    out: dict = {"id": jid, "status": j["status"]}
+    for k in _CODEX_JOB_STR_FIELDS:
+        v = j.get(k)
+        out[k] = v if isinstance(v, str) else None
+    for k in _CODEX_JOB_NUM_FIELDS:
+        out[k] = _num(j.get(k))
+    pid = j.get("pid")
+    out["pid"] = pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 else None
+    ec = j.get("exit_code")
+    out["exit_code"] = ec if isinstance(ec, int) and not isinstance(ec, bool) else None
+    rc = j.get("retry_count")
+    out["retry_count"] = rc if isinstance(rc, int) and not isinstance(rc, bool) and rc >= 0 else 0
+    fr = j.get("final_response")
+    out["final_response"] = fr if isinstance(fr, str) else None
+    return out
+
+
+def _codex_sanitize_shared(d: dict, now: float) -> tuple[dict, bool]:
+    """(clean, was_malformed). Timestamps are clamped to now+1h so a bogus far-future value
+    cannot freeze admission or launches."""
+    clean: dict = {}
+    bad = False
+    hi = now + 3600
+    cd = d.get("cooldown")
+    if cd is not None:
+        nb = _num(cd.get("not_before"), hi) if isinstance(cd, dict) else None
+        if nb is None:
+            bad = True
+        else:
+            clean["cooldown"] = {"not_before": nb, "reason": "throttle", "at": _num(cd.get("at")) or 0.0}
+    th = d.get("throttles")
+    if th is not None:
+        if isinstance(th, list):
+            ok = [t for t in (_num(x, now) for x in th) if t is not None]
+            bad = bad or len(ok) != len(th)
+            clean["throttles"] = ok[-50:]
+        else:
+            bad = True
+    ad = d.get("adaptive")
+    if ad is not None:
+        until = _num(ad.get("until"), now + CODEX_ADAPT_HOLD_S) if isinstance(ad, dict) else None
+        if until is None:
+            bad = True
+        else:
+            clean["adaptive"] = {"since": _num(ad.get("since")) or 0.0, "until": until,
+                                 "reason": ad.get("reason") if isinstance(ad.get("reason"), str) else ""}
+    af = d.get("auth_failed")
+    if af is not None:
+        at = _num(af.get("at"), hi) if isinstance(af, dict) else None
+        if at is None:
+            bad = True
+        else:
+            clean["auth_failed"] = {"at": at, "by": af.get("by") if isinstance(af.get("by"), str) else ""}
+    ll = d.get("last_launch")
+    if ll is not None:
+        v = _num(ll, now + 60)
+        if v is None:
+            bad = True
+        else:
+            clean["last_launch"] = v
+    return clean, bad
+
+
+def _codex_shared_read() -> dict:
+    base = _codex_state_dir_safe()
+    path = base / "shared.json"
+    try:
+        raw = _read_nofollow(path)
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        raise CodexLockError(f"estado compartido de Codex ilegible: {e}") from e
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        logging.getLogger(__name__).warning("codex shared.json malformed; quarantined")
+        _quarantine(path)
+        return {}
+    clean, bad = _codex_sanitize_shared(d, time.time())
+    if bad:
+        logging.getLogger(__name__).warning("codex shared.json had malformed fields; quarantined")
+        _quarantine(path)
+        try:
+            _write_json_atomic(path, clean)  # keep the valid part for every other server
+        except OSError:
+            pass
+    return clean
+
+
+def _codex_shared_update(fn):
+    """Read-modify-write shared.json under an exclusive flock; returns fn(state)'s result."""
+    base = _codex_state_dir_safe()
+    try:
+        fh = _flock_open(base / "shared.lock")
+    except OSError as e:
+        raise CodexLockError(f"lock del estado compartido no disponible: {e}") from e
+    try:
+        deadline = time.time() + 5
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() > deadline:
+                    raise CodexLockError("timeout tomando el lock del estado compartido de Codex")
+                time.sleep(0.005)
+        st = _codex_shared_read()
+        res = fn(st)
+        _write_json_atomic(base / "shared.json", st)
+        return res
+    except OSError as e:
+        raise CodexLockError(f"no se pudo escribir el estado compartido de Codex: {e}") from e
+    finally:
+        fh.close()
+
+
+def _codex_gate() -> dict:
+    """Account-wide admission state: ok | cooldown | auth_failed, plus the effective caps
+    (halved while the adaptive window is active). Raises CodexLockError on bad caps/storage."""
+    g, p = _codex_caps()
+    st = _codex_shared_read()
+    now = time.time()
+    out = {"state": "ok", "message": None, "not_before": None, "cooldown_s_left": 0.0,
+           "adaptive": False, "adaptive_until": None, "eff_global": g, "eff_project": p}
+    af = st.get("auth_failed")
+    if isinstance(af, dict):
+        try:
+            relogged = os.path.getmtime(CODEX_AUTH_FILE) > float(af.get("at", 0))
+        except OSError:
+            relogged = False
+        if relogged:  # `codex login` rewrote auth.json after the failure
+            _codex_shared_update(lambda s: s.pop("auth_failed", None))
+        else:
+            out.update(state="auth_failed", message=CODEX_AUTH_MESSAGE)
+    ad = st.get("adaptive")
+    if isinstance(ad, dict) and float(ad.get("until", 0)) > now:
+        out["adaptive"], out["adaptive_until"] = True, float(ad["until"])
+        out["eff_global"] = max(1, -(-g // 2))
+        out["eff_project"] = min(max(1, -(-p // 2)), out["eff_global"])
+    cd = st.get("cooldown")
+    if out["state"] == "ok" and isinstance(cd, dict) and float(cd.get("not_before", 0)) > now:
+        nb = float(cd["not_before"])
+        out.update(state="cooldown", not_before=nb, cooldown_s_left=round(nb - now, 1),
+                   message=f"cooldown de la cuenta por throttling (429): {nb - now:.0f}s")
+    return out
+
+
+def _codex_note_throttle(res: dict, j: dict) -> float | None:
+    """Record a throttle (429) in the shared state: account-wide cooldown (server hint if any,
+    else 5/10/20/40/60 s backoff with jitter) and the adaptive cap (3 throttles in 5 min ->
+    admission halved for 10 min). Returns the delay if THIS job may retry, else None."""
+    now = time.time()
+    retries = int(j.get("retry_count") or 0)
+    hint = res.get("retry_after_s")
+    if hint:
+        delay = float(hint) * random.uniform(1.0, 1.2)
+    else:
+        delay = CODEX_BACKOFF_S[min(retries, len(CODEX_BACKOFF_S) - 1)] * random.uniform(0.8, 1.2)
+    g, _p = _codex_caps()
+
+    def upd(st: dict) -> None:
+        cd = st.get("cooldown") if isinstance(st.get("cooldown"), dict) else {}
+        st["cooldown"] = {"not_before": max(float(cd.get("not_before", 0)), now + delay),
+                          "reason": "throttle", "at": now}
+        th = [t for t in st.get("throttles", []) if now - float(t) < CODEX_ADAPT_WINDOW_S] + [now]
+        st["throttles"] = th
+        ad = st.get("adaptive")
+        if len(th) >= CODEX_ADAPT_THROTTLES and not (isinstance(ad, dict) and float(ad.get("until", 0)) > now):
+            st["adaptive"] = {"since": now, "until": now + CODEX_ADAPT_HOLD_S,
+                              "eff_global": max(1, -(-g // 2)),
+                              "reason": f"{len(th)} throttles in {CODEX_ADAPT_WINDOW_S}s"}
+
+    _codex_shared_update(upd)
+    return delay if retries < CODEX_MAX_RETRIES else None
+
+
+def _codex_mark_auth_failed() -> None:
+    now = time.time()
+    _codex_shared_update(lambda st: st.__setitem__("auth_failed", {"at": now, "by": _codex_sid}))
+
+
+async def _codex_stagger() -> None:
+    """Space launches by CODEX_STAGGER_S across ALL servers (shared last_launch)."""
+    if CODEX_STAGGER_S <= 0:
+        return
+    now = time.time()
+
+    def upd(st: dict) -> float:
+        start = max(now, float(st.get("last_launch", 0)) + CODEX_STAGGER_S)
+        st["last_launch"] = start
+        return start
+
+    start = _codex_shared_update(upd)
+    if start > now:
+        await asyncio.sleep(start - now)
+
+
+def _codex_account_view() -> dict:
+    try:
+        g = _codex_gate()
+    except CodexLockError as e:
+        return {"state": "storage_error", "error": str(e)}
+    out = {"state": g["state"], "effective_max_concurrent": g["eff_global"],
+           "effective_max_per_project": g["eff_project"]}
+    if g["message"]:
+        out["message"] = g["message"]
+    if g["state"] == "cooldown":
+        out["cooldown_s_left"] = g["cooldown_s_left"]
+    if g["adaptive"]:
+        out["adaptive_until"] = g["adaptive_until"]
+    return out
+
+
+def _codex_try_locks(workdir: str, ident: tuple[str, str] | None = None,
+                     gate: dict | None = None) -> list | None:
+    """Non-blocking: the checkout-root lock + one per-project slot + one global slot (both
+    within the EFFECTIVE caps). None = not available now (or the account gate is closed).
+    Raises CodexLockError when storage or caps are broken: callers fail closed. The handles
+    are passed to the codex child (pass_fds) so the locks live as long as the child does,
+    even if this server is SIGKILLed."""
+    _codex_caps()
+    gate = gate or _codex_gate()
+    if gate["state"] != "ok":
+        return None
+    project, root = ident or _codex_identity(workdir)
+    held: list = []
+    try:
+        base = _codex_state_dir()
+        slots = base / "slots"
+        slots.mkdir(mode=0o700, exist_ok=True)
+        (base / "wd").mkdir(mode=0o700, exist_ok=True)
+        proj_dir = slots / f"proj-{hashlib.sha1(project.encode()).hexdigest()}"
+        proj_dir.mkdir(mode=0o700, exist_ok=True)
+        wd = _flock_try(base / "wd" / f"{hashlib.sha1(root.encode()).hexdigest()}.lock")
+        if wd is None:
+            return None
+        held.append(wd)
+        for d, n in ((proj_dir, gate["eff_project"]), (slots, gate["eff_global"])):
+            for i in range(n):
+                slot = _flock_try(d / f"slot-{i}")
+                if slot is not None:
+                    held.append(slot)
+                    break
+            else:
+                _codex_release(held)
+                return None
+    except OSError as e:
+        _codex_release(held)
+        raise CodexLockError(f"almacén de locks de Codex no disponible: {e}") from e
+    return held
+
+
+def _codex_release(locks: list | None) -> None:
+    # close only: LOCK_UN would drop the lock for the child that shares the open file description
+    for fh in locks or []:
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+
+# ── weekly quota (reads the rate_limits Codex itself logs in ~/.codex/sessions) ───────
+def _codex_weekly_used_percent() -> float | None:
+    """Latest weekly (>= 7 days window) used_percent still inside its window, or None."""
+    root = pathlib.Path(CODEX_SESSIONS_DIR)
+    now = time.time()
+    seen = 0
+    try:
+        files: list[pathlib.Path] = []
+        for y in sorted((p for p in root.iterdir() if p.is_dir()), reverse=True)[:2]:
+            for m in sorted((p for p in y.iterdir() if p.is_dir()), reverse=True)[:2]:
+                for d in sorted((p for p in m.iterdir() if p.is_dir()), reverse=True)[:3]:
+                    files.extend(d.glob("*.jsonl"))
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    for f in files:
+        if seen >= 8:
+            break
+        seen += 1
+        try:
+            with open(f, "rb") as fh:
+                fh.seek(0, 2)
+                fh.seek(max(0, fh.tell() - 262144))
+                lines = fh.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if '"used_percent"' not in line:
+                continue
+            try:
+                rl = json.loads(line)["payload"]["rate_limits"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            for key in ("primary", "secondary"):
+                w = rl.get(key) if isinstance(rl, dict) else None
+                if not isinstance(w, dict) or (w.get("window_minutes") or 0) < 7 * 24 * 60:
+                    continue
+                if (w.get("resets_at") or now + 1) < now:
+                    continue  # that window already reset
+                pct = w.get("used_percent")
+                if isinstance(pct, (int, float)):
+                    return float(pct)
+    return None
+
+
+def _codex_quota_gate(allow_over_quota: bool) -> tuple[dict | None, str | None]:
+    pct = _codex_weekly_used_percent()
+    if pct is None:
+        return None, None
+    if CODEX_QUOTA_REFUSE is not None and pct > CODEX_QUOTA_REFUSE and not allow_over_quota:
+        return {
+            "success": False, "quota_used_percent": pct,
+            "error": (f"cuota semanal de Codex al {pct:g}% (> {CODEX_QUOTA_REFUSE:g}%): no se lanza nada. "
+                      "Pasa allow_over_quota=true para forzarlo."),
+        }, None
+    if pct > CODEX_QUOTA_WARN:
+        return None, f"cuota semanal de Codex al {pct:g}% (aviso > {CODEX_QUOTA_WARN:g}%)"
+    return None, None
+
+
+# ── state: one file per server process ────────────────────────────────────────────────
+def _codex_save() -> None:
+    """Mirror THIS server's jobs to its own 0600 file (atomic replace). Never breaks a job."""
+    try:
+        finished = [j for j in _codex_jobs.values() if j["status"] in _CODEX_TERMINAL]
+        finished.sort(key=lambda j: j.get("finished_at") or 0)
+        for j in finished[:-CODEX_JOBS_KEEP]:
+            _codex_jobs.pop(j["id"], None)
+            _codex_rt.pop(j["id"], None)
+        data = {
+            "v": 2,
+            "server": {"sid": _codex_sid, "pid": os.getpid(), "saved_at": time.time(),
+                       "caps": {"global": CODEX_MAX_CONCURRENT, "project": CODEX_MAX_PER_PROJECT}},
+            "jobs": {
+                jid: {k: (_truncate_words(j.get(k)) if k == "final_response" else j.get(k))
+                      for k in _CODEX_SECRET_FREE_FIELDS}
+                for jid, j in _codex_jobs.items()
+            },
+        }
+        _write_json_atomic(_codex_state_file(), data)
+    except OSError as e:
+        logging.getLogger(__name__).warning("codex jobs file not written: %s", e)
+
+
+def _codex_recover(j: dict) -> None:
+    """A job left queued/running by a dead server. Kill its codex only if the pid is still
+    the SAME process (start time + cmdline carrying our unique -o file); never on pid alone."""
+    pid, out = j.get("pid"), j.get("out_file")
+    j["finished_at"] = time.time()
+    if not pid:
+        j["status"], j["error"] = "lost", "server restarted while the job was queued"
+        return
+    same = bool(
+        j.get("pstart") and out
+        and _ps_field(pid, "lstart") == j["pstart"]
+        and out in _ps_field(pid, "command")
+    )
+    if same:
+        try:
+            same = os.getpgid(pid) == pid
+        except OSError:
+            same = False
+    if same:
+        _codex_killpg(pid)
+        if out:
+            _cleanup_file(out)
+        j["status"] = "killed_on_restart"
+        j["error"] = f"server restarted while the job ran; orphan codex (pid {pid}) killed"
+    else:
+        j["status"] = "lost"
+        j["error"] = "server restarted while the job was running; result unknown (codex no longer running)"
+
+
+def _codex_split_state(prev: dict) -> tuple[dict, dict]:
+    """(jobs, server_meta) from a per-server state file; v1 files were a bare jobs dict."""
+    if prev.get("v") and isinstance(prev.get("jobs"), dict):
+        return prev["jobs"], prev.get("server") if isinstance(prev.get("server"), dict) else {}
+    return prev, {}
+
+
+def _codex_ensure_loaded() -> None:
+    """First use after start: take our liveness lock, then adopt the job files of DEAD
+    sessions only (their owner lock is free). Live sessions' files are never touched."""
+    global _codex_loaded, _codex_owner_fh
+    if _codex_loaded:
+        return
+    _codex_loaded = True
+    try:
+        base = _codex_state_dir()
+    except OSError:
+        return
+    if _codex_owner_fh is not None:
+        _codex_owner_fh.close()
+    try:
+        _codex_owner_fh = _flock_try(base / f"owner.{_codex_sid}.lock")
+    except OSError as e:
+        logging.getLogger(__name__).warning("codex owner lock unavailable: %s", e)
+        _codex_owner_fh = None
+    changed = False
+    for f in sorted(base.glob("jobs.*.json")):
+        sid = f.name[len("jobs."):-len(".json")]
+        if sid == _codex_sid:
+            continue
+        try:
+            lk = _flock_try(base / f"owner.{sid}.lock")
+        except OSError:
+            continue
+        if lk is None:
+            continue  # owner alive: not ours to touch
+        try:
+            bad = False
+            try:
+                try:
+                    prev = json.loads(_read_nofollow(f))
+                except (OSError, ValueError):
+                    prev = None
+                if not isinstance(prev, dict):
+                    bad = True
+                else:
+                    for jid, raw_j in _codex_split_state(prev)[0].items():
+                        j = _codex_sanitize_job(jid, raw_j)
+                        if j is None:
+                            bad = True
+                            continue
+                        if jid in _codex_jobs:
+                            continue
+                        if j["status"] in ("queued", "running"):
+                            _codex_recover(j)
+                        _codex_jobs[jid] = j
+                        changed = True
+            except Exception as e:  # noqa: BLE001 - a bad file must never break this server
+                logging.getLogger(__name__).warning("codex state file %s unusable: %s", f.name, e)
+                bad = True
+            if bad:
+                _quarantine(f)  # keep the evidence, take it out of the way
+            else:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            try:
+                (base / f"owner.{sid}.lock").unlink()
+            except OSError:
+                pass
+        finally:
+            lk.close()
+    try:  # per-job sqlite dirs a SIGKILLed server could not remove
+        for d in (base / "sqlite").iterdir():
+            if time.time() - d.stat().st_mtime > 86400:
+                shutil.rmtree(d, ignore_errors=True)
+    except OSError:
+        pass
+    if changed:
+        _codex_save()
+
+
+def _codex_fail_queued(err: Exception) -> None:
+    """Lock storage / caps broken: fail closed. Queued jobs end `failed`, nothing runs."""
+    for jid in list(_codex_queue):
+        j = _codex_jobs.get(jid)
+        _codex_queue.remove(jid)
+        if j is not None and j["status"] == "queued":
+            j["status"], j["error"], j["failure_kind"] = "failed", str(err), "infra"
+            j["finished_at"] = time.time()
+            if jid in _codex_rt:
+                _codex_rt[jid]["task"] = ""
+
+
+def _codex_start(jid: str, locks: list) -> None:
+    j, rt = _codex_jobs[jid], _codex_rt[jid]
+    j["status"] = "running"
+    j["started_at"] = j["last_activity"] = time.time()
+    j["queue_reason"] = None
+    rt["locks"] = locks
+    atask = asyncio.get_running_loop().create_task(_codex_runner(jid))
+    rt["atask"] = atask
+    # Unconditional finalization: a task cancelled BEFORE its coroutine ran never reaches the
+    # runner's `finally`, so the job would stay `running` holding its locks forever.
+    atask.add_done_callback(lambda _t, _jid=jid: _codex_on_done(_jid))
+
+
+def _codex_on_done(jid: str) -> None:
+    j, rt = _codex_jobs.get(jid), _codex_rt.get(jid)
+    if j is None or rt is None:
+        return
+    leaked = rt.get("locks")
+    if j["status"] != "running" and not leaked:
+        return  # the runner finalized normally
+    proc = rt.get("proc")
+    if proc is not None and proc.returncode is None:
+        _codex_killpg(proc.pid)
+    if j["status"] == "running":
+        j["status"], j["error"] = "cancelled", "cancelled before the runner started"
+        j["finished_at"] = time.time()
+        rt["task"] = ""
+    rt["proc"] = None
+    _codex_release(rt.pop("locks", None))
+    _codex_pump()
+
+
+def _codex_pump(from_ticker: bool = False) -> None:
+    """Start queued jobs (FIFO) while the account gate is open, the effective caps allow and
+    the cross-process locks (checkout root + project slot + global slot) can be taken. Jobs
+    that cannot start stay queued with a `queue_reason`; the ticker retries because other
+    servers release locks without telling us."""
+    global _codex_ticker
+    try:
+        gate = _codex_gate()
+    except CodexLockError as e:
+        logging.getLogger(__name__).warning("codex admission closed: %s", e)
+        _codex_fail_queued(e)
+        _codex_save()
+        return
+    now = time.time()
+    running = [j for j in _codex_jobs.values() if j["status"] == "running"]
+    busy = {j.get("root") or j["workdir"] for j in running}
+    n = len(running)
+    for jid in list(_codex_queue):
+        j = _codex_jobs.get(jid)
+        if j is None or j["status"] != "queued":
+            _codex_queue.remove(jid)
+            continue
+        if gate["state"] == "auth_failed":
+            j["queue_reason"] = "auth_failed"
+            continue
+        if gate["state"] == "cooldown" or (j.get("not_before") or 0) > now:
+            j["queue_reason"] = "throttle_cooldown"
+            continue
+        if n >= gate["eff_global"]:
+            j["queue_reason"] = "adaptive_cap" if gate["adaptive"] else "global_cap"
+            continue
+        root = j.get("root") or j["workdir"]
+        if root in busy:
+            j["queue_reason"] = "workspace_busy"
+            continue
+        try:
+            locks = _codex_try_locks(j["workdir"], (j.get("project") or j["workdir"], root), gate)
+        except CodexLockError as e:
+            _codex_fail_queued(e)
+            break
+        if locks is None:
+            j["queue_reason"] = "waiting_for_slot"
+            continue
+        _codex_queue.remove(jid)
+        busy.add(root)
+        n += 1
+        _codex_start(jid, locks)
+    _codex_save()
+    if _codex_queue and not from_ticker and (
+            _codex_ticker is None or _codex_ticker.done()
+            or _codex_ticker.get_loop() is not asyncio.get_running_loop()):
+        _codex_ticker = asyncio.get_running_loop().create_task(_codex_tick())
+
+
+async def _codex_tick() -> None:
+    while _codex_queue:
+        await asyncio.sleep(0.5 * random.uniform(0.8, 1.2))
+        _codex_pump(from_ticker=True)
+
+
+async def _codex_watchdog(jid: str, timeout_s: float) -> None:
+    """Hard stop for a running job, independent of poll and of _run_codex_job returning."""
+    await asyncio.sleep(timeout_s + CODEX_WATCHDOG_GRACE_S)
+    j, rt = _codex_jobs.get(jid), _codex_rt.get(jid)
+    if j is None or j["status"] != "running":
+        return
+    j["watchdog_fired"] = True
+    proc = rt.get("proc") if rt else None
+    if proc is not None and proc.returncode is None:
+        _codex_killpg(proc.pid)
+    atask = rt.get("atask") if rt else None
+    if atask is not None:
+        atask.cancel()
+
+
+def _codex_apply_result(jid: str, j: dict, rt: dict, res: dict) -> None:
+    """Map one finished attempt to the job's state. A throttle may put the job BACK in the
+    queue (status `queued`, reason throttle_cooldown); auth failures stop admission."""
+    err = res.get("error") or ""
+    kind = res.get("failure_kind")
+    j["exit_code"] = res.get("exit_code")
+    j["failure_kind"] = kind
+    if res.get("session_id"):
+        j["session_id"] = res["session_id"]
+    j["final_response"] = res.get("final_response")
+    j["error"] = err or None
+    if res.get("success"):
+        j["status"] = "done"
+    elif err.startswith("codex timeout"):
+        j["status"] = "timeout"
+    elif kind == "auth":
+        j["status"] = "auth_failed"
+        try:
+            _codex_mark_auth_failed()
+        except CodexLockError as e:
+            logging.getLogger(__name__).warning("auth_failed not recorded: %s", e)
+    elif kind == "throttle":
+        try:
+            delay = _codex_note_throttle(res, j)
+        except CodexLockError as e:
+            j["status"], j["error"] = "failed", f"{err}; {e}"
+            return
+        if delay is None:
+            j["status"] = "failed"
+            j["error"] = f"codex throttled (429) tras {j.get('retry_count', 0)} reintentos: {err}"
+            return
+        now = time.time()
+        j["retry_count"] = int(j.get("retry_count") or 0) + 1
+        j["retry_at"] = j["not_before"] = now + delay
+        j["queue_reason"] = "throttle_cooldown"
+        j["status"], j["error"] = "queued", None
+        _codex_queue.appendleft(jid)  # keeps its place: it was admitted first
+    else:
+        j["status"] = "failed"
+
+
+async def _codex_runner(jid: str) -> None:
+    j, rt = _codex_jobs[jid], _codex_rt[jid]
+
+    def on_proc(proc, out_file) -> None:
+        rt["proc"] = proc
+        j["pid"] = proc.pid
+        j["out_file"] = out_file
+        j["pstart"] = _ps_field(proc.pid, "lstart")
+        _codex_save()
+
+    def on_activity() -> None:
+        now = time.time()
+        j["last_activity"] = now
+        if now - rt.get("last_save", 0) > 5:  # not on every chunk
+            rt["last_save"] = now
+            _codex_save()
+
+    wd = asyncio.get_running_loop().create_task(_codex_watchdog(jid, j["timeout_s"]))
+    try:
+        await _codex_stagger()
+        res = await _run_codex_job(
+            rt["task"], j["model"], j["effort"], j["workdir"], j["sandbox"],
+            j["timeout_s"], on_proc=on_proc, pass_fds=tuple(h.fileno() for h in rt.get("locks") or ()),
+            job_id=jid, on_activity=on_activity,
+        )
+        _codex_apply_result(jid, j, rt, res)
+    except asyncio.CancelledError:
+        if j.get("watchdog_fired"):
+            j["status"], j["error"] = "timeout", f"codex timeout (watchdog) tras {j['timeout_s']}s"
+            proc = rt.get("proc")
+            if proc is not None and proc.returncode is None:
+                _codex_killpg(proc.pid)
+        else:
+            j["status"] = "cancelled"
+            j["error"] = "cancelled"
+            raise
+    except CodexLockError as e:  # shared state unusable: fail closed
+        j["status"], j["error"], j["failure_kind"] = "failed", str(e), "infra"
+    except Exception as e:  # noqa: BLE001 - a job must always reach a terminal state
+        j["status"] = "failed"
+        j["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        wd.cancel()
+        if j["status"] != "queued":  # `queued` = put back for a throttle retry: keep its prompt
+            j["finished_at"] = time.time()
+            rt["task"] = ""  # free the (possibly large) prompt
+        rt["proc"] = None
+        _codex_release(rt.pop("locks", None))
+        _codex_pump()
+
+
+def _codex_owner_alive(base: pathlib.Path, sid: str) -> bool:
+    try:
+        lk = _flock_try(base / f"owner.{sid}.lock")
+    except OSError:
+        return False
+    if lk is None:
+        return True
+    lk.close()
+    return False
+
+
+def _codex_remote_views(ids: list) -> dict:
+    """Jobs of OTHER servers, read-only from their state files (never adopted or modified)."""
+    found: dict = {}
+    try:
+        base = _codex_state_dir()
+        files = sorted(base.glob("jobs.*.json"))
+    except OSError:
+        return found
+    for f in files:
+        sid = f.name[len("jobs."):-len(".json")]
+        if sid == _codex_sid:
+            continue
+        try:
+            prev = json.loads(_read_nofollow(f))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(prev, dict):
+            continue
+        jobs, srv = _codex_split_state(prev)
+        if not isinstance(jobs, dict) or not isinstance(srv, dict):
+            continue
+        hit = [i for i in ids if isinstance(i, str) and i in jobs and i not in found]
+        if not hit:
+            continue
+        alive = _codex_owner_alive(base, sid)
+        spid = srv.get("pid")
+        owner = {"pid": spid if isinstance(spid, int) and not isinstance(spid, bool) else None,
+                 "sid": sid, "alive": alive}
+        for jid in hit:
+            j = _codex_sanitize_job(jid, jobs[jid])
+            if j is None:
+                continue  # malformed entry: ignored (read-only, never rewritten from here)
+            if not alive and j["status"] in ("queued", "running"):
+                j["status"], j["error"] = "lost", "owner server is gone; the job can no longer progress"
+            found[jid] = _codex_job_view(j, owner)
+    return found
+
+
+def _codex_job_view(j: dict, owner: dict | None = None) -> dict:
+    now = time.time()
+    status = j["status"]
+    submitted = j.get("submitted_at") or now
+    if status == "queued":
+        elapsed = now - submitted
+    elif status == "running":
+        elapsed = now - (j.get("started_at") or now)
+    else:
+        elapsed = (j.get("finished_at") or now) - (j.get("started_at") or submitted)
+    view = {
+        "id": j["id"], "status": status, "elapsed_s": round(max(elapsed, 0), 1),
+        "model": j.get("model"), "workdir": j.get("workdir"),
+        "task_preview": j.get("task_preview"),
+    }
+    if status == "queued":
+        view["queued_s"] = round(max(now - submitted, 0), 1)
+        if j.get("queue_reason"):
+            view["queue_reason"] = j["queue_reason"]
+        if owner is None and j["id"] in _codex_queue:
+            view["queue_position"] = list(_codex_queue).index(j["id"]) + 1
+        if (j.get("retry_at") or 0) > now:
+            view["retry_in_s"] = round(j["retry_at"] - now, 1)
+    if j.get("retry_count"):
+        view["retry_count"] = j["retry_count"]
+    if j.get("last_activity"):
+        view["last_activity_age_s"] = round(max(now - j["last_activity"], 0), 1)
+    for k in ("exit_code", "session_id", "failure_kind"):
+        if j.get(k) is not None:
+            view[k] = j[k]
+    if owner is None:
+        owner = {"pid": os.getpid(), "sid": _codex_sid, "alive": True}
+    view["owner"] = owner
+    if j.get("error"):
+        view["error"] = j["error"]
+    if status in ("done", "failed", "timeout") and j.get("final_response"):
+        view["final_response"] = _truncate_words(j["final_response"])
+    return view
+
+
+@mcp.tool()
+async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dict:
+    """
+    Lanza una o varias tareas de Codex SIN esperar y devuelve los ids de inmediato; el
+    orquestador sigue trabajando y consulta con `poll_codex(ids)`. Pensado para lanzar
+    muchas tarjetas en paralelo (ver `delegate_to_codex` para una sola y bloqueante).
+
+    Cada elemento de `tasks`: {task (obligatorio), workdir='.', model='luna',
+    effort='low', sandbox='workspace-write', timeout_s=1800}. Mismas reglas y alias que
+    `delegate_to_codex`. ATÓMICO: se validan TODAS antes de lanzar ninguna; si una falla,
+    no arranca nada y la respuesta trae el error de cada elemento inválido.
+
+    Regla de operación: UN worktree por job (git worktree add). Los jobs del mismo checkout
+    se serializan; los worktrees de un repo comparten el tope por proyecto.
+
+    Límites: máximo DELEGATE_CODEX_MAX_CONCURRENT (default 8) corriendo a la vez EN TOTAL
+    entre todas las sesiones/servidores y DELEGATE_CODEX_MAX_PER_PROJECT (default 6) por
+    proyecto (git common dir), ambos con flock en ~/.codex-jobs; el resto espera en cola
+    FIFO (tope DELEGATE_CODEX_MAX_QUEUE=32, contado contra los slots REALMENTE libres).
+    UN solo job por checkout/worktree a la vez, también entre sesiones. Los lanzamientos se
+    escalonan 2.5 s. Un 429 pone un cooldown de toda la cuenta y reintenta (máx 3);
+    3 throttles en 5 min reducen la admisión a la mitad por 10 min. `refresh_token_reused`/401
+    = `auth_failed`: no se admite nada hasta `codex login`. `timeout_s` cuenta desde que
+    arranca. Los jobs mueren con el server.
+    Cuota semanal: > 85% agrega `warning`; solo rechaza si se define DELEGATE_CODEX_QUOTA_REFUSE_PCT (salvo `allow_over_quota=true`).
+    ⚠️ Mismo aviso de privacidad: modelo cloud, nunca con PHI/PII.
+
+    Returns: {"jobs": [{"index", "id", "status"} | {"index", "error"}], "max_concurrent": N,
+              "account": {...}, "warning"?}
+    """
+    _codex_ensure_loaded()
+    _codex_install_shutdown_hooks()
+    if not isinstance(tasks, list) or not tasks:
+        return {"success": False, "error": "tasks debe ser una lista no vacía"}
+    qerr, warning = _codex_quota_gate(allow_over_quota)
+    if qerr:
+        return qerr
+    # Phase 1: validate everything. Nothing is started unless every element is valid.
+    planned: list[dict] = []
+    errors: list[dict] = []
+    for i, t in enumerate(tasks):
+        if not isinstance(t, dict):
+            errors.append({"index": i, "error": "elemento no es un objeto"})
+            continue
+        task = t.get("task")
+        if not isinstance(task, str) or not task.strip():
+            errors.append({"index": i, "error": "task vacío"})
+            continue
+        timeout_s = t.get("timeout_s", 1800)
+        if (not isinstance(timeout_s, int) or isinstance(timeout_s, bool)
+                or not 1 <= timeout_s <= CODEX_MAX_TIMEOUT_S):
+            errors.append({"index": i, "error": f"timeout_s inválido (1..{CODEX_MAX_TIMEOUT_S})"})
+            continue
+        sandbox = t.get("sandbox", "workspace-write")
+        err, (model, effort, workdir_abs) = await _validate_codex_request(
+            task, t.get("workdir", "."), t.get("model", CODEX_DEFAULT_MODEL),
+            t.get("effort", CODEX_DEFAULT_EFFORT), sandbox,
+        )
+        if err:
+            errors.append({"index": i, "error": err["error"]})
+            continue
+        planned.append({"index": i, "task": task, "timeout_s": timeout_s, "sandbox": sandbox,
+                        "model": model, "effort": effort, "workdir_abs": workdir_abs,
+                        "ident": _codex_identity(workdir_abs)})
+    # Admission (fail closed): caps/storage must be sound and the account must not be in
+    # auth_failure. Then RESERVE real slots for the new jobs; whatever cannot get one waits
+    # in the queue, and the queue bound is checked against that real count (a slot taken by
+    # another server counts as waiting, not as free).
+    reserved: list = [None] * len(planned)
+
+    def _drop_reservations() -> None:
+        for r in reserved:
+            _codex_release(r)
+
+    if not errors:
+        try:
+            gate = _codex_gate()
+            if gate["state"] == "auth_failed":
+                return {"success": False, "error": gate["message"], "account": _codex_account_view()}
+            _codex_pump()  # older queued jobs go first
+            if not _codex_queue and gate["state"] == "ok":
+                for i, p in enumerate(planned):
+                    reserved[i] = _codex_try_locks(p["workdir_abs"], p["ident"], gate)
+        except CodexLockError as e:
+            _drop_reservations()
+            return {"success": False, "error": f"admisión cerrada (fail closed): {e}"}
+        waiting = len(_codex_queue) + sum(1 for r in reserved if r is None)
+        if waiting > CODEX_MAX_QUEUE:
+            _drop_reservations()
+            errors.append({"index": 0, "error": f"cola llena ({CODEX_MAX_QUEUE} en espera); reintenta luego"})
+    if errors:
+        bad = {e["index"] for e in errors}
+        return {
+            "success": False,
+            "error": "submit rechazado: ningún job se lanzó porque hay tareas inválidas",
+            "jobs": [next(e for e in errors if e["index"] == i) if i in bad else {"index": i}
+                     for i in range(len(tasks))],
+        }
+    # Phase 2: create + start. No awaits between creation and the end of the loop.
+    jobs_out: list[dict] = []
+    for p, locks in zip(planned, reserved):
+        jid = "cx-" + uuid.uuid4().hex[:12]
+        _codex_jobs[jid] = {
+            "id": jid, "status": "queued", "model": p["model"], "effort": p["effort"],
+            "workdir": os.path.realpath(p["workdir_abs"]), "sandbox": p["sandbox"],
+            "timeout_s": p["timeout_s"], "task_preview": p["task"].strip()[:80],
+            "submitted_at": time.time(), "started_at": None, "finished_at": None,
+            "pid": None, "error": None, "final_response": None,
+            "project": p["ident"][0], "root": p["ident"][1], "retry_count": 0,
+        }
+        _codex_rt[jid] = {"task": p["task"], "proc": None, "atask": None, "locks": None}
+        if locks is not None:
+            _codex_start(jid, locks)
+        else:
+            _codex_queue.append(jid)
+        jobs_out.append({"index": p["index"], "id": jid})
+    _codex_pump()
+    for entry in jobs_out:
+        entry["status"] = _codex_jobs[entry["id"]]["status"]
+    out = {"jobs": jobs_out, "max_concurrent": CODEX_MAX_CONCURRENT, "account": _codex_account_view()}
+    if warning:
+        out["warning"] = warning
+    return out
+
+
+@mcp.tool()
+async def poll_codex(ids: list[str]) -> dict:
+    """
+    Estado de jobs lanzados con `submit_codex`, también los de OTROS servidores vivos (se leen
+    de sus archivos de estado, solo lectura). Por job: status
+    (queued | running | done | failed | cancelled | timeout | auth_failed | lost | unknown),
+    elapsed_s y, si terminó, `final_response` recortada a ~300 palabras. Extras cuando aplican:
+    `queue_reason` + `queued_s` (por qué espera y desde cuándo: global_cap, adaptive_cap,
+    workspace_busy, waiting_for_slot, throttle_cooldown, auth_failed), `retry_count` /
+    `retry_in_s`, `last_activity_age_s`, `exit_code`, `session_id`, `failure_kind`
+    (auth | quota | throttle | infra | other) y `owner` {pid, sid, alive}. `account` resume
+    el estado compartido (ok | cooldown | auth_failed) y los topes efectivos.
+    `lost` = el server dueño murió con el job en cola/corriendo: el resultado se desconoce
+    (revisa el workdir/git a mano). `auth_failed` = corre `codex login`.
+    `done` solo significa que la CLI de Codex salió con código 0; NO es verificación: verifica
+    el trabajo tú.
+
+    Args:
+        ids: ids devueltos por submit_codex.
+    """
+    _codex_ensure_loaded()
+    if not isinstance(ids, list):
+        return {"success": False, "error": "ids debe ser una lista"}
+    remote = _codex_remote_views([i for i in ids if isinstance(i, str) and i not in _codex_jobs])
+    out = []
+    for jid in ids:
+        j = _codex_jobs.get(jid) if isinstance(jid, str) else None
+        if j:
+            out.append(_codex_job_view(j))
+        else:
+            out.append(remote.get(jid) or {"id": jid, "status": "unknown"})
+    return {"jobs": out, "account": _codex_account_view()}
+
+
+@mcp.tool()
+async def cancel_codex(id: str) -> dict:
+    """
+    Cancela un job de `submit_codex`: si está en cola lo saca; si corre, mata su grupo de
+    procesos. Un job ya terminado se devuelve tal cual (no-op).
+
+    Args:
+        id: id devuelto por submit_codex.
+    """
+    _codex_ensure_loaded()
+    j = _codex_jobs.get(id) if isinstance(id, str) else None
+    if j is None:
+        return {"id": id, "status": "unknown"}
+    if j["status"] == "queued":
+        try:
+            _codex_queue.remove(id)
+        except ValueError:
+            pass
+        j["status"] = "cancelled"
+        j["error"] = "cancelled"
+        j["finished_at"] = time.time()
+        _codex_rt.get(id, {})["task"] = ""
+        _codex_pump()
+    elif j["status"] == "running":
+        atask = _codex_rt[id].get("atask")
+        if atask is not None:
+            atask.cancel()
+            # The runner's CancelledError path kills the process group and sets `cancelled`.
+            await asyncio.wait({atask}, timeout=15)
+        _codex_on_done(id)  # unconditional: a task cancelled before it started never ran its finally
+    return _codex_job_view(j)
 
 
 # SSRF guard for delegate_to_provider. If DELEGATE_PROVIDER_ALLOWED_HOSTS is set, only

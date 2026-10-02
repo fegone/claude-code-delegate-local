@@ -44,14 +44,15 @@ def test_old_cli_rejected_for_6_1_but_not_others(monkeypatch):
 
 def test_codex_cmd_without_effort_has_no_config_flag():
     cmd = server._codex_cmd("gpt-6.1-sol", "/w", "read-only", "/o", "hi")
-    assert "-c" not in cmd
+    assert not any(a.startswith("model_reasoning_effort") for a in cmd)
+    assert 'forced_login_method="chatgpt"' in cmd
     assert cmd[-2:] == ["--", "hi"]
 
 
 def test_codex_cmd_effort_before_terminator_and_task_last():
     cmd = server._codex_cmd("gpt-6.1-sol", "/w", "read-only", "/o", "hi", effort="low")
-    i = cmd.index("-c")
-    assert cmd[i + 1] == 'model_reasoning_effort="low"'
+    i = cmd.index('model_reasoning_effort="low"') - 1
+    assert cmd[i] == "-c"
     assert i < cmd.index("--")
     assert cmd[-1] == "hi"
 

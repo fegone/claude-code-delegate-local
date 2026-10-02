@@ -149,8 +149,42 @@ cannot route a local model outward.
 | `delegate_batch(tasks)` | **NEW v0.5.0** — Dispatch up to 4 agent tasks in parallel via `asyncio.gather`. Each task is a dict `{agent_name, task, workdir?, max_turns?, model?, max_tokens?}`. Returns per-task results in input order. Reuses same agent_name across tasks for KV-cache prefix benefit (~30-50% prompt savings on local llama.cpp). |
 | `delegate_to_provider(provider_url, api_key, model, agent_name, task, ...)` | Run an agent on any arbitrary endpoint (DeepSeek, OpenRouter, etc.) |
 | `delegate_to_codex(task, workdir, model, sandbox, timeout_s)` | **NEW** — Delegate to the OpenAI **Codex CLI** as an autonomous agent, authenticated by the user's **ChatGPT subscription** (Plus/Pro) — OpenAI's official path, no API key, no proxy. Codex does its own file edits + shell in its sandbox; the tool shells out to `codex exec` and returns the final message. Default model `gpt-6.1-sol` (needs codex-cli ≥ 0.159; older CLIs get a clear upgrade error, no auto-upgrade). Plan-allowed: `gpt-6.1-sol`, `gpt-6-astra` (frontier), `gpt-6-sol`, `gpt-6-luna` (fast/cheap), the older `gpt-5.6-sol`/`terra`/`luna` + `gpt-5.5`/`5.4`/`5.4-mini`. Short aliases: `sol` → 6.1-sol, `astra`, `luna` → 6-luna, `6-sol`, `6.1-sol`, `terra` → 6-sol (terra retired 2026-09-30), `5.6-*`, `5.5`. (`gpt-5.6`/`-codex` 400 on a subscription.) ⚠️ Cloud model — never for PHI. ⚠️ Plus plan = ~15-80 msgs / 5h window. Env: `DELEGATE_CODEX_BIN`, `DELEGATE_CODEX_MODEL`. |
+| `submit_codex(tasks)` | Launch one or many Codex runs **without waiting**; returns job ids at once. Each task: `{task, workdir, model, effort, sandbox, timeout_s}` (same rules/aliases as `delegate_to_codex`). Atomic: every task is validated before any starts. At most `DELEGATE_CODEX_MAX_CONCURRENT` (default **8**) run at once **across all sessions**, and at most `DELEGATE_CODEX_MAX_PER_PROJECT` (default **6**, must be > 0 and <= the global cap) per project (project = canonical `git rev-parse --git-common-dir`, so every linked worktree of a repo shares one cap). One job per checkout/worktree root at a time (two subdirs of one checkout conflict). Slots are flock files in `~/.codex-jobs/` (override `DELEGATE_CODEX_STATE_DIR`); if that storage fails the server **fails closed** and runs nothing. The rest wait in a FIFO queue (`DELEGATE_CODEX_MAX_QUEUE`, default 32), counted against the slots that are really free. Launches are staggered by `DELEGATE_CODEX_STAGGER_S` (default 2.5 s) across all servers. Each run gets its own SQLite home (`-c sqlite_home=`) while the single login stays in `CODEX_HOME`, and `forced_login_method="chatgpt"`. Per-job `timeout_s` counts from start and is enforced by a watchdog. Jobs die with the server; after a SIGKILL the next server start kills verified orphans (`killed_on_restart`). Weekly quota from `~/.codex/sessions`: above 85 % (`DELEGATE_CODEX_QUOTA_WARN`) a `warning` is added, it never blocks by default; it refuses only when `DELEGATE_CODEX_QUOTA_REFUSE_PCT` is set and exceeded, unless `allow_over_quota=true`. `$HOME` and `/` are refused as workdir. |
+| `poll_codex(ids)` | Per job: `status`, `elapsed_s`, and `final_response` cut to ~300 words / 4000 chars; also reports jobs of **other live servers** (read-only, from their state files). See "Operating Codex jobs" below for every status and field. `done` only means the CLI exited 0 — it is not verification. |
+| `cancel_codex(id)` | Dequeue a queued job or kill the process group of a running one; always ends `cancelled` with its locks released. No-op on finished jobs. |
 | `list_local_agents()` | List agents found in `DELEGATE_LOCAL_AGENTS_DIR` with their frontmatter metadata |
 | `local_backend_status()` | Health check + list of models available on the configured backend |
+
+### Operating Codex jobs
+
+**Rule: one worktree per job.** Create `git worktree add ../wt-<card> -b <card>` for every card and
+pass that path as `workdir`. Two jobs in one checkout are serialized on purpose (they would overwrite
+each other and fight over `index.lock`); worktrees of the same repo are separate checkouts but share
+the per-project cap. Integrate branches one at a time.
+
+**Ramp plan.** Defaults are 8 global / 6 per project. Raise by env, one step at a time, only after a
+clean block of work at the current step (few `throttle` retries, no `auth_failed`, memory fine):
+`DELEGATE_CODEX_MAX_CONCURRENT=12` (with `MAX_PER_PROJECT=8`), then 16, then 20 (`MAX_PER_PROJECT=10`).
+Every server must run the same caps and the same `DELEGATE_CODEX_STATE_DIR`.
+
+**Statuses.** `queued` (see `queue_reason`: `global_cap`, `adaptive_cap`, `workspace_busy`,
+`waiting_for_slot`, `throttle_cooldown`, `auth_failed`) · `running` · `done` (CLI exit 0) · `failed`
+(`failure_kind`: `quota`, `throttle` after 3 retries, `infra`, `other`) · `timeout` · `cancelled` ·
+`auth_failed` (login invalid: run `codex login`; admission resumes by itself once `auth.json`
+changes) · `lost` / `killed_on_restart` (owner server died). Extra fields: `queued_s`, `retry_count`,
+`retry_in_s`, `last_activity_age_s`, `exit_code`, `session_id`, `owner` `{pid, sid, alive}`; the
+poll response also carries `account` (`ok` / `cooldown` / `auth_failed` and the effective caps).
+
+**429 handling.** codex-cli 0.159.2 does not retry direct HTTP 429s (`retry_429: false`), so the server
+does: a throttle sets an account-wide cooldown shared by all servers (`shared.json` in the state dir),
+honors a `Retry-After`-style hint if the output has one, else backs off 5/10/20/40/60 s with jitter,
+and retries the job up to 3 times (the prompt is replayed from the start; `session_id` is recorded for
+manual inspection). Three throttles in 5 minutes halve the effective caps for 10 minutes. Quota
+exhaustion and auth failures are never retried.
+
+**`done` is not "verified".** Codex exiting 0 says nothing about whether the change is correct. Run
+the project's own tests in the job's worktree (or a separate runner) yourself and merge only what
+passes; sandbox-restricted or skipped tests count as unverified.
 
 ### Note on `delegate_batch` and sub-agents
 
