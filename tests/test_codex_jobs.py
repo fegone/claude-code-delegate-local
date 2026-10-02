@@ -35,6 +35,8 @@ async def fake(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "CODEX_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(server, "CODEX_SESSIONS_DIR", str(tmp_path / "sessions"))
     monkeypatch.setattr(server, "CODEX_MAX_CONCURRENT", 4)
+    monkeypatch.setattr(server, "CODEX_MAX_PER_PROJECT", 4)
+    monkeypatch.setattr(server, "CODEX_STAGGER_S", 0.0)
     monkeypatch.setattr(server, "CODEX_MAX_QUEUE", 32)
     _reset()
     dirs = []
@@ -107,6 +109,7 @@ async def test_failed_job_and_atomic_invalid(fake):
 
 async def test_concurrency_limit(fake, monkeypatch):
     monkeypatch.setattr(server, "CODEX_MAX_CONCURRENT", 2)
+    monkeypatch.setattr(server, "CODEX_MAX_PER_PROJECT", 2)
     r = await server.submit_codex([T(fake[i], task="sleep=0.6") for i in range(4)])
     ids = [e["id"] for e in r["jobs"]]
     st = [e["status"] for e in r["jobs"]]
@@ -125,6 +128,7 @@ async def test_concurrency_limit(fake, monkeypatch):
 
 async def test_queue_bound(fake, monkeypatch):
     monkeypatch.setattr(server, "CODEX_MAX_CONCURRENT", 1)
+    monkeypatch.setattr(server, "CODEX_MAX_PER_PROJECT", 1)
     monkeypatch.setattr(server, "CODEX_MAX_QUEUE", 1)
     ok = await server.submit_codex([T(fake[i], task="sleep=0.5") for i in range(2)])
     assert [("id" in e) for e in ok["jobs"]] == [True, True]  # 1 running + 1 waiting
@@ -177,11 +181,11 @@ async def test_restart_reports_lost(fake):
     a, b, c = (e["id"] for e in r["jobs"])
     await _wait([c], lambda j: j[0]["status"] == "done")
     mine = server._codex_state_file()
-    saved = json.load(open(mine))
+    saved = json.load(open(mine))["jobs"]
     assert saved[a]["status"] == "running" and saved[b]["status"] == "queued"
     # simulate a restart: cancel the real tasks (kills codex), wipe memory, and leave the
     # file behind under the name of a session that no longer holds its owner lock
-    snapshot = json.dumps(saved)
+    snapshot = open(mine).read()
     pid = server._codex_jobs[a]["pid"]
     for rt in server._codex_rt.values():
         if rt.get("atask"):
@@ -194,7 +198,7 @@ async def test_restart_reports_lost(fake):
     assert [j["status"] for j in jobs] == ["lost", "lost", "done"]
     assert "restarted" in jobs[0]["error"]
     # persisted as lost, so a second restart still reports it
-    assert json.load(open(server._codex_state_file()))[a]["status"] == "lost"
+    assert json.load(open(server._codex_state_file()))["jobs"][a]["status"] == "lost"
 
 
 async def test_delegate_to_codex_still_works(fake):

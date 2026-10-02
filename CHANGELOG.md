@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (2026-10-02 — Codex job manager, review round 2)
+
+Project identity is the canonical git common dir (linked worktrees share the per-project cap) and
+exclusion is per checkout root; lock-storage failures and invalid caps fail closed; the queue bound
+counts slots really free (other servers included); cancelling before the runner starts finalizes the
+job; `returncode=None` is never success; failures are classified (auth / quota / throttle / infra);
+429s trigger a shared account cooldown, up to 3 retries, and an adaptive halving of admission;
+`refresh_token_reused` marks `auth_failed` and pauses admission; `poll_codex` reports other live
+servers' jobs read-only; each job gets its own `sqlite_home`, `forced_login_method="chatgpt"` and
+staggered launches. Defaults are now 8 global / 6 per project.
+
 ### Changed (2026-09-30 — Codex default is `gpt-6-luna` at effort `low`)
 
 Bench of 48 runs (4 coding tasks with hidden tests, from a one-file bugfix to a DST-aware cron

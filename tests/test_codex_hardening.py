@@ -43,10 +43,13 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "CODEX_JOBS_FILE", str(tmp_path / "legacy.json"))
     monkeypatch.setattr(server, "CODEX_SESSIONS_DIR", str(sessions), raising=False)
     monkeypatch.setattr(server, "CODEX_MAX_CONCURRENT", 4)
+    monkeypatch.setattr(server, "CODEX_MAX_PER_PROJECT", 4)
+    monkeypatch.setattr(server, "CODEX_STAGGER_S", 0.0)
     for k, v in {
         "DELEGATE_CODEX_BIN": str(exe), "DELEGATE_CODEX_STATE_DIR": str(state),
         "DELEGATE_CODEX_JOBS_FILE": str(tmp_path / "legacy.json"),
         "DELEGATE_CODEX_SESSIONS_DIR": str(sessions), "DELEGATE_LOG": "0",
+        "DELEGATE_CODEX_STAGGER_S": "0",
         "PYTHONPATH": ROOT,
     }.items():
         monkeypatch.setenv(k, v)
@@ -205,7 +208,7 @@ async def test_watchdog_enforces_timeout_without_poll(env, monkeypatch):
 def test_global_concurrency_across_two_servers(env, monkeypatch):
     log = str(env / "overlap.log")
     monkeypatch.setenv("DELEGATE_CODEX_MAX_CONCURRENT", "2")
-    monkeypatch.setenv("DELEGATE_CODEX_MAX_PER_PROJECT", "0")
+    monkeypatch.setenv("DELEGATE_CODEX_MAX_PER_PROJECT", "2")
     a = _run_helper(env, "submit", str(env), "1.0", log, "3")
     b = _run_helper(env, "submit", str(env), "1.0", log, "3")
     for h in (a, b):
@@ -289,8 +292,8 @@ def test_default_caps(monkeypatch):
     monkeypatch.delenv("DELEGATE_CODEX_MAX_PER_PROJECT", raising=False)
     monkeypatch.delenv("DELEGATE_CODEX_QUOTA_REFUSE_PCT", raising=False)
     src = open(os.path.join(ROOT, "server.py")).read()
-    assert 'DELEGATE_CODEX_MAX_CONCURRENT", "16"' in src
-    assert 'DELEGATE_CODEX_MAX_PER_PROJECT", "8"' in src
+    assert 'DELEGATE_CODEX_MAX_CONCURRENT", "8"' in src
+    assert 'DELEGATE_CODEX_MAX_PER_PROJECT", "6"' in src
 
 
 def test_project_is_git_toplevel(tmp_path):
@@ -300,19 +303,37 @@ def test_project_is_git_toplevel(tmp_path):
     plain = tmp_path / "plain"
     plain.mkdir()
     real = os.path.realpath
-    assert server._codex_project(str(repo / "a" / "b")) == real(repo)
-    assert server._codex_project(str(repo)) == real(repo)
+    # project identity = the git common dir; the checkout root is the exclusion unit
+    assert server._codex_project(str(repo / "a" / "b")) == real(repo / ".git")
+    assert server._codex_project(str(repo)) == real(repo / ".git")
+    assert server._codex_identity(str(repo / "a" / "b"))[1] == real(repo)
     assert server._codex_project(str(plain)) == real(plain)
 
 
+def _git_worktrees(tmp, name, n):
+    """A real repo with n linked worktrees: distinct checkouts of ONE project."""
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp), "GIT_CONFIG_NOSYSTEM": "1"}
+    repo = tmp / name
+    repo.mkdir()
+    g = ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(g + ["init", "-q"], check=True, capture_output=True, env=env)
+    subprocess.run(g + ["commit", "--allow-empty", "-q", "-m", "x"], check=True, capture_output=True, env=env)
+    out = []
+    for i in range(n):
+        wt = tmp / f"{name}-wt{i}"
+        subprocess.run(g + ["worktree", "add", "-q", str(wt), "-b", f"b{i}"],
+                       check=True, capture_output=True, env=env)
+        out.append(str(wt))
+    return out
+
+
 def test_per_project_cap_across_two_servers_global_stays_open(env, monkeypatch):
-    repo = env / "repo"
-    (repo / ".git").mkdir(parents=True)
+    wts = _git_worktrees(env, "repo", 6)
     log = str(env / "overlap.log")
     monkeypatch.setenv("DELEGATE_CODEX_MAX_CONCURRENT", "16")
     monkeypatch.setenv("DELEGATE_CODEX_MAX_PER_PROJECT", "2")
-    a = _run_helper(env, "submit", str(repo), "1.0", log, "3")
-    b = _run_helper(env, "submit", str(repo), "1.0", log, "3")
+    a = _run_helper(env, "submit", wts[0], "1.0", log, "3", "dirs:" + ",".join(wts[:3]))
+    b = _run_helper(env, "submit", wts[3], "1.0", log, "3", "dirs:" + ",".join(wts[3:]))
     for h in (a, b):
         out, err = h.communicate(timeout=60)
         assert json.loads(out) == ["done"] * 3, err
@@ -320,10 +341,8 @@ def test_per_project_cap_across_two_servers_global_stays_open(env, monkeypatch):
     assert n == 6 and peak <= 2, f"project cap 2 but {peak} ran at once"
     # a different project is not throttled by the first one's cap
     log2 = str(env / "overlap2.log")
-    other, other2 = env / "other1", env / "other2"
-    for d in (other, other2):
-        (d / ".git").mkdir(parents=True)
-    procs = [_run_helper(env, "submit", str(d), "1.0", log2, "2") for d in (other, other2)]
+    o1, o2 = _git_worktrees(env, "other1", 2), _git_worktrees(env, "other2", 2)
+    procs = [_run_helper(env, "submit", d[0], "1.0", log2, "2", "dirs:" + ",".join(d)) for d in (o1, o2)]
     for h in procs:
         out, err = h.communicate(timeout=60)
         assert json.loads(out) == ["done"] * 2, err

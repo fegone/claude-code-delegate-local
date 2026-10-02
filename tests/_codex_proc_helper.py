@@ -2,6 +2,7 @@
 Modes: submit <workdir> <sleep_s> <log> <n>  |  hang <workdir>  |  touch"""
 import asyncio
 import json
+import os
 import sys
 
 import server
@@ -26,16 +27,18 @@ async def main():
         jid = r["jobs"][0]["id"]
         while not server._codex_jobs[jid]["pid"]:
             await asyncio.sleep(0.05)
-        print(json.dumps({"pid": server._codex_jobs[jid]["pid"]}), flush=True)
+        print(json.dumps({"pid": server._codex_jobs[jid]["pid"], "id": jid, "server_pid": os.getpid()}), flush=True)
         await asyncio.sleep(60)
         return
     sleep_s, log, n = sys.argv[3], sys.argv[4], int(sys.argv[5])
-    import os
-    dirs = []
-    for i in range(n):
-        d = os.path.join(wd, f"w{os.getpid()}_{i}") if len(sys.argv) < 7 else wd
-        os.makedirs(d, exist_ok=True)
-        dirs.append(d)
+    if len(sys.argv) >= 7 and sys.argv[6].startswith("dirs:"):
+        dirs = sys.argv[6][len("dirs:"):].split(",")  # pre-made checkouts/worktrees
+    else:
+        dirs = []
+        for i in range(n):
+            d = os.path.join(wd, f"w{os.getpid()}_{i}") if len(sys.argv) < 7 else wd
+            os.makedirs(d, exist_ok=True)
+            dirs.append(d)
     r = await server.submit_codex(
         [{"task": f"sleep={sleep_s};log={log}", "workdir": d} for d in dirs]
     )
