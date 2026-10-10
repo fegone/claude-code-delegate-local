@@ -86,7 +86,7 @@ def _gateway_from_file(path: str) -> str:
     `{"selector": "<litellm|bifrost>"}`. Nunca imprime el contenido del archivo."""
     label = "DELEGATE_GATEWAY_FILE"
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         raise ValueError(f"{label} no se puede abrir ({exc.strerror})") from None
     try:
@@ -115,6 +115,8 @@ def _gateway_from_file(path: str) -> str:
 
 
 _GATEWAY_FILE = os.getenv("DELEGATE_GATEWAY_FILE", "").strip()
+if "DELEGATE_GATEWAY_FILE" in os.environ and not _GATEWAY_FILE:
+    raise ValueError("DELEGATE_GATEWAY_FILE debe ser una ruta no vacia")
 # Con archivo, el archivo manda sobre DELEGATE_GATEWAY; sin él, comportamiento de siempre.
 GATEWAY = (
     _gateway_from_file(_GATEWAY_FILE)

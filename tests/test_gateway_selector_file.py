@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -117,3 +118,45 @@ def test_sin_archivo_comportamiento_de_siempre():
     assert _load({"DELEGATE_GATEWAY": "bifrost", **BIF}, "unset_env").GATEWAY == "bifrost"
     with pytest.raises(ValueError, match="DELEGATE_GATEWAY"):
         _load({"DELEGATE_GATEWAY": "kong"}, "unset_kong")
+
+
+@pytest.mark.parametrize("value", ["", " ", "\t\n"])
+def test_archivo_env_blank_es_error_no_fallback(value):
+    with pytest.raises(ValueError, match="DELEGATE_GATEWAY_FILE"):
+        _load({"DELEGATE_GATEWAY_FILE": value, "DELEGATE_GATEWAY": "bifrost", **BIF}, "blank")
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="os.mkfifo unavailable")
+def test_fifo_es_error_sin_bloquear(tmp_path):
+    fifo = tmp_path / "selector.fifo"
+    os.mkfifo(fifo, 0o600)
+    env = {k: v for k, v in os.environ.items() if k not in _GATEWAY_ENV}
+    env["DELEGATE_GATEWAY_FILE"] = str(fifo)
+    result = subprocess.run(
+        [sys.executable, "-c", "import server"],
+        cwd=Path(__file__).resolve().parent.parent,
+        env=env, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0
+    assert "DELEGATE_GATEWAY_FILE debe ser un archivo regular" in result.stderr
+
+
+@pytest.mark.parametrize("url", [None, "", " ", BIF["DELEGATE_BIFROST_URL"]])
+def test_reload_valida_url_real(tmp_path, url):
+    f = _sel(tmp_path, {"selector": "bifrost", "secret": "SECRET-must-not-print"})
+    env = {k: v for k, v in os.environ.items() if k not in _GATEWAY_ENV}
+    env["DELEGATE_GATEWAY_FILE"] = f
+    if url is not None:
+        env["DELEGATE_BIFROST_URL"] = url
+    script = Path(__file__).resolve().parent.parent / "scripts" / "reload-delegate.sh"
+    result = subprocess.run(
+        ["bash", str(script)], env=env, capture_output=True, text=True, timeout=30,
+    )
+    if url and url.strip():
+        assert result.returncode == 0
+        assert "next MCP spawn will use gateway: bifrost" in result.stdout
+    else:
+        assert result.returncode == 1
+        assert "DELEGATE_BIFROST_URL" in result.stderr
+        assert "next MCP spawn" not in result.stdout
+    assert "SECRET-must-not-print" not in result.stdout + result.stderr

@@ -21,8 +21,7 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 # Import server.py in a throwaway interpreter: it runs the same startup validation.
 # DELEGATE_BIFROST_URL is only required for the bifrost value; pass through if set.
 exec uv run --quiet --directory "$here" python - "$here" <<'PY'
-import importlib.util, sys, os
-os.environ.setdefault("DELEGATE_BIFROST_URL", "http://127.0.0.1:1")  # validation only
+import importlib.util, sys
 spec = importlib.util.spec_from_file_location("server_reload_check", sys.argv[1] + "/server.py")
 m = importlib.util.module_from_spec(spec)
 try:
