@@ -1,0 +1,26 @@
+{
+  "lanes": [
+    {"name": "cloud", "alias": "FILL_CLOUD_ALIAS", "provider": "FILL_CLOUD_PROVIDER"},
+    {"name": "local", "alias": "FILL_LOCAL_ALIAS", "provider": "FILL_LOCAL_PROVIDER"}
+  ],
+  "batch_size": 3,
+  "rack_file": "/FILL/ABSOLUTE/PATH/rack_ai_bifrost_code.prom",
+  "rack_consumer": "coding",
+  "rack_wait_s": 120,
+  "selector_file": "/FILL/ABSOLUTE/PATH/delegate-gateway.json",
+  "litellm_value": "litellm",
+  "bifrost_value": "bifrost",
+  "reload_argv": ["/Users/felixgonzalez/dev/claude-delegate-local/scripts/reload-delegate.sh"],
+  "health_url": "http://127.0.0.1:4000/health/liveliness",
+  "rollback_probe": {
+    "alias": "FILL_ROLLBACK_ALIAS",
+    "vk_file": "/FILL/ABSOLUTE/PATH/litellm-probe.vk",
+    "routes": {
+      "litellm": {"port": 4000, "served_by_header": "FILL_HEADER_ONLY_LITELLM_SETS", "served_by_value": "FILL"},
+      "bifrost": {"port": 0, "served_by_header": "FILL_HEADER_ONLY_BIFROST_SETS", "served_by_value": "FILL"}
+    }
+  },
+  "observation_file": "/FILL/ABSOLUTE/PATH/policy-events.jsonl",
+  "observation_key_file": "/FILL/ABSOLUTE/PATH/observation.key",
+  "observation_hours": 24
+}
