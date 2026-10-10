@@ -79,7 +79,48 @@ def _gateway_from_env(raw: str | None) -> str:
     return val
 
 
-GATEWAY = _gateway_from_env(os.getenv("DELEGATE_GATEWAY"))
+def _gateway_from_file(path: str) -> str:
+    """T16 · selector en archivo (`DELEGATE_GATEWAY_FILE`). Mismo rigor que un valor
+    desconocido en el env: cualquier defecto es error de ARRANQUE, nunca fallback.
+    Exige archivo regular (sin symlink), del uid actual, modo 0600 y JSON
+    `{"selector": "<litellm|bifrost>"}`. Nunca imprime el contenido del archivo."""
+    label = "DELEGATE_GATEWAY_FILE"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise ValueError(f"{label} no se puede abrir ({exc.strerror})") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{label} debe ser un archivo regular")
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError(f"{label} debe tener modo 0600")
+        if info.st_uid != os.geteuid():
+            raise ValueError(f"{label} debe ser del uid que corre el MCP")
+        raw = os.read(fd, 4097)
+    finally:
+        os.close(fd)
+    if len(raw) > 4096:
+        raise ValueError(f"{label} demasiado grande")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError(f"{label} no es JSON valido") from None
+    sel = data.get("selector") if isinstance(data, dict) else None
+    if not isinstance(sel, str) or sel not in GATEWAY_VALUES:
+        raise ValueError(
+            f"{label}: 'selector' debe ser un string en ({' | '.join(GATEWAY_VALUES)})"
+        )
+    return sel
+
+
+_GATEWAY_FILE = os.getenv("DELEGATE_GATEWAY_FILE", "").strip()
+# Con archivo, el archivo manda sobre DELEGATE_GATEWAY; sin él, comportamiento de siempre.
+GATEWAY = (
+    _gateway_from_file(_GATEWAY_FILE)
+    if _GATEWAY_FILE
+    else _gateway_from_env(os.getenv("DELEGATE_GATEWAY"))
+)
 # Solo se exigen con el gateway bifrost; con litellm ni se miran.
 BIFROST_URL = os.getenv("DELEGATE_BIFROST_URL", "").strip()
 # Virtual keys por carril (design §4.2): local/ornith → LOCAL; el resto (código en la
