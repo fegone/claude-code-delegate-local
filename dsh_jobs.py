@@ -10,6 +10,8 @@ No import of server.py: the MCP tools in server.py are thin wrappers over `DshJo
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -19,6 +21,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import time
 import uuid
 from collections import deque
@@ -28,6 +31,8 @@ DEFAULT_TIMEOUT_S = 2400
 POLL_WORDS = 300
 POLL_CHARS = 4000
 JOBS_KEEP = 200
+CANCEL_WAIT_S = 15
+TERM_WAIT_S = 2
 TERMINAL = frozenset({"done", "failed", "timeout", "cancelled", "lost"})
 # Xiaomi Token Plan terms forbid automation: these aliases never run from submit_dsh.
 REFUSED_AUTOMATED = ("mimo", "xiaomi")
@@ -191,6 +196,28 @@ def _ps_field(pid: int, field: str) -> str:
                               text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
+
+
+
+def _process_info(pid: int) -> tuple[str, bool] | None:
+    """Start time and zombie flag; None only for a confirmed absent process."""
+    if sys.platform == "darwin":
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        buf = ctypes.create_string_buffer(136)  # struct proc_bsdinfo (PROC_PIDTBSDINFO)
+        size = lib.proc_pidinfo(pid, 3, 0, buf, len(buf))
+        if size == len(buf):
+            start = buf.raw[120:136].hex()  # timeval seconds + microseconds
+            zombie = int.from_bytes(buf.raw[4:8], sys.byteorder) == 5
+            return start, zombie
+        error = ctypes.get_errno()
+        if error == errno.ESRCH:
+            return None
+        raise OSError(error, "cannot inspect launcher")
+    try:
+        fields = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return fields[19], fields[0] == "Z"
+    except FileNotFoundError:
+        return None
 
 
 def _killpg(pid: int | None, sig=signal.SIGTERM) -> None:
@@ -391,6 +418,7 @@ class DshJobs:
             v["queue_reason"] = j.get("queue_reason")
         if j.get("final_response"):
             v["final_response"] = truncate_words(j["final_response"])
+        v["summary_untrusted"] = True
         v["owner"] = {"sid": self.sid, "pid": os.getpid(), "alive": True}
         return v
 
@@ -487,6 +515,12 @@ class DshJobs:
         j, rt = self.jobs.get(jid), self.rt.get(jid)
         if j is None or rt is None:
             return
+        unknown_run = rt.get("proc") is not None and not rt.get("launcher_identity")
+        if rt.get("teardown_pending") or unknown_run or self.launcher_alive(rt):
+            j.update(status="running", finished_at=None,
+                     error="launcher teardown unconfirmed; slot retained")
+            self.save()
+            return
         proc = rt.get("proc")
         if proc is not None and proc.returncode is None:
             _killpg(proc.pid, signal.SIGKILL)
@@ -563,19 +597,29 @@ class DshJobs:
             rt["proc"] = proc
             j["pid"] = proc.pid
             self.save()
-            try:
-                _, err = await asyncio.wait_for(proc.communicate(),
-                                                timeout=j["timeout_s"] + CFG.kill_grace_s)
-            except asyncio.TimeoutError:
-                _killpg(proc.pid, signal.SIGKILL)
-                await proc.wait()
-                j.update(status="timeout", error=f"dsh timeout tras {j['timeout_s']}s")
-                self.read_result(j, run_dir, force_status="timeout")
-                return
+            communication = asyncio.create_task(proc.communicate())
+            rt["cancel_requested"] = rt.get("cancel_requested", False)
+            deadline = time.monotonic() + j["timeout_s"] + CFG.kill_grace_s
+            while True:
+                self.capture_launcher(j, rt)
+                if communication.done() and rt.get("launcher_identity") and not self.launcher_alive(rt):
+                    break
+                if rt["cancel_requested"] or time.monotonic() >= deadline:
+                    status = "cancelled" if rt["cancel_requested"] else "timeout"
+                    await self.stop_run(j, rt)
+                    _killpg(proc.pid, signal.SIGKILL)
+                    await communication
+                    j.update(status=status, error=status)
+                    self.read_result(j, run_dir, force_status=status)
+                    return
+                await asyncio.sleep(0.05)
+            _, err = await communication
             self.read_result(j, run_dir, rc=proc.returncode, stderr=(err or b"")[-500:].decode("utf-8", "replace"))
         except asyncio.CancelledError:
-            if proc is not None and proc.returncode is None:
+            if proc is not None:
+                await self.stop_run(j, rt)
                 _killpg(proc.pid, signal.SIGKILL)
+                await proc.wait()
             j["status"], j["error"] = "cancelled", "cancelled"
             raise
         except FileNotFoundError:
@@ -589,6 +633,64 @@ class DshJobs:
                 (run_dir / "task.md").unlink()
             except OSError:
                 pass
+
+    def capture_launcher(self, j: dict, rt: dict) -> None:
+        if rt.get("launcher_identity"):
+            return
+        try:
+            pid = int((pathlib.Path(j["out_dir"]) / "launcher.pid").read_text().strip())
+            if pid <= 1:
+                return
+            info = _process_info(pid)
+            rt["launcher_identity"] = (pid, info[0] if info else "exited")
+        except (OSError, ValueError, KeyError):
+            pass
+
+    def launcher_alive(self, rt: dict) -> bool:
+        identity = rt.get("launcher_identity")
+        if not identity:
+            return rt.get("proc") is not None
+        pid, started = identity
+        try:
+            info = _process_info(pid)
+        except OSError:
+            return True  # Unknown is not proof of teardown.
+        return info is not None and info[0] == started and not info[1]
+
+    def signal_launcher(self, rt: dict, sig: int) -> None:
+        identity = rt.get("launcher_identity")
+        if identity:
+            try:
+                info = _process_info(identity[0])
+                if info is not None and info[0] == identity[1] and not info[1]:
+                    os.kill(identity[0], sig)
+            except OSError:
+                pass
+
+    async def stop_run(self, j: dict, rt: dict) -> None:
+        rt["teardown_pending"] = True
+        out = pathlib.Path(j["out_dir"])
+        out.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(out / "cancel", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        os.close(fd)
+        deadline = time.monotonic() + CANCEL_WAIT_S
+        while time.monotonic() < deadline:
+            self.capture_launcher(j, rt)
+            if (out / "result.json").exists() and rt.get("launcher_identity") and not self.launcher_alive(rt):
+                rt["teardown_pending"] = False
+                return
+            await asyncio.sleep(0.05)
+        while True:
+            self.capture_launcher(j, rt)
+            if rt.get("launcher_identity") and not self.launcher_alive(rt):
+                break
+            self.signal_launcher(rt, signal.SIGTERM)
+            deadline = time.monotonic() + TERM_WAIT_S
+            while self.launcher_alive(rt) and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            self.signal_launcher(rt, signal.SIGKILL)
+            await asyncio.sleep(0.05)
+        rt["teardown_pending"] = False
 
     def read_result(self, j: dict, run_dir: pathlib.Path, rc: int | None = None,
                     stderr: str = "", force_status: str | None = None) -> None:
@@ -616,6 +718,8 @@ class DshJobs:
         st = res.get("status")
         if st == "ok" and rc == 0:
             j["status"] = "done"
+        elif st == "cancelled":
+            j["status"], j["error"] = "cancelled", "dsh reportó cancelled"
         elif st == "timeout":
             j["status"], j["error"] = "timeout", "dsh reportó timeout"
         else:
@@ -650,9 +754,8 @@ class DshJobs:
         elif j["status"] == "running":
             atask = self.rt[jid].get("atask")
             if atask is not None:
-                atask.cancel()
-                await asyncio.wait({atask}, timeout=15)
-            self.on_done(jid)
+                self.rt[jid]["cancel_requested"] = True
+                await asyncio.shield(atask)
         return self.view(j)
 
     def kill_all(self) -> None:

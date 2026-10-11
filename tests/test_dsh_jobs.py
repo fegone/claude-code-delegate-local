@@ -12,14 +12,38 @@ import dsh_jobs
 import server
 
 STUB = '''#!{py}
-import sys, time, json, os
+import sys, time, json, os, signal
 a = sys.argv[1:]
 g = lambda k: a[a.index(k) + 1]
 task = open(g("--task-file")).read()
 kv = dict(p.split("=", 1) for p in task.split(";") if "=" in p)
 open(os.environ.get("STUB_LOG", os.devnull), "a").write(g("--model") + " " + g("--cwd") + "\\n")
-time.sleep(float(kv.get("sleep", "0")))
 out = g("--out-dir"); os.makedirs(out, exist_ok=True)
+if kv.get("detach") == "1":
+    child = os.fork()
+    if child:
+        if kv.get("waiter_exit") == "1":
+            sys.exit(0)
+        while not os.path.exists(out + "/result.json"):
+            time.sleep(0.02)
+        sys.exit(0)
+    os.setsid()
+    os.close(2)
+    # Real pane launchers do not inherit the waiter's flock descriptors.
+    for fd in range(3, 256):
+        try: os.close(fd)
+        except OSError: pass
+if kv.get("ignore_cancel") == "1":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(float(kv.get("pid_delay", "0")))
+open(out + "/launcher.pid", "w").write(str(os.getpid()))
+end = time.monotonic() + float(kv.get("sleep", "0"))
+while time.monotonic() < end:
+    if os.path.exists(out + "/cancel") and kv.get("ignore_cancel") != "1":
+        time.sleep(float(kv.get("teardown", "0")))
+        kv["status"] = "cancelled"
+        break
+    time.sleep(0.02)
 if kv.get("noresult") != "1":
     json.dump({{"status": kv.get("status", "ok"), "rc": int(kv.get("rc", "0")), "diff_stat": "1 file changed",
                "summary": kv.get("say", "word " * int(kv.get("words", "3"))), "tokens": 42, "wall_s": 1.5}},
@@ -76,6 +100,7 @@ async def test_result_parsing_and_trim(env):
     assert v["status"] == "done" and v["tokens"] == 42 and v["diff_stat"] == "1 file changed"
     assert v["wall_s"] == 1.5 and "truncated, 500 words" in v["final_response"]
     assert len(v["final_response"].split()) < 320
+    assert v["summary_untrusted"] is True
 
 
 async def test_failed_status_and_missing_result(env):
@@ -127,10 +152,11 @@ async def test_bad_args(env):
 
 async def test_timeout(env):
     J = dsh_jobs.JOBS
-    r = await J.submit([T(git_repo(env / "r9"), "sleep=30", timeout_s=1)])
+    r = await J.submit([T(git_repo(env / "r9"), "sleep=30;detach=1", timeout_s=1)])
     t0 = asyncio.get_event_loop().time()
     v = await wait_status(J, r["jobs"][0]["id"], {"timeout"})
     assert asyncio.get_event_loop().time() - t0 < 10 and "timeout" in v["error"]
+    assert (env / "state" / "runs" / r["jobs"][0]["id"] / "out" / "cancel").exists()
     # slot released: a new job can start
     r2 = await J.submit([T(git_repo(env / "r9b"), "x")])
     assert r2["jobs"][0]["status"] == "running"
@@ -221,3 +247,107 @@ async def test_tool_descriptions_warn_about_phi():
         assert name in tools
     d = tools["submit_dsh"].description
     assert "PHI" in d and "mimo" in d.lower()
+
+
+async def test_cancel_holds_slot_until_launcher_teardown(env):
+    J = dsh_jobs.JOBS
+    wd = git_repo(env / "teardown")
+    r = await J.submit([T(wd, "sleep=30;teardown=0.5;detach=1"), T(wd, "x")])
+    first, second = [e["id"] for e in r["jobs"]]
+    while not J.jobs[first].get("out_dir") or not (env / "state" / "runs" / first / "out" / "launcher.pid").exists():
+        await asyncio.sleep(0.02)
+    cancel = asyncio.create_task(J.cancel(first))
+    await asyncio.sleep(0.1)
+    assert (env / "state" / "runs" / first / "out" / "cancel").exists()
+    assert J.jobs[second]["status"] == "queued"
+    assert J.rt[first]["locks"]
+    assert (await cancel)["status"] == "cancelled"
+    await wait_status(J, second, {"done"})
+
+
+def test_launcher_pid_reuse_is_not_signalled(monkeypatch):
+    J = dsh_jobs.DshJobs()
+    rt = {"launcher_identity": (12345, "original start")}
+    monkeypatch.setattr(dsh_jobs, "_process_info", lambda pid: ("different start", False))
+    signals = []
+    monkeypatch.setattr(os, "kill", lambda *args: signals.append(args))
+    J.signal_launcher(rt, dsh_jobs.signal.SIGTERM)
+    assert signals == []
+
+
+async def test_cancel_escalates_to_real_launcher(env, monkeypatch):
+    monkeypatch.setattr(dsh_jobs, "CANCEL_WAIT_S", 0.2)
+    monkeypatch.setattr(dsh_jobs, "TERM_WAIT_S", 0.2)
+    signals = []
+    real_kill = os.kill
+    def kill(pid, sig):
+        signals.append(sig)
+        real_kill(pid, sig)
+    monkeypatch.setattr(os, "kill", kill)
+    J = dsh_jobs.JOBS
+    r = await J.submit([T(git_repo(env / "escalate"), "sleep=30;detach=1;ignore_cancel=1")])
+    jid = r["jobs"][0]["id"]
+    while not J.jobs[jid].get("out_dir") or not (env / "state" / "runs" / jid / "out" / "launcher.pid").exists():
+        await asyncio.sleep(0.02)
+    assert (await J.cancel(jid))["status"] == "cancelled"
+    assert dsh_jobs.signal.SIGTERM in signals and dsh_jobs.signal.SIGKILL in signals
+    assert not J.launcher_alive(J.rt[jid])
+    assert not J.rt[jid].get("locks")
+
+
+def test_unconfirmed_teardown_retains_locks(env):
+    J = dsh_jobs.JOBS
+    J.jobs["test"] = {"id": "test", "status": "running"}
+    locks = J.try_locks("/project", "/checkout")
+    J.rt["test"] = {"locks": locks, "teardown_pending": True}
+    J.on_done("test")
+    assert J.rt["test"]["locks"] == locks
+    assert J.try_locks("/project", "/checkout") is None
+    dsh_jobs._release(locks)
+
+
+def test_inspection_failure_retains_slot_and_does_not_signal(env, monkeypatch):
+    J = dsh_jobs.JOBS
+    rt = {"launcher_identity": (12345, "start")}
+    def unavailable(pid):
+        raise OSError("inspection unavailable")
+    monkeypatch.setattr(dsh_jobs, "_process_info", unavailable)
+    signals = []
+    monkeypatch.setattr(os, "kill", lambda *args: signals.append(args))
+    assert J.launcher_alive(rt)
+    J.signal_launcher(rt, dsh_jobs.signal.SIGKILL)
+    assert signals == []
+
+
+async def test_waiter_exit_before_pid_publication_keeps_slot(env):
+    J = dsh_jobs.JOBS
+    wd = git_repo(env / "early-waiter")
+    r = await J.submit([T(wd, "detach=1;waiter_exit=1;pid_delay=0.4;sleep=0.4"), T(wd, "x")])
+    first, second = [e["id"] for e in r["jobs"]]
+    await asyncio.sleep(0.2)
+    assert J.jobs[first]["status"] == "running"
+    assert J.jobs[second]["status"] == "queued"
+    assert J.rt[first]["locks"]
+    await wait_status(J, first, {"done"})
+    await wait_status(J, second, {"done"})
+
+
+def test_result_with_unknown_launcher_keeps_slot(env, monkeypatch):
+    J = dsh_jobs.JOBS
+    out = env / "unknown-out"
+    out.mkdir()
+    (out / "launcher.pid").write_text("12345")
+    (out / "result.json").write_text('{"status": "cancelled"}')
+    j = {"id": "unknown", "status": "running", "out_dir": str(out)}
+    locks = J.try_locks("/project", "/checkout")
+    rt = {"proc": object(), "locks": locks}
+    J.jobs["unknown"], J.rt["unknown"] = j, rt
+    def unavailable(pid):
+        raise OSError("inspection unavailable")
+    monkeypatch.setattr(dsh_jobs, "_process_info", unavailable)
+    J.capture_launcher(j, rt)
+    J.on_done("unknown")
+    assert J.launcher_alive(rt)
+    assert rt["locks"] == locks
+    assert J.try_locks("/project", "/checkout") is None
+    dsh_jobs._release(locks)

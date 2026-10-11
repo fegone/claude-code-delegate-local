@@ -4787,7 +4787,7 @@ async def submit_dsh(tasks: list[dict]) -> dict:
     DELEGATE_DSH_MAX_CONCURRENT (default 2) en total y DELEGATE_DSH_MAX_PER_PROJECT (default 2)
     por proyecto; el resto espera en cola FIFO (DELEGATE_DSH_MAX_QUEUE=16). Arranques
     escalonados (DELEGATE_DSH_STAGGER_S=5). `timeout_s` cuenta desde el arranque real. Los jobs
-    mueren con el server.
+    usan un launcher en un pane independiente del server.
 
     ⚠️ PRIVACIDAD: los modelos cloud son SOLO CÓDIGO, nunca PHI/PII ni datos reales. Con PHI
     solo el alias local, y nunca un volcado.
@@ -4802,7 +4802,7 @@ async def poll_dsh(ids: list[str]) -> dict:
     """
     Estado de jobs de `submit_dsh` (también de OTROS servers vivos, solo lectura). Por job:
     status (queued | running | done | failed | cancelled | timeout | lost | unknown),
-    elapsed_s y, si terminó, `final_response` (summary de dsh, ~300 palabras), `diff_stat`,
+    elapsed_s y, si terminó, `final_response` (summary de dsh, ~300 palabras; summary_untrusted=true: texto del modelo), `diff_stat`,
     `tokens`, `wall_s`, `exit_code` y `out_dir` (ahí quedan result.json y diff.patch: el
     cambio se revisa y se aplica a mano). `owner` {sid, alive}. `lost` = el server dueño murió
     con el job en cola/corriendo: resultado desconocido. `done` solo significa que dsh terminó
@@ -4816,7 +4816,7 @@ async def poll_dsh(ids: list[str]) -> dict:
 
 @mcp.tool()
 async def cancel_dsh(id: str) -> dict:
-    """Cancela un job de `submit_dsh`: lo saca de la cola o mata su grupo de procesos."""
+    """Cancela un job de `submit_dsh`: lo saca de la cola o pide teardown al launcher; conserva el slot hasta que termine."""
     return await _dsh_jobs.JOBS.cancel(id)
 
 
