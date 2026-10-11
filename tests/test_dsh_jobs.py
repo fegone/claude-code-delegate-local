@@ -423,3 +423,52 @@ async def test_missing_pid_cancel_is_bounded(env, monkeypatch, detached):
     v = await asyncio.wait_for(J.cancel(jid), timeout=3)
     assert v["status"] == "lost"
     assert not J.rt[jid].get("locks")
+
+
+async def test_teardown_spares_bystander_with_run_output(env, monkeypatch):
+    """A user's less process is not a run member just because it reads a diff."""
+    proc_root = env / "proc"
+    proc_root.mkdir()
+    out = str(env / "state" / "runs" / "scoped-run" / "out")
+    commands = {
+        12341: f"less {out}/diff.patch",
+        12342: f"bash /tools/dsh-run.sh --out-dir {out}",
+        12343: f"bash /tools/dsh-herdr.sh --out-dir {out}",
+        12344: f"python /tools/gateway-proxy.py {out}",
+        12345: "worker without output arguments",
+        12346: "bash /tools/dsh-run.sh --out-dir /another/run/out",
+    }
+    for pid, command in commands.items():
+        entry = proc_root / str(pid)
+        entry.mkdir()
+        (entry / "stat").write_text(f"{pid} (process) S 1 {pid} 0")
+        (entry / "cmdline").write_bytes(command.replace(" ", "\0").encode())
+    from types import SimpleNamespace
+    real_path = dsh_jobs.pathlib.Path
+    monkeypatch.setattr(dsh_jobs, "pathlib", SimpleNamespace(Path=lambda p: proc_root if p == "/proc" else real_path(p)))
+    monkeypatch.setattr(dsh_jobs, "sys", SimpleNamespace(platform="linux"))
+    alive = set(commands)
+    monkeypatch.setattr(dsh_jobs, "_process_info", lambda pid: ("original", False) if pid in alive else None)
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    signals = []
+
+    def kill(pid, sig):
+        signals.append((pid, sig))
+        alive.discard(pid)
+
+    monkeypatch.setattr(os, "kill", kill)
+    monkeypatch.setattr(os, "killpg", kill)
+    rt = {"groups": {12345: ("original", False)}}
+    await dsh_jobs.JOBS.teardown_processes({"id": "scoped-run", "out_dir": out}, rt)
+    assert 12341 in alive
+    assert 12346 in alive
+    assert {pid for pid, sig in signals} == {12342, 12343, 12344, 12345}
+    assert rt["teardown_confirmed"]
+
+
+def test_example_allowlist_accepts_new_and_legacy_aliases(env, monkeypatch):
+    example = os.path.join(os.path.dirname(dsh_jobs.__file__), "examples", "dsh-models.json")
+    monkeypatch.setenv("DELEGATE_DSH_MODELS_FILE", example)
+    allowed, error = dsh_jobs.load_models()
+    assert error is None
+    assert {"qwen-3-8-27b", "ornith-1-5", "local-qwen-3-8", "ornith"} <= allowed

@@ -740,9 +740,10 @@ class DshJobs:
                 groups.add(pgid)
         found = []
         for pid, pgid, command in rows:
-            scoped = j["id"] in command and j["out_dir"] in command
-            proxy = scoped and "gateway-proxy.py" in command
-            if pgid not in groups and not proxy and not scoped:
+            scoped = j["out_dir"] in command and any(
+                name in command for name in ("dsh-run.sh", "dsh-herdr.sh", "gateway-proxy.py")
+            )
+            if pgid not in groups and not scoped:
                 continue
             if pid == os.getpid() or pgid == os.getpgrp():
                 continue
