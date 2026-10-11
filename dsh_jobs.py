@@ -33,6 +33,7 @@ POLL_CHARS = 4000
 JOBS_KEEP = 200
 CANCEL_WAIT_S = 15
 TERM_WAIT_S = 2
+LAUNCHER_PID_WAIT_S = 30
 TERMINAL = frozenset({"done", "failed", "timeout", "cancelled", "lost"})
 # Xiaomi Token Plan terms forbid automation: these aliases never run from submit_dsh.
 REFUSED_AUTOMATED = ("mimo", "xiaomi")
@@ -515,15 +516,13 @@ class DshJobs:
         j, rt = self.jobs.get(jid), self.rt.get(jid)
         if j is None or rt is None:
             return
-        unknown_run = rt.get("proc") is not None and not rt.get("launcher_identity")
+        unknown_run = (rt.get("proc") is not None and not rt.get("launcher_identity")
+                       and not rt.get("teardown_confirmed"))
         if rt.get("teardown_pending") or unknown_run or self.launcher_alive(rt):
             j.update(status="running", finished_at=None,
                      error="launcher teardown unconfirmed; slot retained")
             self.save()
             return
-        proc = rt.get("proc")
-        if proc is not None and proc.returncode is None:
-            _killpg(proc.pid, signal.SIGKILL)
         if j["status"] == "running":
             j["status"], j["error"], j["finished_at"] = "cancelled", "cancelled before the runner finished", time.time()
         rt["proc"] = None
@@ -596,20 +595,36 @@ class DshJobs:
                 pass_fds=lock_fds)
             rt["proc"] = proc
             j["pid"] = proc.pid
+            rt["groups"] = {proc.pid: _process_info(proc.pid)}
+            pid_deadline = time.monotonic() + LAUNCHER_PID_WAIT_S
+            rt["pid_deadline"] = pid_deadline
             self.save()
             communication = asyncio.create_task(proc.communicate())
             rt["cancel_requested"] = rt.get("cancel_requested", False)
             deadline = time.monotonic() + j["timeout_s"] + CFG.kill_grace_s
             while True:
                 self.capture_launcher(j, rt)
-                if communication.done() and rt.get("launcher_identity") and not self.launcher_alive(rt):
+                if not rt.get("launcher_identity") and time.monotonic() >= pid_deadline:
+                    await self.stop_run(j, rt)
+                    if rt.get("teardown_pending"):
+                        return
+                    await communication
+                    j.update(status="lost", error="launcher.pid no apareció; run lost")
+                    return
+                if rt.get("launcher_identity") and not self.launcher_alive(rt):
+                    await self.teardown_processes(j, rt)
+                    if rt.get("teardown_pending"):
+                        return
                     break
                 if rt["cancel_requested"] or time.monotonic() >= deadline:
                     status = "cancelled" if rt["cancel_requested"] else "timeout"
                     await self.stop_run(j, rt)
-                    _killpg(proc.pid, signal.SIGKILL)
+                    if rt.get("teardown_pending"):
+                        return
                     await communication
-                    j.update(status=status, error=status)
+                    if rt.get("missing_launcher"):
+                        status = "lost"
+                    j.update(status=status, error="launcher.pid no apareció; run lost" if status == "lost" else status)
                     self.read_result(j, run_dir, force_status=status)
                     return
                 await asyncio.sleep(0.05)
@@ -618,8 +633,8 @@ class DshJobs:
         except asyncio.CancelledError:
             if proc is not None:
                 await self.stop_run(j, rt)
-                _killpg(proc.pid, signal.SIGKILL)
-                await proc.wait()
+                if not rt.get("teardown_pending"):
+                    await proc.wait()
             j["status"], j["error"] = "cancelled", "cancelled"
             raise
         except FileNotFoundError:
@@ -627,6 +642,8 @@ class DshJobs:
         except Exception as e:  # noqa: BLE001 - a job error must never kill the server
             j.update(status="failed", error=f"{type(e).__name__}: {e}")
         finally:
+            if proc is not None and not rt.get("teardown_confirmed"):
+                await self.teardown_processes(j, rt)
             j["finished_at"] = time.time()
             rt["task"] = ""
             try:
@@ -643,13 +660,16 @@ class DshJobs:
                 return
             info = _process_info(pid)
             rt["launcher_identity"] = (pid, info[0] if info else "exited")
+            if info and not info[1]:
+                pgid = os.getpgid(pid)
+                rt.setdefault("groups", {})[pgid] = _process_info(pgid)
         except (OSError, ValueError, KeyError):
             pass
 
     def launcher_alive(self, rt: dict) -> bool:
         identity = rt.get("launcher_identity")
         if not identity:
-            return rt.get("proc") is not None
+            return rt.get("proc") is not None and not rt.get("teardown_confirmed")
         pid, started = identity
         try:
             info = _process_info(pid)
@@ -667,30 +687,128 @@ class DshJobs:
             except OSError:
                 pass
 
+    def run_processes(self, j: dict, rt: dict) -> list[tuple[int, str, int]]:
+        """Inspect all run groups plus escaped launchers/proxies; errors fail closed."""
+        rows = []
+        if sys.platform == "darwin":
+            lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            size = lib.proc_listpids(1, 0, None, 0)
+            if size <= 0:
+                raise OSError("cannot enumerate processes")
+            pids = (ctypes.c_int * (size // 4 + 1024))()
+            count = lib.proc_listpids(1, 0, pids, ctypes.sizeof(pids))
+            if count <= 0:
+                raise OSError("cannot enumerate processes")
+            libc = ctypes.CDLL(None, use_errno=True)
+            for pid in pids[:count // 4]:
+                if pid <= 1:
+                    continue
+                buf = ctypes.create_string_buffer(136)
+                if lib.proc_pidinfo(pid, 3, 0, buf, len(buf)) != len(buf):
+                    # Protected processes outside our child sessions are not inspectable.
+                    continue
+                pgid = int.from_bytes(buf.raw[100:104], sys.byteorder)
+                if int.from_bytes(buf.raw[20:24], sys.byteorder) != os.getuid():
+                    continue
+                argv = ctypes.create_string_buffer(1024 * 1024)
+                length = ctypes.c_size_t(len(argv))
+                mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+                if libc.sysctl(mib, 3, argv, ctypes.byref(length), None, 0) != 0:
+                    if pgid in rt.get("groups", {}):
+                        info = _process_info(pid)
+                        if info and not info[1]:
+                            raise OSError("cannot inspect run process argv")
+                    continue
+                rows.append((pid, pgid, argv.raw[4:length.value].replace(b"\0", b" ").decode("utf-8", "replace")))
+        else:
+            for entry in pathlib.Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    if entry.stat().st_uid != os.getuid():
+                        continue
+                    fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                    rows.append((int(entry.name), int(fields[2]),
+                                 (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")))
+                except FileNotFoundError:
+                    continue
+        groups = set()
+        for pgid, original in rt.get("groups", {}).items():
+            current = _process_info(pgid)
+            # A reused group leader belongs to a different run.
+            if original and (current is None or current[0] == original[0]):
+                groups.add(pgid)
+        found = []
+        for pid, pgid, command in rows:
+            scoped = j["id"] in command and j["out_dir"] in command
+            proxy = scoped and "gateway-proxy.py" in command
+            if pgid not in groups and not proxy and not scoped:
+                continue
+            if pid == os.getpid() or pgid == os.getpgrp():
+                continue
+            info = _process_info(pid)
+            if info and not info[1]:
+                found.append((pid, info[0], pgid))
+        return found
+
+    def signal_run(self, j: dict, rt: dict, sig: int) -> None:
+        members = self.run_processes(j, rt)
+        signalled = set()
+        for pid, started, pgid in members:
+            info = _process_info(pid)
+            if info is None or info[0] != started or info[1]:
+                continue
+            if os.getpgid(pid) != pgid:
+                continue
+            original = rt.get("groups", {}).get(pgid)
+            leader = _process_info(pgid) if original else None
+            group_matches = original and (leader is None or leader[0] == original[0])
+            if group_matches and pgid not in signalled:
+                try:
+                    os.killpg(pgid, sig)
+                    signalled.add(pgid)
+                except ProcessLookupError:
+                    pass
+            else:
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+
+    async def teardown_processes(self, j: dict, rt: dict) -> None:
+        rt["teardown_pending"] = True
+        try:
+            self.signal_launcher(rt, signal.SIGTERM)
+            self.signal_run(j, rt, signal.SIGTERM)
+            deadline = time.monotonic() + TERM_WAIT_S
+            while self.run_processes(j, rt) and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            self.signal_launcher(rt, signal.SIGKILL)
+            self.signal_run(j, rt, signal.SIGKILL)
+            deadline = time.monotonic() + TERM_WAIT_S + 1
+            while self.run_processes(j, rt) and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            if not self.run_processes(j, rt) and (not rt.get("launcher_identity") or not self.launcher_alive(rt)):
+                rt["teardown_pending"] = False
+                rt["teardown_confirmed"] = True
+        except (OSError, subprocess.SubprocessError):
+            pass  # No proof of teardown: retain the slot.
+
     async def stop_run(self, j: dict, rt: dict) -> None:
         rt["teardown_pending"] = True
         out = pathlib.Path(j["out_dir"])
         out.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(out / "cancel", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         os.close(fd)
-        deadline = time.monotonic() + CANCEL_WAIT_S
-        while time.monotonic() < deadline:
-            self.capture_launcher(j, rt)
-            if (out / "result.json").exists() and rt.get("launcher_identity") and not self.launcher_alive(rt):
-                rt["teardown_pending"] = False
-                return
-            await asyncio.sleep(0.05)
-        while True:
+        deadline = time.monotonic() + CANCEL_WAIT_S if rt.get("launcher_identity") else time.monotonic()
+        pid_deadline = rt.get("pid_deadline", time.monotonic() + LAUNCHER_PID_WAIT_S)
+        while time.monotonic() < deadline or (not rt.get("launcher_identity") and time.monotonic() < pid_deadline):
             self.capture_launcher(j, rt)
             if rt.get("launcher_identity") and not self.launcher_alive(rt):
                 break
-            self.signal_launcher(rt, signal.SIGTERM)
-            deadline = time.monotonic() + TERM_WAIT_S
-            while self.launcher_alive(rt) and time.monotonic() < deadline:
-                await asyncio.sleep(0.05)
-            self.signal_launcher(rt, signal.SIGKILL)
             await asyncio.sleep(0.05)
-        rt["teardown_pending"] = False
+        rt["missing_launcher"] = not rt.get("launcher_identity")
+        await self.teardown_processes(j, rt)
 
     def read_result(self, j: dict, run_dir: pathlib.Path, rc: int | None = None,
                     stderr: str = "", force_status: str | None = None) -> None:
@@ -759,10 +877,13 @@ class DshJobs:
         return self.view(j)
 
     def kill_all(self) -> None:
-        for rt in list(self.rt.values()):
-            proc = rt.get("proc")
-            if proc is not None and proc.returncode is None:
-                _killpg(proc.pid, signal.SIGKILL)
+        for jid, rt in list(self.rt.items()):
+            if rt.get("proc") is not None:
+                try:
+                    self.signal_launcher(rt, signal.SIGKILL)
+                    self.signal_run(self.jobs[jid], rt, signal.SIGKILL)
+                except (OSError, subprocess.SubprocessError):
+                    pass
 
 
 JOBS = DshJobs()
