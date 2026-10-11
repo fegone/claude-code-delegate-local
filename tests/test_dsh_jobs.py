@@ -3,8 +3,8 @@ import asyncio
 import json
 import os
 import stat
-import subprocess
 import sys
+import signal
 
 import pytest
 
@@ -36,7 +36,14 @@ if kv.get("detach") == "1":
 if kv.get("ignore_cancel") == "1":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 time.sleep(float(kv.get("pid_delay", "0")))
-open(out + "/launcher.pid", "w").write(str(os.getpid()))
+if kv.get("nopid") != "1":
+    open(out + "/launcher.pid", "w").write(str(os.getpid()))
+if kv.get("proxy") == "1":
+    import subprocess
+    proxy = out + "/gateway-proxy.py"
+    open(proxy, "w").write("import time; time.sleep(60)")
+    child = subprocess.Popen([sys.executable, proxy, out], start_new_session=kv.get("proxy_detach", "1") == "1", stderr=subprocess.DEVNULL, close_fds=True)
+    open(out + "/proxy.pid", "w").write(str(child.pid))
 end = time.monotonic() + float(kv.get("sleep", "0"))
 while time.monotonic() < end:
     if os.path.exists(out + "/cancel") and kv.get("ignore_cancel") != "1":
@@ -52,9 +59,8 @@ sys.exit(int(kv.get("exit", "0")))
 '''
 
 
-def git_repo(path):
+def workdir(path):
     path.mkdir()
-    subprocess.run(["git", "init", "-q", str(path)], check=True)
     return path
 
 
@@ -74,6 +80,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("DELEGATE_DSH_MAX_CONCURRENT", "2")
     monkeypatch.setenv("DELEGATE_DSH_MAX_PER_PROJECT", "2")
     monkeypatch.setenv("STUB_LOG", str(tmp_path / "log.txt"))
+    monkeypatch.setattr(dsh_jobs, "identity", lambda wd: (str(wd), str(wd)))
     monkeypatch.setattr(dsh_jobs, "JOBS", dsh_jobs.DshJobs())
     return tmp_path
 
@@ -93,7 +100,7 @@ async def wait_status(jobs, jid, want, t=15):
 
 
 async def test_result_parsing_and_trim(env):
-    wd = git_repo(env / "r1")
+    wd = workdir(env / "r1")
     J = dsh_jobs.JOBS
     r = await J.submit([T(wd, "words=500")])
     v = await wait_status(J, r["jobs"][0]["id"], {"done", "failed"})
@@ -104,9 +111,9 @@ async def test_result_parsing_and_trim(env):
 
 
 async def test_failed_status_and_missing_result(env):
-    wd = git_repo(env / "r2")
+    wd = workdir(env / "r2")
     J = dsh_jobs.JOBS
-    r = await J.submit([T(wd, "status=failed;rc=1;exit=1"), T(git_repo(env / "r3"), "noresult=1;exit=3")])
+    r = await J.submit([T(wd, "status=failed;rc=1;exit=1"), T(workdir(env / "r3"), "noresult=1;exit=3")])
     a = await wait_status(J, r["jobs"][0]["id"], {"failed", "done"})
     b = await wait_status(J, r["jobs"][1]["id"], {"failed", "done"})
     assert a["status"] == "failed" and b["status"] == "failed" and "sin result.json" in b["error"]
@@ -114,12 +121,12 @@ async def test_failed_status_and_missing_result(env):
 
 async def test_ok_but_nonzero_rc_is_not_done(env):
     J = dsh_jobs.JOBS
-    r = await J.submit([T(git_repo(env / "r4"), "exit=2")])
+    r = await J.submit([T(workdir(env / "r4"), "exit=2")])
     assert (await wait_status(J, r["jobs"][0]["id"], {"failed", "done"}))["status"] == "failed"
 
 
 async def test_unknown_and_disabled_model_refused_atomically(env):
-    wd = git_repo(env / "r5")
+    wd = workdir(env / "r5")
     J = dsh_jobs.JOBS
     for m in ("nope", "off-y"):
         r = await J.submit([T(wd, "x"), T(wd, "y", model=m)])
@@ -129,20 +136,20 @@ async def test_unknown_and_disabled_model_refused_atomically(env):
 
 async def test_missing_allowlist_refuses_all(env, monkeypatch):
     monkeypatch.setenv("DELEGATE_DSH_MODELS_FILE", str(env / "absent.json"))
-    r = await dsh_jobs.JOBS.submit([T(git_repo(env / "r6"), "x")])
+    r = await dsh_jobs.JOBS.submit([T(workdir(env / "r6"), "x")])
     assert r["success"] is False and "allowlist" in r["jobs"][0]["error"]
 
 
 @pytest.mark.parametrize("alias", ["mimo-flash", "MiMo-Pro", "xiaomi-x"])
 async def test_mimo_refused_even_if_allowlisted(env, alias):
-    r = await dsh_jobs.JOBS.submit([T(git_repo(env / "r7"), "x", model=alias)])
+    r = await dsh_jobs.JOBS.submit([T(workdir(env / "r7"), "x", model=alias)])
     assert r["success"] is False and "Xiaomi" in r["jobs"][0]["error"]
     assert not dsh_jobs.JOBS.jobs
 
 
 async def test_bad_args(env):
     J = dsh_jobs.JOBS
-    wd = git_repo(env / "r8")
+    wd = workdir(env / "r8")
     assert (await J.submit([]))["success"] is False
     for bad in ({"task": "", "model": "local-x"}, T(wd, "x", timeout_s=0), T(wd, "x", timeout_s=True),
                 {"task": "x", "model": "local-x", "workdir": str(env / "nodir")}, {"model": "local-x"}):
@@ -152,20 +159,20 @@ async def test_bad_args(env):
 
 async def test_timeout(env):
     J = dsh_jobs.JOBS
-    r = await J.submit([T(git_repo(env / "r9"), "sleep=30;detach=1", timeout_s=1)])
+    r = await J.submit([T(workdir(env / "r9"), "sleep=30;detach=1", timeout_s=1)])
     t0 = asyncio.get_event_loop().time()
     v = await wait_status(J, r["jobs"][0]["id"], {"timeout"})
     assert asyncio.get_event_loop().time() - t0 < 10 and "timeout" in v["error"]
     assert (env / "state" / "runs" / r["jobs"][0]["id"] / "out" / "cancel").exists()
     # slot released: a new job can start
-    r2 = await J.submit([T(git_repo(env / "r9b"), "x")])
+    r2 = await J.submit([T(workdir(env / "r9b"), "x")])
     assert r2["jobs"][0]["status"] == "running"
     await wait_status(J, r2["jobs"][0]["id"], {"done"})
 
 
 async def test_global_cap_fifo_and_release(env):
     J = dsh_jobs.JOBS
-    repos = [git_repo(env / f"q{i}") for i in range(4)]
+    repos = [workdir(env / f"q{i}") for i in range(4)]
     r = await J.submit([T(w, "sleep=0.6") for w in repos])
     st = [e["status"] for e in r["jobs"]]
     assert st == ["running", "running", "queued", "queued"]  # cap 2
@@ -179,7 +186,7 @@ async def test_global_cap_fifo_and_release(env):
 
 async def test_same_checkout_serialized(env):
     J = dsh_jobs.JOBS
-    wd = git_repo(env / "same")
+    wd = workdir(env / "same")
     r = await J.submit([T(wd, "sleep=0.5"), T(wd, "sleep=0")])
     assert [e["status"] for e in r["jobs"]] == ["running", "queued"]
     assert (await wait_status(J, r["jobs"][1]["id"], {"done"}))["status"] == "done"
@@ -188,29 +195,29 @@ async def test_same_checkout_serialized(env):
 async def test_queue_full(env, monkeypatch):
     monkeypatch.setenv("DELEGATE_DSH_MAX_QUEUE", "1")
     J = dsh_jobs.JOBS
-    repos = [git_repo(env / f"f{i}") for i in range(4)]
+    repos = [workdir(env / f"f{i}") for i in range(4)]
     r = await J.submit([T(w, "sleep=0.5") for w in repos])  # 2 run, 2 wait > 1
     assert r["success"] is False and "cola llena" in r["error"] and not J.jobs
 
 
 async def test_caps_shared_across_servers(env):
     A, B = dsh_jobs.DshJobs(), dsh_jobs.DshJobs()
-    ra = await A.submit([T(git_repo(env / "s1"), "sleep=0.8"), T(git_repo(env / "s2"), "sleep=0.8")])
+    ra = await A.submit([T(workdir(env / "s1"), "sleep=0.8"), T(workdir(env / "s2"), "sleep=0.8")])
     assert [e["status"] for e in ra["jobs"]] == ["running", "running"]
-    rb = await B.submit([T(git_repo(env / "s3"), "x")])
+    rb = await B.submit([T(workdir(env / "s3"), "x")])
     assert rb["jobs"][0]["status"] == "queued"  # flock slots are cross-process
     assert (await wait_status(B, rb["jobs"][0]["id"], {"done"}))["status"] == "done"
 
 
 async def test_invalid_caps_fail_closed(env, monkeypatch):
     monkeypatch.setenv("DELEGATE_DSH_MAX_PER_PROJECT", "5")
-    r = await dsh_jobs.JOBS.submit([T(git_repo(env / "c1"), "x")])
+    r = await dsh_jobs.JOBS.submit([T(workdir(env / "c1"), "x")])
     assert r["success"] is False and "fail closed" in r["error"]
 
 
 async def test_cancel_running_and_queued(env):
     J = dsh_jobs.JOBS
-    wd = git_repo(env / "cx")
+    wd = workdir(env / "cx")
     r = await J.submit([T(wd, "sleep=30"), T(wd, "sleep=0")])
     ids = [e["id"] for e in r["jobs"]]
     assert (await J.cancel(ids[1]))["status"] == "cancelled"
@@ -251,7 +258,7 @@ async def test_tool_descriptions_warn_about_phi():
 
 async def test_cancel_holds_slot_until_launcher_teardown(env):
     J = dsh_jobs.JOBS
-    wd = git_repo(env / "teardown")
+    wd = workdir(env / "teardown")
     r = await J.submit([T(wd, "sleep=30;teardown=0.5;detach=1"), T(wd, "x")])
     first, second = [e["id"] for e in r["jobs"]]
     while not J.jobs[first].get("out_dir") or not (env / "state" / "runs" / first / "out" / "launcher.pid").exists():
@@ -285,7 +292,7 @@ async def test_cancel_escalates_to_real_launcher(env, monkeypatch):
         real_kill(pid, sig)
     monkeypatch.setattr(os, "kill", kill)
     J = dsh_jobs.JOBS
-    r = await J.submit([T(git_repo(env / "escalate"), "sleep=30;detach=1;ignore_cancel=1")])
+    r = await J.submit([T(workdir(env / "escalate"), "sleep=30;detach=1;ignore_cancel=1")])
     jid = r["jobs"][0]["id"]
     while not J.jobs[jid].get("out_dir") or not (env / "state" / "runs" / jid / "out" / "launcher.pid").exists():
         await asyncio.sleep(0.02)
@@ -321,7 +328,7 @@ def test_inspection_failure_retains_slot_and_does_not_signal(env, monkeypatch):
 
 async def test_waiter_exit_before_pid_publication_keeps_slot(env):
     J = dsh_jobs.JOBS
-    wd = git_repo(env / "early-waiter")
+    wd = workdir(env / "early-waiter")
     r = await J.submit([T(wd, "detach=1;waiter_exit=1;pid_delay=0.4;sleep=0.4"), T(wd, "x")])
     first, second = [e["id"] for e in r["jobs"]]
     await asyncio.sleep(0.2)
@@ -351,3 +358,68 @@ def test_result_with_unknown_launcher_keeps_slot(env, monkeypatch):
     assert rt["locks"] == locks
     assert J.try_locks("/project", "/checkout") is None
     dsh_jobs._release(locks)
+
+
+async def test_missing_launcher_pid_is_bounded_and_releases_slot(env, monkeypatch):
+    monkeypatch.setattr(dsh_jobs, "LAUNCHER_PID_WAIT_S", 0.2)
+    monkeypatch.setattr(dsh_jobs, "CANCEL_WAIT_S", 0.1)
+    monkeypatch.setattr(dsh_jobs, "TERM_WAIT_S", 0.1)
+    J = dsh_jobs.JOBS
+    wd = workdir(env / "missing-pid")
+    r = await J.submit([T(wd, "nopid=1;sleep=60"), T(wd, "x")])
+    first, second = [e["id"] for e in r["jobs"]]
+    try:
+        v = await wait_status(J, first, {"lost"}, t=3)
+        assert "launcher.pid" in v["error"]
+        assert not J.rt[first].get("locks")
+        await wait_status(J, second, {"done"})
+    finally:
+        J.kill_all()
+
+
+@pytest.mark.parametrize("proxy_detach", ["0", "1"])
+async def test_sigkilled_launcher_tears_down_proxy(env, monkeypatch, proxy_detach):
+    monkeypatch.setattr(dsh_jobs, "TERM_WAIT_S", 0.1)
+    J = dsh_jobs.JOBS
+    r = await J.submit([T(workdir(env / "proxy"), "sleep=60;proxy=1;proxy_detach=" + proxy_detach)])
+    jid = r["jobs"][0]["id"]
+    out = env / "state" / "runs" / jid / "out"
+    while not (out / "proxy.pid").exists():
+        await asyncio.sleep(0.02)
+    pid = int((out / "proxy.pid").read_text())
+    try:
+        os.kill(int((out / "launcher.pid").read_text()), signal.SIGKILL)
+        await wait_status(J, jid, {"failed"}, t=3)
+        info = dsh_jobs._process_info(pid)
+        assert info is None or info[1]
+        assert not J.rt[jid].get("locks")
+    finally:
+        try: os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+        J.kill_all()
+
+
+def test_group_member_pid_reuse_is_not_signalled(monkeypatch):
+    J = dsh_jobs.DshJobs()
+    monkeypatch.setattr(J, "run_processes", lambda j, rt: [(12345, "original", 12345)])
+    monkeypatch.setattr(dsh_jobs, "_process_info", lambda pid: ("reused", False))
+    signals = []
+    monkeypatch.setattr(os, "killpg", lambda *args: signals.append(args))
+    monkeypatch.setattr(os, "kill", lambda *args: signals.append(args))
+    J.signal_run({}, {"groups": {12345: ("original", False)}}, signal.SIGKILL)
+    assert not signals
+
+
+@pytest.mark.parametrize("detached", [False, True])
+async def test_missing_pid_cancel_is_bounded(env, monkeypatch, detached):
+    monkeypatch.setattr(dsh_jobs, "LAUNCHER_PID_WAIT_S", 0.2)
+    monkeypatch.setattr(dsh_jobs, "TERM_WAIT_S", 0.1)
+    J = dsh_jobs.JOBS
+    wd = workdir(env / "cancel-missing")
+    r = await J.submit([T(wd, "nopid=1;sleep=60" + (";detach=1;waiter_exit=1" if detached else ""))])
+    jid = r["jobs"][0]["id"]
+    while not J.rt[jid].get("proc"):
+        await asyncio.sleep(0.02)
+    v = await asyncio.wait_for(J.cancel(jid), timeout=3)
+    assert v["status"] == "lost"
+    assert not J.rt[jid].get("locks")
