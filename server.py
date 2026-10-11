@@ -856,6 +856,7 @@ async def _lifespan(_app):
         yield
     finally:
         _codex_kill_all()
+        _dsh_jobs.JOBS.kill_all()
         global _http_client
         if _http_client is not None and not _http_client.is_closed:
             try:
@@ -4762,6 +4763,61 @@ async def cancel_codex(id: str) -> dict:
             await asyncio.wait({atask}, timeout=15)
         _codex_on_done(id)  # unconditional: a task cancelled before it started never ran its finally
     return _codex_job_view(j)
+
+
+# ── dsh jobs (submit_dsh / poll_dsh / cancel_dsh): logic lives in dsh_jobs.py ──────────
+import dsh_jobs as _dsh_jobs
+
+
+@mcp.tool()
+async def submit_dsh(tasks: list[dict]) -> dict:
+    """
+    Lanza tareas de dsh (DeepSeek Harness en jaula, visible en Herdr) SIN esperar y devuelve
+    ids; consulta con `poll_dsh(ids)`. Mismas reglas que `submit_codex`, con estado y topes
+    PROPIOS (~/.dsh-jobs): modelos locales comparten una sola Mac Studio.
+
+    Cada elemento de `tasks`: {task (obligatorio), workdir='.', model (obligatorio),
+    timeout_s=2400}. `model` debe estar en la allowlist (archivo de DELEGATE_DSH_MODELS_FILE,
+    default ~/.config/neola-lab/dsh-models.json; ejemplo en examples/dsh-models.json); un alias
+    desconocido se rechaza. Todo alias `mimo*`/`xiaomi*` se rechaza siempre: los términos del
+    Token Plan de Xiaomi prohíben el envío automatizado. ATÓMICO: si una tarea es inválida no
+    arranca ninguna.
+
+    Un worktree por job: los jobs del mismo checkout se serializan. Topes con flock:
+    DELEGATE_DSH_MAX_CONCURRENT (default 2) en total y DELEGATE_DSH_MAX_PER_PROJECT (default 2)
+    por proyecto; el resto espera en cola FIFO (DELEGATE_DSH_MAX_QUEUE=16). Arranques
+    escalonados (DELEGATE_DSH_STAGGER_S=5). `timeout_s` cuenta desde el arranque real. Los jobs
+    mueren con el server.
+
+    ⚠️ PRIVACIDAD: los modelos cloud son SOLO CÓDIGO, nunca PHI/PII ni datos reales. Con PHI
+    solo el alias local, y nunca un volcado.
+
+    Returns: {"jobs": [{"index", "id", "status"} | {"index", "error"}], "max_concurrent": N}
+    """
+    return await _dsh_jobs.JOBS.submit(tasks)
+
+
+@mcp.tool()
+async def poll_dsh(ids: list[str]) -> dict:
+    """
+    Estado de jobs de `submit_dsh` (también de OTROS servers vivos, solo lectura). Por job:
+    status (queued | running | done | failed | cancelled | timeout | lost | unknown),
+    elapsed_s y, si terminó, `final_response` (summary de dsh, ~300 palabras), `diff_stat`,
+    `tokens`, `wall_s`, `exit_code` y `out_dir` (ahí quedan result.json y diff.patch: el
+    cambio se revisa y se aplica a mano). `owner` {sid, alive}. `lost` = el server dueño murió
+    con el job en cola/corriendo: resultado desconocido. `done` solo significa que dsh terminó
+    con rc 0 y status ok; NO es verificación: verifica el trabajo tú.
+
+    Args:
+        ids: ids devueltos por submit_dsh.
+    """
+    return await _dsh_jobs.JOBS.poll(ids)
+
+
+@mcp.tool()
+async def cancel_dsh(id: str) -> dict:
+    """Cancela un job de `submit_dsh`: lo saca de la cola o mata su grupo de procesos."""
+    return await _dsh_jobs.JOBS.cancel(id)
 
 
 # SSRF guard for delegate_to_provider. If DELEGATE_PROVIDER_ALLOWED_HOSTS is set, only

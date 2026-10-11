@@ -186,6 +186,25 @@ exhaustion and auth failures are never retried.
 the project's own tests in the job's worktree (or a separate runner) yourself and merge only what
 passes; sandbox-restricted or skipped tests count as unverified.
 
+### Operating dsh jobs (`submit_dsh` / `poll_dsh` / `cancel_dsh`)
+
+Same model as the Codex jobs, for DeepSeek Harness runs inside the sandboxed, Herdr-visible launcher
+(`dsh-herdr.sh --cwd --model --task-file --out-dir`, override with `DELEGATE_DSH_LAUNCHER`). Each job
+reads `<out-dir>/result.json` (`status`, `rc`, `diff_stat`, `summary`, `tokens`, `wall_s`); the change
+itself stays in the run dir (`out_dir` in the poll) to be reviewed and applied by hand.
+
+- `submit_dsh(tasks)`: each task is `{task, model (required), workdir='.', timeout_s=2400}`. Atomic: one invalid
+  task and nothing starts. `poll_dsh(ids)` returns `queued | running | done | failed | cancelled | timeout | lost | unknown`,
+  `final_response` trimmed to ~300 words, `owner`. `lost` = the owning server died with the job queued or running.
+- Own state and caps, separate from Codex: `DELEGATE_DSH_STATE_DIR` (default `~/.dsh-jobs`),
+  `DELEGATE_DSH_MAX_CONCURRENT=2`, `DELEGATE_DSH_MAX_PER_PROJECT=2` (local models share one Mac Studio),
+  `DELEGATE_DSH_MAX_QUEUE=16`, `DELEGATE_DSH_STAGGER_S=5`. One job per checkout; use one worktree per job.
+- Model allowlist: `DELEGATE_DSH_MODELS_FILE` (default `~/.config/neola-lab/dsh-models.json`, example in
+  `examples/dsh-models.json`, same shape as the launcher's `models.json`). Unknown or disabled models are refused;
+  with no file, everything is refused.
+- Any `mimo*` / `xiaomi*` alias is refused for automated dispatch (Xiaomi Token Plan terms forbid automation).
+- Privacy: cloud models take code only, never PHI or real personal data.
+
 ### Note on `delegate_batch` and sub-agents
 
 Claude Code sub-agents launched via the native `Agent`/`Task` tool **do not inherit the parent session's MCP servers**. This means `delegate_batch` (and any other MCP tool) is only callable from the **main orchestrator session**. Sub-agents that need parallel local-backend dispatch should use `httpx.AsyncClient` + `asyncio.gather` directly against the LiteLLM endpoint instead. This is a Claude Code architecture constraint, not a `delegate-local` limitation.
