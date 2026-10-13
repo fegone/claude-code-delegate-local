@@ -125,12 +125,33 @@ GATEWAY = (
 )
 # Solo se exigen con el gateway bifrost; con litellm ni se miran.
 BIFROST_URL = os.getenv("DELEGATE_BIFROST_URL", "").strip()
+BIFROST_LOCAL_URL = os.getenv("DELEGATE_BIFROST_LOCAL_URL", "").strip()
 # Virtual keys por carril (design §4.2): local/ornith → LOCAL; el resto (código en la
 # nube) → CODE. Los aliases openai-* que en realidad son deepseek van al carril de código.
 BIFROST_VK_LOCAL = os.getenv("DELEGATE_BIFROST_VK_LOCAL", "").strip()
 BIFROST_VK_CODE = os.getenv("DELEGATE_BIFROST_VK_CODE", "").strip()
 if GATEWAY == GATEWAY_BIFROST and not BIFROST_URL:
     raise ValueError("DELEGATE_GATEWAY=bifrost exige DELEGATE_BIFROST_URL (design §4.2)")
+if GATEWAY == GATEWAY_BIFROST:
+    for _label, _base in (
+        ("DELEGATE_BIFROST_URL", BIFROST_URL),
+        ("DELEGATE_BIFROST_LOCAL_URL", BIFROST_LOCAL_URL),
+    ):
+        if not _base:
+            continue
+        try:
+            _parsed = urllib.parse.urlsplit(_base)
+            if (
+                _parsed.scheme not in ("http", "https")
+                or not _parsed.hostname
+                or _parsed.username is not None
+                or _parsed.password is not None
+            ):
+                raise ValueError("URL inválida")
+        except ValueError:
+            raise ValueError(
+                f"{_label} debe ser una URL http(s) con host y sin userinfo"
+            ) from None
 DEFAULT_MODEL = os.getenv("DELEGATE_LOCAL_MODEL", "local-qwen-3-6-35b")
 # Optional: auto-route coding agents to a coder-tuned alias when the caller does
 # NOT pass model explicitly (i.e., model still == DEFAULT_MODEL). OPT-IN — defaults
@@ -764,14 +785,16 @@ def _is_local_backend(model: str | None) -> bool:
     return m.startswith("local-") or m.startswith("ornith")
 
 
-def _bifrost_endpoint() -> str:
-    """DELEGATE_BIFROST_URL convertido en endpoint de mensajes. La rama Anthropic usa la
+def _bifrost_endpoint(base: str | None = None) -> str:
+    """Base de Bifrost convertida en endpoint de mensajes. La rama Anthropic usa la
     URL tal cual y la rama OpenAI la deriva con `_derive_base` (corta en `/v1/` y deja
     `.../litellm` → `.../litellm/v1/chat/completions`, auditoría §2.6 / design §4.2), así
     que la ruta es siempre `/litellm/...` y nunca `/anthropic/...`."""
-    if not BIFROST_URL:
+    if base is None:
+        base = BIFROST_URL
+    if not base:
         raise ValueError("DELEGATE_GATEWAY=bifrost exige DELEGATE_BIFROST_URL (design §4.2)")
-    base = BIFROST_URL.rstrip("/")
+    base = base.rstrip("/")
     if base.endswith("/v1/messages"):
         return base
     if base.endswith("/litellm"):
@@ -787,12 +810,16 @@ def _gateway_for(
     - `url`/`key` explícitos por despacho (`delegate_to_provider`) mandan sobre el
       conmutador: quien pide un backend propio lo recibe tal cual.
     - `litellm` (default): LITELLM_URL/LITELLM_KEY, idéntico a antes del T09.
-    - `bifrost`: DELEGATE_BIFROST_URL + virtual key del carril — `local-*`/`ornith*` →
-      DELEGATE_BIFROST_VK_LOCAL, todo lo demás → DELEGATE_BIFROST_VK_CODE.
+    - `bifrost`: `local-*`/`ornith*` usan DELEGATE_BIFROST_LOCAL_URL (si está
+      vacío, DELEGATE_BIFROST_URL) + VK_LOCAL; el resto usa BIFROST_URL + VK_CODE.
     """
     if GATEWAY == GATEWAY_BIFROST and not url:
-        lane = BIFROST_VK_LOCAL if _is_local_backend(model) else BIFROST_VK_CODE
-        return _bifrost_endpoint(), lane if key is None else key
+        local = _is_local_backend(model)
+        lane = BIFROST_VK_LOCAL if local else BIFROST_VK_CODE
+        base = (BIFROST_LOCAL_URL or BIFROST_URL) if local else BIFROST_URL
+        # URLs del entorno del operador: el guard SSRF solo valida provider_url
+        # explícitos en delegate_to_provider, nunca estos gateways configurados.
+        return _bifrost_endpoint(base), lane if key is None else key
     return url if url else LITELLM_URL, key if key is not None else LITELLM_KEY
 
 
