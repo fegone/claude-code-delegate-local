@@ -21,10 +21,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import shutil
 import signal
+import subprocess
+import tempfile
 import time
 import uuid
 from collections import deque
@@ -42,7 +45,7 @@ POLL_WORDS = 300
 POLL_CHARS = 4000
 JOBS_KEEP = 200
 TERMINAL = frozenset({"done", "failed", "timeout", "cancelled"})
-DENIED_DIRS = (".ssh", ".gnupg", ".aws", ".config", ".claude", ".codex", "Library")
+DENIED_DIRS = (".ssh", ".gnupg", ".aws", ".config", ".claude", ".codex", ".gemini", "Library")
 _ENV_ALLOW = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TZ", "LANG"})
 PUBLIC_FIELDS = ("id", "status", "model", "effort", "workdir", "timeout_s", "task_preview",
                  "submitted_at", "started_at", "finished_at", "pid", "error", "final_response",
@@ -54,6 +57,77 @@ _SECRET_PATS = (
     re.compile(r"(?i)\b(?:token|api[_-]?key|secret|password|authorization)\b\s*[=:]\s*\S+"),
     re.compile(r"\b[A-Za-z0-9+/_-]{40,}={0,2}"),
 )
+
+
+# ── Isolation (Security veto H1, 2026-10-13) ───────────────────────────────────────
+# agy runs with --dangerously-skip-permissions (print mode cannot ask), so the only real
+# boundary is the OS. Layer 1: opt-in gate like Codex. Layer 2: macOS Seatbelt profile.
+ALLOW_DANGER_ENV = "DELEGATE_GEMINI_ALLOW_DANGER"
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+# Library/Keychains stays readable: agy keeps its Google OAuth session in the login keychain (measured
+# 2026-10-13: with it denied, `agy -p` dies with 'authentication failed'). Writes stay denied.
+# Under $HOME: never readable nor writable by agy (unless inside the job workdir).
+SECRET_HOME_PATHS = (".ssh", ".aws", ".gnupg", ".config", ".claude", ".codex", ".codex-jobs",
+                     ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".docker", ".kube",
+                     ".zsh_history", ".bash_history", ".dsh-jobs", "neola", "dev", "develop",
+                     "Library/Cookies", "Library/Mail", "Library/Messages")
+_BAD_PATH_CHARS = re.compile(r'["\\\x00-\x1f]')
+
+
+def danger_allowed() -> bool:
+    return os.getenv(ALLOW_DANGER_ENV, "0").lower() in ("1", "true", "yes")
+
+
+def _sb_path(p: str) -> str:
+    if _BAD_PATH_CHARS.search(p):
+        raise ValueError("ruta con caracteres no permitidos en el perfil de sandbox")
+    return p
+
+
+def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ...] | None = None) -> str:
+    """Seatbelt profile. Last matching rule wins, so each allow follows the deny it carves out.
+    Reads: everything except secret locations (and .env files) outside the workdir.
+    Writes: allow-list only (workdir, temp dirs, ~/.gemini, a few /dev nodes)."""
+    home = os.path.realpath(home or os.path.expanduser("~"))
+    wd = os.path.realpath(workdir)
+    if tmp_dirs is None:
+        tmp_dirs = tuple({os.path.realpath(d) for d in ("/tmp", "/private/var/folders",
+                                                        tempfile.gettempdir())})
+    gem = os.path.join(home, ".gemini")
+    secrets = [os.path.join(home, p) for p in SECRET_HOME_PATHS]
+    L = ["(version 1)", "(allow default)",
+         "; delegate-local gemini jail. Generated per run.",
+         "(deny file-write*)",
+         "(allow file-write*"]
+    for p in (wd, gem, *tmp_dirs):
+        L.append(f'  (subpath "{_sb_path(p)}")')
+    L += ['  (literal "/dev/null") (literal "/dev/dtracehelper") (literal "/dev/tty") (literal "/dev/ptmx")',
+          '  (regex #"^/dev/ttys[0-9]+$")', ")",
+          "(deny file-read* file-write*"]
+    for p in secrets:
+        L.append(f'  (subpath "{_sb_path(p)}")')
+    L.append(f'  (regex #"^{re.escape(home)}/.*[^/]*\\.env([.][^/]*)?$")')
+    L.append(")")
+    # carve-outs, after the denies: the workdir (may live under ~/dev or ~/develop), agy state
+    L.append("(allow file-read* file-write*")
+    L.append(f'  (subpath "{_sb_path(wd)}")')
+    L.append(")")
+    L.append("(allow file-read* file-write*")
+    L.append(f'  (subpath "{_sb_path(gem)}")')
+    L.append(")")
+    # a workdir nested inside a denied dir would have been re-allowed above: refuse earlier
+    # (validate) for the hard ones; ~/dev and ~/develop are the legitimate exceptions.
+    L.append("(deny process-info* (target others))")
+    L.append("(deny mach-priv-task-port)")
+    return "\n".join(L) + "\n"
+
+
+def sandbox_available() -> bool:
+    try:
+        return subprocess.run([SANDBOX_EXEC, "-p", "(version 1)(allow default)", "/usr/bin/true"],
+                              capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def agy_bin() -> str | None:
@@ -95,8 +169,21 @@ def kill_group(proc) -> None:
             pass
 
 
+def reap_group(proc) -> None:
+    """Kill leftovers of the process group even after the leader exited."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
 def validate(task, workdir, effort, timeout_s) -> tuple[dict | None, dict]:
     """Returns (error | None, normalized {workdir, effort, model, timeout_s})."""
+    if not danger_allowed():
+        return {"success": False,
+                "error": "Gemini/agy corre con --dangerously-skip-permissions (no puede pedir permiso en "
+                         f"modo -p). Deshabilitado: define {ALLOW_DANGER_ENV}=1 para permitirlo. "
+                         "Siempre corre dentro de un sandbox-exec; nunca con PHI."}, {}
     for name, val in (("task", task), ("workdir", workdir), ("effort", effort)):
         if not isinstance(val, str):
             return {"success": False, "error": f"{name} debe ser texto"}, {}
@@ -108,9 +195,10 @@ def validate(task, workdir, effort, timeout_s) -> tuple[dict | None, dict]:
         return {"success": False,
                 "error": f"effort inválido: {effort!r} (válidos: {', '.join(EFFORTS)}). "
                          "Solo se exponen los modelos gemini-3.8-flash-*."}, {}
-    if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
-        return {"success": False, "error": "timeout_s debe ser un número > 0"}, {}
-    timeout_s = int(min(timeout_s, MAX_TIMEOUT_S))
+    if (isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float))
+            or not math.isfinite(timeout_s) or timeout_s <= 0):
+        return {"success": False, "error": "timeout_s debe ser un número finito > 0"}, {}
+    timeout_s = max(1, int(min(timeout_s, MAX_TIMEOUT_S)))
     wd = os.path.abspath(os.path.expanduser(workdir))
     if not os.path.isdir(wd):
         return {"success": False, "error": f"workdir no existe: {wd}"}, {}
@@ -122,9 +210,16 @@ def validate(task, workdir, effort, timeout_s) -> tuple[dict | None, dict]:
     return None, {"workdir": wd, "effort": eff, "model": model, "timeout_s": timeout_s}
 
 
-def _build_cmd(binary: str, task: str, model: str, timeout_s: int) -> list[str]:
-    return [binary, "-p", task, "--model", model, "--output-format", "json",
-            "--dangerously-skip-permissions", "--print-timeout", f"{timeout_s}s"]
+AGY_SANDBOX_FLAG = os.getenv("DELEGATE_GEMINI_AGY_SANDBOX_FLAG", "1").lower() in ("1", "true", "yes")
+
+
+def _build_cmd(binary: str, task: str, model: str, timeout_s: int, profile_path: str) -> list[str]:
+    cmd = [SANDBOX_EXEC, "-f", profile_path, binary, "-p", task, "--model", model,
+           "--output-format", "json", "--dangerously-skip-permissions",
+           "--print-timeout", f"{timeout_s}s"]
+    if AGY_SANDBOX_FLAG:
+        cmd.append("--sandbox")  # agy's own terminal restrictions, on top of Seatbelt
+    return cmd
 
 
 async def _drain(stream, cap: int) -> bytes:
@@ -185,7 +280,25 @@ async def run_agy(task: str, norm: dict, on_proc=None) -> dict:
                 "error": "agy binary no encontrado (instala con `brew install --cask antigravity-cli`, "
                          "o define DELEGATE_AGY_BIN)."}
     timeout_s = norm["timeout_s"]
-    cmd = _build_cmd(binary, task, norm["model"], timeout_s)
+    if not sandbox_available():
+        return {"success": False, "error": "sandbox-exec no disponible: agy no corre sin aislamiento."}
+    try:
+        fd, profile_path = tempfile.mkstemp(prefix="gemini-jail-", suffix=".sb")
+        with os.fdopen(fd, "w") as f:
+            f.write(build_profile(norm["workdir"]))
+    except (OSError, ValueError) as e:
+        return {"success": False, "error": f"no se pudo generar el perfil de sandbox: {e}"}
+    try:
+        return await _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc)
+    finally:
+        try:
+            os.remove(profile_path)
+        except OSError:
+            pass
+
+
+async def _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc) -> dict:
+    cmd = _build_cmd(binary, task, norm["model"], timeout_s, profile_path)
     t0 = time.time()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -220,6 +333,7 @@ async def run_agy(task: str, norm: dict, on_proc=None) -> dict:
     except BaseException:
         kill_group(proc)  # client cancel or any failure: never leave the tree alive
         raise
+    reap_group(proc)  # L3: children agy left in its session die with it
     res = parse_output(stdout, stderr, proc.returncode)
     res.update(base)
     res["elapsed_s"] = round(time.time() - t0, 1)
@@ -297,7 +411,7 @@ class GeminiJobs:
                 "task_preview": task.strip()[:60], "submitted_at": time.time(),
                 "root": os.path.realpath(norm["workdir"]), "queue_reason": "waiting_for_slot",
             }
-            self.rt[jid] = {"task": task, "proc": None, "atask": None}
+            self.rt[jid] = {"task": task, "proc": None, "atask": None, "done": asyncio.Event(), "result": None}
             self.queue.append(jid)
             out.append({"index": i, "id": jid, "status": "queued"})
         self._pump()
@@ -339,6 +453,7 @@ class GeminiJobs:
             j["pid"] = proc.pid
         try:
             res = await run_agy(rt["task"], norm, on_proc)
+            rt["result"] = res
             if j["status"] == "running":
                 j["exit_code"] = res.get("exit_code")
                 j["conversation_id"] = res.get("conversation_id")
@@ -358,6 +473,7 @@ class GeminiJobs:
             j["finished_at"] = time.time()
             rt["task"] = ""
             rt["proc"] = None
+            rt["done"].set()
             self._pump()
 
     def _trim(self) -> None:
@@ -365,6 +481,25 @@ class GeminiJobs:
         for k in done[: max(0, len(done) - JOBS_KEEP)]:
             self.jobs.pop(k, None)
             self.rt.pop(k, None)
+
+    async def run_blocking(self, task: str, workdir: str, effort: str, timeout_s) -> dict:
+        """delegate_to_gemini: same caps, per-workdir lock and kill_all as submit (L4)."""
+        sub = await self.submit([{"task": task, "workdir": workdir, "effort": effort,
+                                  "timeout_s": timeout_s}])
+        if "jobs" not in sub or "id" not in (sub["jobs"][0] if sub["jobs"] else {}):
+            return sub if not sub.get("jobs") else {"success": False, "error": sub["jobs"][0].get("error", sub.get("error"))}
+        jid = sub["jobs"][0]["id"]
+        rt = self.rt[jid]
+        try:
+            await rt["done"].wait()
+        except BaseException:
+            await self.cancel(jid)
+            raise
+        j = self.jobs[jid]
+        res = rt["result"] or {"success": False, "error": j.get("error") or j["status"]}
+        if j["status"] == "cancelled":
+            res = {"success": False, "error": "cancelled"}
+        return res
 
     # ── poll / cancel ──
     async def poll(self, ids: list[str]) -> dict:
@@ -384,6 +519,8 @@ class GeminiJobs:
                 pass
             j["status"], j["error"], j["finished_at"] = "cancelled", "cancelled", time.time()
             self.rt.get(jid, {})["task"] = ""
+            if "done" in self.rt.get(jid, {}):
+                self.rt[jid]["done"].set()
             self._pump()
         elif j["status"] == "running":
             rt = self.rt[jid]

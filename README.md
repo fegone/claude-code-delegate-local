@@ -202,8 +202,10 @@ Mismas ideas que Codex, con el plan Google AI Pro en vez de una API key. Cada ta
   esperar, `poll_gemini(ids)` consulta y `cancel_gemini(id)` saca de la cola o mata el grupo de procesos.
 - Topes: `DELEGATE_GEMINI_MAX_CONCURRENT` (4) y `DELEGATE_GEMINI_MAX_QUEUE` (32), un job por workdir.
   El estado vive en memoria del servidor: no hay estado compartido entre sesiones como en Codex.
-- Aviso: corre sin permisos dentro de `workdir`, asi que conviene un worktree o una carpeta de prueba.
-- **Nunca PHI ni datos de pacientes.** El plan de consumidor de Google no tiene BAA.
+- **Puerta**: como `danger-full-access` de Codex, las herramientas se niegan a correr salvo con `DELEGATE_GEMINI_ALLOW_DANGER=1`, porque `agy -p` no puede pedir permisos y corre con `--dangerously-skip-permissions`.
+- **Aislamiento (siempre)**: `agy` corre dentro de `sandbox-exec` con un perfil generado por corrida, mas su propio `--sandbox`. Sin lectura de `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config`, `~/.claude`, `~/.codex`, `~/.docker`, `~/.kube`, `~/.netrc`, `~/dev`, `~/develop` (salvo el workdir) ni archivos `.env` fuera del workdir. Escritura solo en el workdir, los temporales y `~/.gemini`. Si `sandbox-exec` no funciona, no corre nada.
+- Limites conocidos: la sesion de Google de `agy` vive en el llavero de login, asi que `~/Library/Keychains` queda legible (solo lectura) y el acceso a `securityd` sigue abierto. La red de salida no se restringe. `~/.gemini` guarda las conversaciones completas.
+- **Nunca PHI ni datos de pacientes, ni en la tarea ni en ningun archivo bajo `workdir`**: `agy` lee esos archivos y los sube a Google. El plan de consumidor no tiene BAA.
 
 ### Operating dsh jobs (`submit_dsh` / `poll_dsh` / `cancel_dsh`)
 

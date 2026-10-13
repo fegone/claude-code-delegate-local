@@ -4830,8 +4830,10 @@ async def delegate_to_gemini(
     se rechaza (solo se exponen los gemini-3.8-flash-*).
 
     ⚠️ PRIVACIDAD: plan de consumidor de Google, SIN BAA. NUNCA PHI, datos de pacientes ni
-    secretos. Solo código y texto sintético. Corre con --dangerously-skip-permissions en
-    `workdir`: usa un worktree/scratch dir.
+    secretos, ni en la tarea NI en ningún archivo bajo `workdir` (agy los lee y los sube a Google).
+    Corre con --dangerously-skip-permissions, por eso exige DELEGATE_GEMINI_ALLOW_DANGER=1 y
+    siempre corre dentro de sandbox-exec (sin lectura de ~/.ssh, ~/.claude, ~/dev, etc.;
+    escritura solo en workdir, tmp y ~/.gemini). Usa un worktree/scratch dir.
     Requiere `agy` (brew install --cask antigravity-cli) con sesión iniciada (`agy` una vez);
     ruta con DELEGATE_AGY_BIN.
 
@@ -4844,10 +4846,7 @@ async def delegate_to_gemini(
     Returns: {success, status, response, conversation_id, usage, duration_s, exit_code, model,
               effort, elapsed_s} o {success: False, error}.
     """
-    err, norm = _gemini_jobs.validate(task, workdir, effort, timeout_s)
-    if err:
-        return err
-    return await _gemini_jobs.run_agy(task, norm)
+    return await _gemini_jobs.JOBS.run_blocking(task, workdir, effort, timeout_s)
 
 
 @mcp.tool()
@@ -4858,7 +4857,8 @@ async def submit_gemini(tasks: list[dict]) -> dict:
     timeout_s=900}. Mismas reglas que `delegate_to_gemini`. ATÓMICO: se validan todas antes de
     lanzar ninguna. Tope DELEGATE_GEMINI_MAX_CONCURRENT (default 4) corriendo y
     DELEGATE_GEMINI_MAX_QUEUE (32) en cola; un job por workdir a la vez. Los jobs mueren con el
-    server. ⚠️ Nunca PHI (plan de consumidor, sin BAA).
+    server. Misma puerta (DELEGATE_GEMINI_ALLOW_DANGER=1) y sandbox que delegate_to_gemini.
+    ⚠️ Nunca PHI, ni en la tarea ni en archivos del workdir (plan de consumidor, sin BAA).
     """
     return await _gemini_jobs.JOBS.submit(tasks)
 
