@@ -900,6 +900,7 @@ async def _lifespan(_app):
     finally:
         _codex_kill_all()
         _dsh_jobs.JOBS.kill_all()
+        _gemini_jobs.JOBS.kill_all()
         global _http_client
         if _http_client is not None and not _http_client.is_closed:
             try:
@@ -4806,6 +4807,76 @@ async def cancel_codex(id: str) -> dict:
             await asyncio.wait({atask}, timeout=15)
         _codex_on_done(id)  # unconditional: a task cancelled before it started never ran its finally
     return _codex_job_view(j)
+
+
+# ── Gemini via Google Antigravity CLI (`agy`): logic lives in gemini_jobs.py ──────────
+import gemini_jobs as _gemini_jobs
+
+
+@mcp.tool()
+async def delegate_to_gemini(
+    task: str,
+    workdir: str = ".",
+    effort: str = "low",
+    timeout_s: int = _gemini_jobs.DEFAULT_TIMEOUT_S,
+) -> dict:
+    """
+    Delega una tarea a Gemini vía Google Antigravity CLI (`agy -p`), autenticado con la
+    SUSCRIPCIÓN de Google AI Pro del usuario (sin API key). agy es su propio agente: lee y
+    escribe archivos en `workdir` y devuelve su respuesta final. Bloquea hasta que termina;
+    para varios en paralelo usa submit_gemini / poll_gemini / cancel_gemini.
+
+    effort -> modelo: low = gemini-3.8-flash-low (default), medium, high. Cualquier otro valor
+    se rechaza (solo se exponen los gemini-3.8-flash-*).
+
+    ⚠️ PRIVACIDAD: plan de consumidor de Google, SIN BAA. NUNCA PHI, datos de pacientes ni
+    secretos. Solo código y texto sintético. Corre con --dangerously-skip-permissions en
+    `workdir`: usa un worktree/scratch dir.
+    Requiere `agy` (brew install --cask antigravity-cli) con sesión iniciada (`agy` una vez);
+    ruta con DELEGATE_AGY_BIN.
+
+    Args:
+        task: instrucción completa (agy no ve esta conversación).
+        workdir: directorio de trabajo ('/' y $HOME se rechazan).
+        effort: low | medium | high.
+        timeout_s: tope de pared (default 900, máx 7200); se mata todo el grupo de procesos.
+
+    Returns: {success, status, response, conversation_id, usage, duration_s, exit_code, model,
+              effort, elapsed_s} o {success: False, error}.
+    """
+    err, norm = _gemini_jobs.validate(task, workdir, effort, timeout_s)
+    if err:
+        return err
+    return await _gemini_jobs.run_agy(task, norm)
+
+
+@mcp.tool()
+async def submit_gemini(tasks: list[dict]) -> dict:
+    """
+    Lanza una o varias tareas de Gemini (agy) SIN esperar; devuelve ids de inmediato y se
+    consultan con `poll_gemini(ids)`. Cada elemento: {task, workdir='.', effort='low',
+    timeout_s=900}. Mismas reglas que `delegate_to_gemini`. ATÓMICO: se validan todas antes de
+    lanzar ninguna. Tope DELEGATE_GEMINI_MAX_CONCURRENT (default 4) corriendo y
+    DELEGATE_GEMINI_MAX_QUEUE (32) en cola; un job por workdir a la vez. Los jobs mueren con el
+    server. ⚠️ Nunca PHI (plan de consumidor, sin BAA).
+    """
+    return await _gemini_jobs.JOBS.submit(tasks)
+
+
+@mcp.tool()
+async def poll_gemini(ids: list[str]) -> dict:
+    """
+    Estado de jobs de `submit_gemini`: status (queued | running | done | failed | cancelled |
+    timeout | unknown), elapsed_s y, si terminó, `final_response` recortada a ~300 palabras,
+    `usage`, `conversation_id`. `done` solo significa que agy salió bien: NO es verificación.
+    """
+    return await _gemini_jobs.JOBS.poll(ids)
+
+
+@mcp.tool()
+async def cancel_gemini(id: str) -> dict:
+    """Cancela un job de `submit_gemini`: lo saca de la cola o mata el grupo de procesos de agy. No-op si ya terminó."""
+    return await _gemini_jobs.JOBS.cancel(id)
 
 
 # ── dsh jobs (submit_dsh / poll_dsh / cancel_dsh): logic lives in dsh_jobs.py ──────────

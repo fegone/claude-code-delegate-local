@@ -186,6 +186,25 @@ exhaustion and auth failures are never retried.
 the project's own tests in the job's worktree (or a separate runner) yourself and merge only what
 passes; sandbox-restricted or skipped tests count as unverified.
 
+### Gemini por Antigravity CLI (`delegate_to_gemini`, `submit_gemini`, `poll_gemini`, `cancel_gemini`)
+
+Mismas ideas que Codex, con el plan Google AI Pro en vez de una API key. Cada tarea ejecuta
+`agy -p ... --output-format json --dangerously-skip-permissions` con el stdin cerrado (sin `-p`,
+`agy` abre una TUI y se cuelga).
+
+- Instalar: `brew install --cask antigravity-cli`, y correr `agy` una vez para iniciar sesion.
+  Otra ruta: `DELEGATE_AGY_BIN`. Sin el binario el servidor arranca igual y las herramientas
+  devuelven "agy binary no encontrado".
+- `effort` = `low` (por defecto), `medium` o `high`, que eligen `gemini-3.8-flash-<effort>`.
+  Cualquier otro valor se rechaza; los modelos `claude-*` y `gpt-oss` que lista `agy models` no se exponen.
+- `delegate_to_gemini(task, workdir, effort, timeout_s)` bloquea y devuelve `status`, `response`,
+  `conversation_id`, `usage`, `duration_s` y `exit_code`. `submit_gemini(tasks)` lanza varias sin
+  esperar, `poll_gemini(ids)` consulta y `cancel_gemini(id)` saca de la cola o mata el grupo de procesos.
+- Topes: `DELEGATE_GEMINI_MAX_CONCURRENT` (4) y `DELEGATE_GEMINI_MAX_QUEUE` (32), un job por workdir.
+  El estado vive en memoria del servidor: no hay estado compartido entre sesiones como en Codex.
+- Aviso: corre sin permisos dentro de `workdir`, asi que conviene un worktree o una carpeta de prueba.
+- **Nunca PHI ni datos de pacientes.** El plan de consumidor de Google no tiene BAA.
+
 ### Operating dsh jobs (`submit_dsh` / `poll_dsh` / `cancel_dsh`)
 
 Same model as the Codex jobs, for DeepSeek Harness runs inside the sandboxed, Herdr-visible launcher
