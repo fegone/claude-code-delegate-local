@@ -186,6 +186,27 @@ exhaustion and auth failures are never retried.
 the project's own tests in the job's worktree (or a separate runner) yourself and merge only what
 passes; sandbox-restricted or skipped tests count as unverified.
 
+### Gemini por Antigravity CLI (`delegate_to_gemini`, `submit_gemini`, `poll_gemini`, `cancel_gemini`)
+
+Mismas ideas que Codex, con el plan Google AI Pro en vez de una API key. Cada tarea ejecuta
+`agy -p ... --output-format json --dangerously-skip-permissions` con el stdin cerrado (sin `-p`,
+`agy` abre una TUI y se cuelga).
+
+- Instalar: `brew install --cask antigravity-cli`, y correr `agy` una vez para iniciar sesion.
+  Otra ruta: `DELEGATE_AGY_BIN`. Sin el binario el servidor arranca igual y las herramientas
+  devuelven "agy binary no encontrado".
+- `effort` = `low` (por defecto), `medium` o `high`, que eligen `gemini-3.8-flash-<effort>`.
+  Cualquier otro valor se rechaza; los modelos `claude-*` y `gpt-oss` que lista `agy models` no se exponen.
+- `delegate_to_gemini(task, workdir, effort, timeout_s)` bloquea y devuelve `status`, `response`,
+  `conversation_id`, `usage`, `duration_s` y `exit_code`. `submit_gemini(tasks)` lanza varias sin
+  esperar, `poll_gemini(ids)` consulta y `cancel_gemini(id)` saca de la cola o mata el grupo de procesos.
+- Topes: `DELEGATE_GEMINI_MAX_CONCURRENT` (4) y `DELEGATE_GEMINI_MAX_QUEUE` (32), un job por workdir.
+  El estado vive en memoria del servidor: no hay estado compartido entre sesiones como en Codex.
+- **Puerta**: como `danger-full-access` de Codex, las herramientas se niegan a correr salvo con `DELEGATE_GEMINI_ALLOW_DANGER=1`, porque `agy -p` no puede pedir permisos y corre con `--dangerously-skip-permissions`.
+- **Aislamiento (siempre)**: `agy` corre dentro de `sandbox-exec` con un perfil generado por corrida, mas su propio `--sandbox`. La lectura esta denegada **en todo el sistema de archivos** y solo se devuelve: el workdir, `~/.gemini`, `~/Library/Keychains` (solo lectura; la sesion de Google de `agy` vive en el llavero) y rutas de sistema: `/usr`, `/bin`, `/sbin`, `/System`, `/Library/Developer`, `/opt/homebrew`, `/private/etc`, `/private/var/db/timezone`, `/private/var/folders` y `/dev` (cada una medida con el `agy` real, `python3`, `git` y `curl`). `/Volumes` (copias de Time Machine, discos externos), `/Users`, `/Applications`, `/private/tmp` y `/private/var/root` no se pueden leer, ni siquiera listar. Solo se permite `stat()` (no contenido) en el resto del sistema y en `~/Library`, porque `security` no encuentra el llavero sin eso. Escritura solo en el workdir, los temporales y las rutas de estado de `agy` (`~/.gemini/antigravity-cli/{annotations,brain,cache,conversations,implicit,log,crashes,presence}` y unos pocos archivos); `~/.gemini/config` (`mcp_config.json`), `settings.json`, `builtin` y `bin` quedan de solo lectura. Sin `exec` de `/usr/bin/open`, `osascript` ni de nada en `/Applications`: si la sesion no se lee dentro de la jaula el job termina con "agy session not readable in the jail" y nunca abre un login. Si `sandbox-exec` no funciona, no corre nada. Mas permisos solo se agregan midiendo con el `agy` real (`EXTRA_READ_PATHS`).
+- Limites conocidos: `agy` obtiene su token ejecutando `/usr/bin/security`, asi que ese exec NO se puede negar (medido); los elementos del llavero creados con `security add-generic-password` sin `-T` siguen siendo legibles desde la jaula (confian en ese binario). La red de salida queda abierta (agy debe hablar con Google), asi que un archivo del workdir con instrucciones hostiles puede intentar exfiltrar lo que el workdir contiene. `~/.gemini` guarda las conversaciones completas.
+- **Nunca PHI ni datos de pacientes, ni en la tarea ni en ningun archivo bajo `workdir`**: `agy` lee esos archivos y los sube a Google. El plan de consumidor no tiene BAA.
+
 ### Operating dsh jobs (`submit_dsh` / `poll_dsh` / `cancel_dsh`)
 
 Same model as the Codex jobs, for DeepSeek Harness runs inside the sandboxed, Herdr-visible launcher
