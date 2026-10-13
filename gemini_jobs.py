@@ -76,6 +76,12 @@ AGY_STATE_DIRS = ("annotations", "brain", "cache", "conversations", "implicit", 
 AGY_STATE_FILES = ("conversation_summaries.db", "jetbox_summaries_proto.pb", "jetski_state.pbtxt",
                    "last_check.timestamp", "installation_id", "cli.log")
 # Extra read-only HOME paths agy needs to start (filled empirically, see README).
+# System paths agy and its children read. Measured with the real agy + shell tools (README).
+# Each entry was dropped one at a time against the real agy + python3/git/curl and kept only if needed:
+# /Library (whole), /Library/Keychains (system keychain) and /private/var/db (whole) were NOT needed.
+SYSTEM_READ_PATHS: tuple[str, ...] = ("/usr", "/bin", "/sbin", "/System", "/Library/Developer",
+                                      "/opt/homebrew", "/private/etc", "/private/var/db/timezone",
+                                      "/private/var/folders", "/dev")
 EXTRA_READ_PATHS: tuple[str, ...] = ()
 EXTRA_WRITE_PATHS: tuple[str, ...] = ()
 # NOT denied: /usr/bin/security. Measured 2026-10-13: agy reads its Google OAuth token by exec'ing it
@@ -99,9 +105,10 @@ def _sb_path(p: str) -> str:
     return p
 
 
-def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ...] | None = None) -> str:
+def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ...] | None = None,
+                  system_read: tuple[str, ...] | None = None) -> str:
     """Seatbelt profile. Last matching rule wins, so each allow follows the deny it carves out.
-    Reads: everything outside $HOME; inside $HOME only the allow-back list above.
+    Reads: deny-by-default for the whole filesystem; only SYSTEM_READ_PATHS, the workdir, ~/.gemini and Keychains.
     Writes: allow-list only (workdir, temp dirs, agy state paths, a few /dev nodes).
     Network is left open (agy must reach Google): documented residual risk."""
     home = os.path.realpath(home or os.path.expanduser("~"))
@@ -120,19 +127,34 @@ def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ..
         L.append(f'  (regex #"^{re.escape(os.path.join(cli, f))}(-[a-z]+)?$")')
     L += ['  (literal "/dev/null") (literal "/dev/dtracehelper") (literal "/dev/tty") (literal "/dev/ptmx")',
           '  (regex #"^/dev/ttys[0-9]+$")', ")",
-          f'(deny file-read* (subpath "{_sb_path(home)}"))',
-          "(allow file-read*"]
+          "; reads: deny the WHOLE filesystem, then allow back a short list (round 3: /Volumes held a",
+          "; Time Machine copy of HOME). stat() works everywhere except HOME, /Users and /Volumes.",
+          "(deny file-read*)", "(allow file-read-metadata)"]
+    L.append("(deny file-read-metadata")
+    for p in (home, "/Users", "/Volumes"):
+        L.append(f'  (subpath "{_sb_path(p)}")')
+    L.append(")")
+    L.append('(allow file-read* (literal "/"))  ; dyld/startup need the root directory itself')
+    L.append("(allow file-read*")
+    for p in (system_read if system_read is not None else SYSTEM_READ_PATHS):
+        L.append(f'  (subpath "{_sb_path(p)}")')
+    L.append(")")
+    L.append(f'(deny file-read* (subpath "{_sb_path(home)}"))')  # HOME stays closed even under an allowed root
+    L.append("(allow file-read*")
     for p in (wd, gem, os.path.join(home, "Library", "Keychains"), *EXTRA_READ_PATHS):
         L.append(f'  (subpath "{_sb_path(p)}")')
     L.append(")")
-    # stat() of $HOME itself and its parents so getcwd/realpath work (no listing, no contents)
+    # stat() of the parents of HOME and of the workdir so getcwd/realpath work (no listing, no contents)
     L.append("(allow file-read-metadata")
-    L.append(f'  (literal "{_sb_path(home)}")')
-    parent = os.path.dirname(home)
-    while parent and parent != "/":
-        L.append(f'  (literal "{_sb_path(parent)}")')
-        parent = os.path.dirname(parent)
+    for base in (home, wd):
+        L.append(f'  (literal "{_sb_path(base)}")')
+        parent = os.path.dirname(base)
+        while parent and parent != "/":
+            L.append(f'  (literal "{_sb_path(parent)}")')
+            parent = os.path.dirname(parent)
     L.append(")")
+    # stat() (never contents) of ~/Library: `security` cannot find the login keychain without it (measured)
+    L.append(f'(allow file-read-metadata (subpath "{_sb_path(os.path.join(home, "Library"))}"))')
     for e in DENIED_EXEC_LITERAL:
         L.append(f'(deny process-exec (literal "{e}"))')
     L.append("(deny process-exec")

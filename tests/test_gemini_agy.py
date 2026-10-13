@@ -282,6 +282,35 @@ def _jail(tmp_path):
     return home, work, secrets, run
 
 
+def test_profile_canary_whole_fs_deny_by_default(tmp_path):
+    """Round 3: /Volumes (Time Machine copy of HOME) and /Users/Shared must be unreadable too."""
+    import subprocess
+    home, work, secrets, run = _jail(tmp_path)
+    prof = tmp_path / "real.sb"
+    prof.write_text(gemini_jobs.build_profile(str(work), home=str(home), tmp_dirs=()))
+
+    def jailed(script):
+        return subprocess.run([gemini_jobs.SANDBOX_EXEC, "-f", str(prof), "/bin/sh", "-c", script],
+                              capture_output=True, text=True, cwd=str(work))
+    for path in ("/Volumes", "/Users/Shared", "/Users", "/Applications", "/private/var/root",
+                 "/private/tmp", "/private/var/log"):
+        if os.path.isdir(path) and subprocess.run(["ls", path], capture_output=True).returncode == 0:
+            assert jailed(f"ls '{path}'").returncode != 0, path  # control: readable outside the jail
+    # a file anywhere outside the allow-list, in a temp-like dir that is NOT allowed
+    outside = tmp_path.resolve().parent / "outside-canary.txt"
+    outside.write_text("CANARY-SECRET")
+    prof2 = tmp_path / "strict.sb"
+    prof2.write_text(gemini_jobs.build_profile(str(work), home=str(home), tmp_dirs=(),
+                                               system_read=("/usr", "/bin", "/sbin", "/System", "/dev")))
+    r = subprocess.run([gemini_jobs.SANDBOX_EXEC, "-f", str(prof2), "/bin/sh", "-c", f"cat '{outside}'"],
+                       capture_output=True, text=True, cwd=str(work))
+    assert r.returncode != 0 and "CANARY-SECRET" not in r.stdout
+    # a workdir on another volume stays usable: the allow is generated from the workdir
+    p = gemini_jobs.build_profile("/Volumes/Samsung Evo/develop/x", home=str(home))
+    assert p.rindex('(subpath "/Volumes/Samsung Evo/develop/x")') > p.index("(deny file-read*)")
+    assert '(literal "/Volumes/Samsung Evo")' in p  # ancestors stat()able for getcwd
+
+
 def test_profile_canary_home_is_deny_by_default(tmp_path):
     home, work, secrets, run = _jail(tmp_path)
     for rel in secrets:
