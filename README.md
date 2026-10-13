@@ -336,6 +336,9 @@ cambiar y otro para volver: hoy el default es `litellm` y nada cambia.**
 | `DELEGATE_GATEWAY` | `litellm` | `litellm` (usa `DELEGATE_LOCAL_URL`, comportamiento actual) o `bifrost` (`DELEGATE_BIFROST_URL`). Un valor desconocido es **error de arranque**. Volver = quitar el env var. |
 | `DELEGATE_BIFROST_URL` | — | Solo con `bifrost`: base URL de Bifrost. La ruta sale siempre `/litellm/...` (design §4.2), p. ej. `http://127.0.0.1:4010/litellm/v1/messages`. |
 | `DELEGATE_BIFROST_LOCAL_URL` | vacío | Base opcional para `local-*` y `ornith*`, p. ej. `http://100.123.88.91:4011`; vacía usa `DELEGATE_BIFROST_URL`. |
+| `DELEGATE_BIFROST_API` | `litellm` | Con `bifrost`: `litellm` conserva las rutas `/litellm/...`; `openai` usa `/v1/chat/completions` para todos los modelos. |
+| API OpenAI de Bifrost | — | Normaliza la base de cada carril y convierte mensajes y herramientas a OpenAI, con o sin streaming; conserva las virtual keys y las cabeceras de enrutado. |
+| Validación de API | — | Cualquier otro valor causa error de arranque solo con `bifrost`; las URLs explícitas de `delegate_to_provider` conservan su comportamiento. |
 | Carriles Bifrost | — | El carril local usa `DELEGATE_BIFROST_VK_LOCAL`; el de código conserva `DELEGATE_BIFROST_URL` y `DELEGATE_BIFROST_VK_CODE`, también en formato OpenAI. |
 | Validación Bifrost | — | Con `bifrost`, ambas URLs deben ser http(s), con host y sin credenciales en la URL; una URL inválida causa error de arranque. El guard SSRF de `delegate_to_provider` no se aplica a estos gateways del entorno. |
 | `DELEGATE_BIFROST_VK_LOCAL` | — | Virtual key del carril **local** con bifrost: alias `local-*` y `ornith*`. |

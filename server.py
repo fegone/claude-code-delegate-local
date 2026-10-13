@@ -126,6 +126,9 @@ GATEWAY = (
 # Solo se exigen con el gateway bifrost; con litellm ni se miran.
 BIFROST_URL = os.getenv("DELEGATE_BIFROST_URL", "").strip()
 BIFROST_LOCAL_URL = os.getenv("DELEGATE_BIFROST_LOCAL_URL", "").strip()
+BIFROST_API = os.getenv("DELEGATE_BIFROST_API", "litellm")
+if GATEWAY == GATEWAY_BIFROST and BIFROST_API not in ("litellm", "openai"):
+    raise ValueError("DELEGATE_BIFROST_API debe ser 'litellm' u 'openai'")
 # Virtual keys por carril (design §4.2): local/ornith → LOCAL; el resto (código en la
 # nube) → CODE. Los aliases openai-* que en realidad son deepseek van al carril de código.
 BIFROST_VK_LOCAL = os.getenv("DELEGATE_BIFROST_VK_LOCAL", "").strip()
@@ -1947,9 +1950,27 @@ async def _call_backend(
         headers["x-litellm-num-retries"] = "0"
     client = _get_http_client()
 
-    if _is_openai_format(model):
+    bifrost_openai = (
+        GATEWAY == GATEWAY_BIFROST and BIFROST_API == "openai" and not url
+    )
+    if bifrost_openai or _is_openai_format(model):
         # OpenAI format → /v1/chat/completions
-        oai_url = f"{_derive_base(endpoint)}/v1/chat/completions"
+        if bifrost_openai:
+            # _gateway_for conserva su selección de carril y VK. Quitamos las
+            # rutas de compatibilidad, incluidas las que añadió al base del carril.
+            parsed = urllib.parse.urlsplit(endpoint)
+            path = parsed.path.rstrip("/")
+            while True:
+                for suffix in ("/v1/messages", "/v1", "/litellm"):
+                    if path.endswith(suffix):
+                        path = path[:-len(suffix)].rstrip("/")
+                        break
+                else:
+                    break
+            base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+        else:
+            base = _derive_base(endpoint)
+        oai_url = f"{base}/v1/chat/completions"
         payload = _anthropic_to_openai_request(messages, system, tools, model, max_tokens)
         if DELEGATE_STREAMING:
             payload["stream"] = True
