@@ -423,6 +423,11 @@ FAILOVER_CHAINS = {
 FAILOVER_GRACE = float(os.getenv("DELEGATE_FAILOVER_GRACE", "10"))
 
 
+def _failover_enabled() -> bool:
+    """DELEGATE_FAILOVER=0 (or false/off/no) = never hop to another model. Read per call."""
+    return os.getenv("DELEGATE_FAILOVER", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
 def _is_no_failover(model: str) -> bool:
     """Local models and Codex are pinned to themselves, in both directions."""
     if not isinstance(model, str):
@@ -438,7 +443,7 @@ def _failover_candidates(model: str) -> list[str]:
     chain edited later can never route a local model outward or a remote model
     into the GPU: the guard holds even if the table above is wrong.
     """
-    if _is_no_failover(model):
+    if _is_no_failover(model) or not _failover_enabled():
         return []
     chain = FAILOVER_CHAINS.get((model or "").lower(), [])
     return [m for m in chain if not _is_no_failover(m)]
@@ -852,9 +857,14 @@ def _resolve_bash_timeout(timeout, default) -> int:
 # que hacia que los fallos parecieran aleatorios. Default = DISPATCH_TIMEOUT + margen de
 # cola, para que batch nunca sea el que corta primero.
 BATCH_QUEUE_GRACE = int(os.getenv("DELEGATE_BATCH_QUEUE_GRACE", "900"))
-BATCH_TASK_TIMEOUT = int(
+BATCH_TASK_TIMEOUT: int | None = int(
     os.getenv("DELEGATE_BATCH_TASK_TIMEOUT", str(DISPATCH_TIMEOUT + BATCH_QUEUE_GRACE))
 )
+# 0 (or negative) = no per-task limit. wait_for(timeout=0) would fail every task instantly.
+if BATCH_TASK_TIMEOUT <= 0:
+    BATCH_TASK_TIMEOUT = None
+# Seconds between batch liveness pulses when no task finished (keeps clients from cancelling).
+BATCH_HEARTBEAT_S = float(os.getenv("DELEGATE_BATCH_HEARTBEAT_S", "20")) or 20.0
 _BASH_MAX_CONCURRENCY = int(os.getenv("DELEGATE_RUN_BASH_CONCURRENCY", "4"))
 # Agent name must be a bare filename component (no path separators / traversal), since it
 # is interpolated into agent-definition load paths.
@@ -1111,7 +1121,7 @@ _LOG_FIELDS = (
     "tokens_in", "tokens_out", "cache_read_tokens", "cache_creation_tokens",
     "cache_hit_pct", "stop_reason", "hit_turn_limit", "incomplete",
     "bash_calls", "bash_failures", "last_bash_exit", "timeout_scope",
-    "failed_over_from", "model_used", "failover_tried", "turn_failed",
+    "failed_over_from", "requested_model", "failover_note", "model_used", "failover_tried", "turn_failed",
 )
 
 
@@ -2598,7 +2608,11 @@ async def _dispatch_bounded(
                     # how you end up comparing two models and measuring one.
                     if isinstance(out, dict):
                         out["failed_over_from"] = eff_model
+                        out["requested_model"] = eff_model
                         out["model_used"] = alt
+                        out["failover_note"] = (
+                            f"requested {eff_model} but served by {alt} "
+                            "(provider pool full; disable with DELEGATE_FAILOVER=0)")
                         _log_dispatch(out, eff_model, alt_prov,
                                       time.monotonic() - t_queue0)
                     return out
@@ -2686,7 +2700,7 @@ async def delegate_to_local_agent(
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Tool batch: delegate_batch — N tasks en paralelo via asyncio.gather
+# Tool batch: delegate_batch — N tasks en paralelo via asyncio.wait
 # ────────────────────────────────────────────────────────────────────────────────
 # Techo de tareas ACEPTADAS por llamada. Ya no es el limitador de concurrencia: eso lo
 # hacen los semáforos por proveedor (PROVIDER_CONCURRENCY). Aquí solo se acota el tamaño
@@ -2702,7 +2716,7 @@ async def delegate_batch(
     ctx: Context | None = None,
 ) -> dict:
     """
-    Despacha hasta N agentes EN PARALELO en una sola llamada, usando asyncio.gather.
+    Despacha hasta N agentes EN PARALELO en una sola llamada (asyncio.wait con latido).
     Útil cuando el orquestador quiere ejecutar N sub-tareas independientes simultáneamente
     en backends que soportan paralelismo nativo (e.g., llama.cpp con --parallel 4).
 
@@ -2772,7 +2786,7 @@ async def delegate_batch(
         }
 
     async def _run_one_with_isolation(t: dict, idx: int) -> dict:
-        """Wrap _delegate_one_impl so an exception in one task doesn't fail the gather."""
+        """Wrap _delegate_one_impl so an exception in one task doesn't fail the whole batch."""
         if not isinstance(t, dict):
             return {
                 "success": False,
@@ -2820,7 +2834,7 @@ async def delegate_batch(
         await ctx.report_progress(
             progress=0,
             total=len(tasks),
-            message=f"dispatching {len(tasks)} tasks in parallel via asyncio.gather",
+            message=f"dispatching {len(tasks)} tasks in parallel",
         )
 
     t0 = time.time()
@@ -2848,10 +2862,19 @@ async def delegate_batch(
     try:
         while pending:
             done, _ = await asyncio.wait(
-                set(pending), return_when=asyncio.FIRST_COMPLETED
+                set(pending), timeout=BATCH_HEARTBEAT_S,
+                return_when=asyncio.FIRST_COMPLETED,
             )
             for task in done:
                 idx = pending.pop(task)
+                if task.cancelled():
+                    # A cancelled subtask must not abort its siblings.
+                    results_by_idx[idx] = {
+                        "success": False,
+                        "error": f"batch task {idx} was cancelled",
+                        "task_index": idx,
+                    }
+                    continue
                 try:
                     results_by_idx[idx] = task.result()
                 except Exception as e:  # defensive: bounded wrapper should not raise
@@ -2861,8 +2884,8 @@ async def delegate_batch(
                         "task_index": idx,
                     }
             if ctx:
-                # Liveness heartbeat as tasks land — keeps impatient clients
-                # from assuming the batch died and cancelling mid-flight.
+                # Liveness heartbeat every round, even when nothing finished: long
+                # tasks used to leave the client silent until one landed (811 s hang).
                 await ctx.report_progress(
                     progress=len(results_by_idx),
                     total=len(tasks),
@@ -4935,11 +4958,12 @@ async def cancel_dsh(id: str) -> dict:
 
 
 # SSRF guard for delegate_to_provider. If DELEGATE_PROVIDER_ALLOWED_HOSTS is set, only
-# those hosts are allowed. Otherwise (backward-compat, since localhost/Tailscale 100.x are
-# legit targets) everything is allowed EXCEPT cloud-metadata / link-local endpoints.
+# those hosts are allowed (explicit list, no wildcard). If unset, ONLY loopback is allowed,
+# so a prompt-injected caller cannot send code and API keys to a foreign host.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _PROVIDER_ALLOWED_HOSTS = {
     h.strip().lower() for h in os.getenv("DELEGATE_PROVIDER_ALLOWED_HOSTS", "").split(",") if h.strip()
-}
+} or set(_LOOPBACK_HOSTS)
 
 
 async def _validate_provider_url(url: str) -> tuple[bool, str]:

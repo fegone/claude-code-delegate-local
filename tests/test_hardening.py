@@ -145,8 +145,10 @@ def test_derive_base():
 def test_validate_provider_url():
     def v(u):
         return run_coro(server._validate_provider_url(u))
-    assert v("https://api.deepseek.com/v1/messages")[0]     # DNS may be offline -> allowed
+    assert not v("https://api.deepseek.com/v1/messages")[0]  # default = loopback only
     assert v("http://localhost:4000/v1/messages")[0]        # loopback legit
+    assert v("http://127.0.0.1:4000/v1/messages")[0]
+    assert v("http://[::1]:4000/v1/messages")[0]
     assert not v("http://169.254.169.254/latest/meta-data")[0]
     assert not v("http://2852039166/")[0]                   # decimal-encoded metadata IP
     assert not v("ftp://x/y")[0]

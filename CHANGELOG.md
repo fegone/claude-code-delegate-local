@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed (2026-10-13, reported by Edgar)
+
+`delegate_batch` heartbeats every round and survives a cancelled subtask; `DELEGATE_BATCH_TASK_TIMEOUT=0`
+means no limit; `delegate_to_provider` defaults to loopback-only hosts; dsh tools need
+`DELEGATE_DSH_LAUNCHER`; new `DELEGATE_FAILOVER=0` switch, and failed-over results carry
+`requested_model` / `failover_note`.
+
 ### Changed (2026-10-02 — Codex job manager, review round 2)
 
 Project identity is the canonical git common dir (linked worktrees share the per-project cap) and

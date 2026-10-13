@@ -129,6 +129,21 @@ reintentan.
 pruebas del proyecto en el worktree del job (o en un runner aparte) y mergea solo lo que pase; las
 pruebas saltadas o restringidas por el sandbox cuentan como sin verificar.
 
+### Cambios de comportamiento (2026-10-13, reportados por Edgar)
+
+- **`DELEGATE_BATCH_TASK_TIMEOUT=0` (o negativo) = sin límite por tarea.** Antes `0` hacía fallar
+  cada tarea al instante. `delegate_batch` además emite latido de progreso cada
+  `DELEGATE_BATCH_HEARTBEAT_S` segundos (default 20) aunque ninguna tarea haya terminado, y una
+  subtarea cancelada ya no aborta a las demás.
+- **`delegate_to_provider` solo acepta loopback por defecto** (`127.0.0.1`, `localhost`, `::1`).
+  Para otros hosts hay que declararlos: `DELEGATE_PROVIDER_ALLOWED_HOSTS=api.deepseek.com,100.x.y.z`.
+  Lista explícita, sin comodín.
+- **Las herramientas dsh (`submit_dsh`, `poll_dsh`, `cancel_dsh`) quedan desactivadas sin
+  `DELEGATE_DSH_LAUNCHER`.** Ya no hay ruta por defecto: hay que apuntar al `dsh-herdr.sh` de confianza.
+- **`DELEGATE_FAILOVER=0` apaga el cambio de modelo** cuando el pool está lleno: la tarea espera o
+  falla en el modelo pedido. Con el default (`1`), el resultado trae `requested_model`, `model_used` y
+  `failover_note` cuando hubo cambio.
+
 ### Nota sobre `delegate_batch` y sub-agentes
 
 Los sub-agentes de Claude Code lanzados con el tool nativo `Agent`/`Task` **NO heredan los MCP servers de la sesión padre**. Esto significa que `delegate_batch` (y cualquier otro tool MCP) solo se puede invocar desde la **sesión orquestadora principal**. Los sub-agentes que necesiten despacho paralelo al backend local deben usar `httpx.AsyncClient` + `asyncio.gather` directo contra el endpoint LiteLLM. Es una limitación arquitectónica de Claude Code, no del `delegate-local`.
