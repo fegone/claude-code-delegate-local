@@ -18,7 +18,11 @@ Complete reference for all environment variables and supported backend setups.
 | `DELEGATE_RUN_BASH` | `1` | No | `0` disables the `run_bash` agent tool. |
 | `DELEGATE_RUN_BASH_TIMEOUT` / `DELEGATE_RUN_BASH_CONCURRENCY` | `120` / `4` | No | `run_bash` per-call timeout (s) and max concurrent shells. |
 | `DELEGATE_MAX_READ_FILE_BYTES` / `DELEGATE_MAX_WRITE_BYTES` | `64MiB` / `8MiB` | No | Size guards for `read_file` / `write_file`. |
-| `DELEGATE_PROVIDER_ALLOWED_HOSTS` | `""` | No | Comma-separated allowlist for `delegate_to_provider` hosts (SSRF guard). Empty = allow all except metadata/link-local. |
+| `DELEGATE_PROVIDER_ALLOWED_HOSTS` | `""` | No | Comma-separated allowlist for `delegate_to_provider` hosts (SSRF guard). Empty = loopback only (`127.0.0.1`, `localhost`, `::1`). No wildcard. |
+| `DELEGATE_DSH_LAUNCHER` | `""` | No | Path to `dsh-herdr.sh`. Unset = dsh tools disabled. |
+| `DELEGATE_FAILOVER` | `1` | No | `0` = never fail over to another model when a pool is full. |
+| `DELEGATE_BATCH_HEARTBEAT_S` | `20` | No | Seconds between `delegate_batch` progress pulses. |
+| `DELEGATE_BATCH_TASK_TIMEOUT` | dispatch+grace | No | Per-task ceiling in a batch; `0` = no limit. |
 | `DELEGATE_CODEX_ALLOW_DANGER` | `0` | No | `1` allows Codex `sandbox="danger-full-access"`. |
 | `DELEGATE_CODEX_STDOUT_CAP` | `512KiB` | No | Ring-buffer cap on Codex stdout kept in RAM. |
 

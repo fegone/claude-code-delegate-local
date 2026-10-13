@@ -79,8 +79,10 @@ class Config:
 
     @property
     def launcher(self) -> str:
-        return os.getenv("DELEGATE_DSH_LAUNCHER") or os.path.expanduser(
-            "~/develop/NeolaDental/n8n/scripts/dsh/dsh-herdr.sh")
+        # No default path: executing a file at a guessed location on another machine
+        # (a planted script) is code execution. Unset = dsh tools disabled.
+        v = os.getenv("DELEGATE_DSH_LAUNCHER", "").strip()
+        return os.path.expanduser(v) if v else ""
 
     @property
     def models_file(self) -> str:
@@ -89,6 +91,17 @@ class Config:
 
 
 CFG = Config()
+
+
+DISABLED_MSG = ("dsh tools disabled: DELEGATE_DSH_LAUNCHER is not set. Point it at the "
+                "dsh-herdr.sh launcher you trust to enable them.")
+
+
+def disabled() -> dict | None:
+    """Error payload when no launcher is configured, else None."""
+    if not CFG.launcher:
+        return {"success": False, "error": DISABLED_MSG}
+    return None
 
 
 class DshLockError(RuntimeError):
@@ -449,6 +462,8 @@ class DshJobs:
         return {"task": task, "model": t["model"], "timeout_s": timeout_s, "workdir": real}, None
 
     async def submit(self, tasks) -> dict:
+        if (off := disabled()):
+            return off
         self.ensure_loaded()
         if not isinstance(tasks, list) or not tasks:
             return {"success": False, "error": "tasks debe ser una lista no vacía"}
@@ -847,6 +862,8 @@ class DshJobs:
 
     # ── poll / cancel ────────────────────────────────────────────────────────────────
     async def poll(self, ids) -> dict:
+        if (off := disabled()):
+            return off
         self.ensure_loaded()
         if not isinstance(ids, list):
             return {"success": False, "error": "ids debe ser una lista"}
@@ -858,6 +875,8 @@ class DshJobs:
         return {"jobs": out, "max_concurrent": CFG.max_concurrent}
 
     async def cancel(self, jid) -> dict:
+        if (off := disabled()):
+            return off
         self.ensure_loaded()
         j = self.jobs.get(jid) if isinstance(jid, str) else None
         if j is None:
