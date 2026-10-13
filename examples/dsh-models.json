@@ -1,0 +1,10 @@
+{
+  "_comment": "Allowlist for submit_dsh. Copy to ~/.config/neola-lab/dsh-models.json (or point DELEGATE_DSH_MODELS_FILE at it). Same shape as the launcher's models.json: only entries with enabled=true run. mimo*/xiaomi* aliases are refused regardless. Cloud models = code only, never PHI.",
+  "models": {
+    "qwen-3-8-27b": {"enabled": true},
+    "local-qwen-3-8": {"enabled": true},
+    "ornith-1-5": {"enabled": true},
+    "ornith": {"enabled": true},
+    "cloud-example-disabled": {"enabled": false}
+  }
+}
