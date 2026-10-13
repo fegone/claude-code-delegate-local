@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (2026-10-13, T16: delegate through Bifrost)
+
+- `DELEGATE_GATEWAY_FILE` selector file and `scripts/reload-delegate.sh` (#49).
+- `DELEGATE_BIFROST_LOCAL_URL`: local models (`local-*`, `ornith*`) can use their own Bifrost base URL (#55).
+- `DELEGATE_BIFROST_API=openai`: both Bifrost lanes in OpenAI format to `<base>/v1/chat/completions`, for gateways that publish only that route; default `litellm` unchanged (#56).
+- Gemini 3.8 Flash through the Antigravity CLI (`agy`): `delegate_to_gemini`, `submit_gemini`, `poll_gemini`, `cancel_gemini`, run under a deny-by-default `sandbox-exec` profile and gated by `DELEGATE_GEMINI_ALLOW_DANGER=1` (#53).
+
+### Fixed (2026-10-13, T16)
+
+- Local-lane `max_tokens` is clamped to `DELEGATE_BIFROST_LOCAL_MAX_TOKENS` (default 16384) on Bifrost, so the gateway no longer answers `params_limit` (#57).
+
 ### Fixed (2026-10-13, reported by Edgar)
 
 `delegate_batch` heartbeats every round and survives a cancelled subtask; `DELEGATE_BATCH_TASK_TIMEOUT=0`
