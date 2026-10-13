@@ -245,22 +245,28 @@ async def test_fails_closed_without_sandbox_exec(fake_agy, wd, monkeypatch):
     assert not os.path.exists(os.path.join(wd, "argv.txt"))
 
 
-def test_profile_canary_blocks_secrets_allows_workdir(tmp_path):
-    """A child under the generated profile cannot read fake HOME/.ssh, .env outside the workdir,
-    or write outside the allow-list; it can read and write the workdir and write ~/.gemini."""
+def _jail(tmp_path):
+    """Fake HOME with the files the veto reports named, a workdir under ~/develop, and the profile."""
     import subprocess
     if not gemini_jobs.sandbox_available():
         pytest.skip("sandbox-exec unavailable here")
     home = tmp_path.resolve() / "home"
-    (home / ".ssh").mkdir(parents=True)
-    (home / ".ssh" / "id_canary").write_text("CANARY-SECRET")
-    (home / ".claude").mkdir()
-    (home / ".claude" / "k").write_text("CANARY-SECRET")
-    (home / "develop" / "other").mkdir(parents=True)
-    (home / "develop" / "other" / "x.txt").write_text("CANARY-SECRET")
-    (home / "docs").mkdir()
-    (home / "docs" / "app.env").write_text("CANARY-SECRET")
-    (home / ".gemini").mkdir()
+    secrets = [".ssh/id_canary", ".claude/k", ".claude.json", ".zshrc", ".config/x",
+               "Library/Application Support/Claude/c.json", "Library/Application Support/Codex/c.json",
+               "develop/other/x.txt", "docs/app.env", "Library/Preferences/p.plist"]
+    for rel in secrets:
+        f = home / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("CANARY-SECRET")
+    cli = home / ".gemini" / "antigravity-cli"
+    for d in ("conversations", "brain", "builtin"):
+        (cli / d).mkdir(parents=True)
+    (home / ".gemini" / "config").mkdir()
+    (home / ".gemini" / "config" / "mcp_config.json").write_text("{}")
+    (cli / "settings.json").write_text("{}")
+    (cli / "builtin" / "skill.md").write_text("s")
+    (home / "Library" / "Keychains").mkdir(parents=True)
+    (home / "Library" / "Keychains" / "login.keychain-db").write_text("kc")
     work = home / "develop" / "job"
     work.mkdir()
     (work / "mine.txt").write_text("workdir-ok")
@@ -273,19 +279,57 @@ def test_profile_canary_blocks_secrets_allows_workdir(tmp_path):
         if jailed:
             cmd = [gemini_jobs.SANDBOX_EXEC, "-f", str(prof)] + cmd
         return subprocess.run(cmd, capture_output=True, text=True, cwd=str(work))
+    return home, work, secrets, run
 
-    for secret in (home / ".ssh" / "id_canary", home / ".claude" / "k",
-                   home / "develop" / "other" / "x.txt", home / "docs" / "app.env"):
-        assert run(f"cat '{secret}'", jailed=False).stdout == "CANARY-SECRET"  # control: readable
-        r = run(f"cat '{secret}'")
-        assert r.returncode != 0 and "CANARY-SECRET" not in r.stdout, secret
+
+def test_profile_canary_home_is_deny_by_default(tmp_path):
+    home, work, secrets, run = _jail(tmp_path)
+    for rel in secrets:
+        p = home / rel
+        assert run(f"cat '{p}'", jailed=False).stdout == "CANARY-SECRET"  # control: readable
+        r = run(f"cat '{p}'")
+        assert r.returncode != 0 and "CANARY-SECRET" not in r.stdout, rel
+    # a never-listed file in HOME is also unreadable (deny-by-default, not a denylist)
+    (home / "brand-new-secret.txt").write_text("CANARY-SECRET")
+    assert run(f"cat '{home}/brand-new-secret.txt'").returncode != 0
+    # allowed back: workdir (including its .env), ~/.gemini, Keychains (read), system paths
     assert run("cat mine.txt").stdout == "workdir-ok"
     assert run("cat .env").stdout == "workdir-env-ok"
+    assert run(f"cat '{home}/.gemini/config/mcp_config.json'").stdout == "{}"
+    assert run(f"cat '{home}/Library/Keychains/login.keychain-db'").stdout == "kc"
+    assert run("cat /etc/hosts").returncode == 0
+    # the listing of HOME itself is not allowed either
+    assert run(f"ls '{home}'").returncode != 0
+
+
+def test_profile_writes_only_workdir_and_agy_state(tmp_path):
+    home, work, secrets, run = _jail(tmp_path)
     assert run("echo hi > new.txt && cat new.txt").stdout.strip() == "hi"
-    assert run(f"echo x > '{home}/.gemini/state'").returncode == 0
-    assert run(f"echo x > '{home}/docs/new.txt'").returncode != 0
-    assert run(f"echo x > '{home}/.ssh/authorized_keys'").returncode != 0
-    assert run(f"echo x > '{home}/develop/other/y.txt'").returncode != 0
+    cli = home / ".gemini" / "antigravity-cli"
+    assert run(f"echo x > '{cli}/conversations/c1.db'").returncode == 0
+    assert run(f"echo x > '{cli}/brain/b'").returncode == 0
+    assert run(f"echo x > '{cli}/jetski_state.pbtxt'").returncode == 0
+    # M1: config / settings / builtin are read-only
+    for blocked in (home / ".gemini" / "config" / "mcp_config.json", home / ".gemini" / "config" / "new.json",
+                    cli / "settings.json", cli / "builtin" / "skill.md", home / ".gemini" / "x"):
+        assert run(f"echo x > '{blocked}'").returncode != 0, blocked
+    assert (home / ".gemini" / "config" / "mcp_config.json").read_text() == "{}"
+    for blocked in (home / "docs" / "new.txt", home / ".ssh" / "authorized_keys",
+                    home / "develop" / "other" / "y.txt", home / ".zshrc"):
+        assert run(f"echo x > '{blocked}'").returncode != 0, blocked
+
+
+def test_profile_denies_browser_launchers(tmp_path):
+    import subprocess
+    home, work, secrets, run = _jail(tmp_path)
+    for exe in ("/usr/bin/open", "/usr/bin/osascript"):
+        r = run(f"{exe} --version")
+        assert r.returncode == 126 or "not permitted" in r.stderr.lower(), (exe, r)
+    # control: the profile does not forbid ordinary executables
+    assert run("/bin/echo ok").stdout.strip() == "ok"
+    prof = gemini_jobs.build_profile(str(work), home=str(home), tmp_dirs=())
+    assert '(literal "/usr/bin/open")' in prof and '(subpath "/Applications")' in prof
+    assert "/usr/bin/security" not in prof  # agy needs it for its OAuth token (documented)
 
 
 async def test_leftover_children_killed_after_normal_exit(fake_agy, wd):
@@ -331,3 +375,9 @@ async def test_blocking_call_cancel_kills_job(fake_agy, wd):
 async def test_real_agy_hello(tmp_path):
     r = await _tool("delegate_to_gemini", "Create hello.txt with one line: hi", str(tmp_path), timeout_s=120)
     assert r["success"] is True and (tmp_path / "hello.txt").exists()
+
+
+def test_auth_failure_gets_clear_jail_error():
+    out = gemini_jobs.parse_output(
+        b'{"status":"ERROR","response":"","error":"authentication failed or timed out"}', b"", 1)
+    assert out["success"] is False and "agy session not readable in the jail" in out["error"]

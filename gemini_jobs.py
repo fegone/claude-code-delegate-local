@@ -45,7 +45,7 @@ POLL_WORDS = 300
 POLL_CHARS = 4000
 JOBS_KEEP = 200
 TERMINAL = frozenset({"done", "failed", "timeout", "cancelled"})
-DENIED_DIRS = (".ssh", ".gnupg", ".aws", ".config", ".claude", ".codex", ".gemini", "Library")
+DENIED_DIRS = (".ssh", ".gnupg", ".aws", ".config", ".claude", ".codex", ".gemini", ".docker", ".kube", "Library")
 _ENV_ALLOW = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TZ", "LANG"})
 PUBLIC_FIELDS = ("id", "status", "model", "effort", "workdir", "timeout_s", "task_preview",
                  "submitted_at", "started_at", "finished_at", "pid", "error", "final_response",
@@ -64,13 +64,28 @@ _SECRET_PATS = (
 # boundary is the OS. Layer 1: opt-in gate like Codex. Layer 2: macOS Seatbelt profile.
 ALLOW_DANGER_ENV = "DELEGATE_GEMINI_ALLOW_DANGER"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
-# Library/Keychains stays readable: agy keeps its Google OAuth session in the login keychain (measured
-# 2026-10-13: with it denied, `agy -p` dies with 'authentication failed'). Writes stay denied.
-# Under $HOME: never readable nor writable by agy (unless inside the job workdir).
-SECRET_HOME_PATHS = (".ssh", ".aws", ".gnupg", ".config", ".claude", ".codex", ".codex-jobs",
-                     ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".docker", ".kube",
-                     ".zsh_history", ".bash_history", ".dsh-jobs", "neola", "dev", "develop",
-                     "Library/Cookies", "Library/Mail", "Library/Messages")
+# HOME is deny-by-default for reads (Security re-review 2026-10-13: a denylist missed ~/.claude.json,
+# ~/.zshrc, ~/Library/Application Support/*). Allowed back, minimal and measured with the real agy:
+#   read : the job workdir, ~/.gemini (agy's own state/config), ~/Library/Keychains (agy keeps its
+#          Google OAuth session in the login keychain; without it `agy -p` dies with
+#          "authentication failed". The file is encrypted; read-only).
+#   write: the job workdir, temp dirs, and ONLY the agy state paths below. ~/.gemini/config
+#          (mcp_config.json), settings.json, builtin, bin, updater stay read-only (M1).
+AGY_STATE_DIRS = ("annotations", "brain", "cache", "conversations", "implicit", "log", "crashes",
+                  "presence")
+AGY_STATE_FILES = ("conversation_summaries.db", "jetbox_summaries_proto.pb", "jetski_state.pbtxt",
+                   "last_check.timestamp", "installation_id", "cli.log")
+# Extra read-only HOME paths agy needs to start (filled empirically, see README).
+EXTRA_READ_PATHS: tuple[str, ...] = ()
+EXTRA_WRITE_PATHS: tuple[str, ...] = ()
+# NOT denied: /usr/bin/security. Measured 2026-10-13: agy reads its Google OAuth token by exec'ing it
+# (with that exec denied, `agy -p` dies with 'authentication failed' even with all of $HOME readable).
+# Residual risk: keychain items created with `security add-generic-password` and no -T trust it.
+# Denied: anything that can open a browser / login page:
+# an auth failure inside the jail must end the job, never pop a Google login in the user's session.
+DENIED_EXEC_LITERAL = ("/usr/bin/open", "/usr/bin/osascript", "/usr/bin/xdg-open")
+DENIED_EXEC_SUBPATH = ("/Applications", "/System/Applications")
+DENIED_MACH = ("com.apple.coreservices.launchservicesd", "com.apple.lsd.open", "com.apple.coreservices.appleevents")
 _BAD_PATH_CHARS = re.compile(r'["\\\x00-\x1f]')
 
 
@@ -86,39 +101,47 @@ def _sb_path(p: str) -> str:
 
 def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ...] | None = None) -> str:
     """Seatbelt profile. Last matching rule wins, so each allow follows the deny it carves out.
-    Reads: everything except secret locations (and .env files) outside the workdir.
-    Writes: allow-list only (workdir, temp dirs, ~/.gemini, a few /dev nodes)."""
+    Reads: everything outside $HOME; inside $HOME only the allow-back list above.
+    Writes: allow-list only (workdir, temp dirs, agy state paths, a few /dev nodes).
+    Network is left open (agy must reach Google): documented residual risk."""
     home = os.path.realpath(home or os.path.expanduser("~"))
     wd = os.path.realpath(workdir)
     if tmp_dirs is None:
         tmp_dirs = tuple({os.path.realpath(d) for d in ("/tmp", "/private/var/folders",
                                                         tempfile.gettempdir())})
     gem = os.path.join(home, ".gemini")
-    secrets = [os.path.join(home, p) for p in SECRET_HOME_PATHS]
-    L = ["(version 1)", "(allow default)",
-         "; delegate-local gemini jail. Generated per run.",
-         "(deny file-write*)",
-         "(allow file-write*"]
-    for p in (wd, gem, *tmp_dirs):
+    cli = os.path.join(gem, "antigravity-cli")
+    L = ["(version 1)", "(allow default)", "; delegate-local gemini jail. Generated per run.",
+         "(deny file-write*)", "(allow file-write*"]
+    for p in (wd, *tmp_dirs, *EXTRA_WRITE_PATHS, *[os.path.join(cli, d) for d in AGY_STATE_DIRS]):
         L.append(f'  (subpath "{_sb_path(p)}")')
+    for f in AGY_STATE_FILES:
+        # sqlite sidecars (-journal, -wal, -shm) live next to the db
+        L.append(f'  (regex #"^{re.escape(os.path.join(cli, f))}(-[a-z]+)?$")')
     L += ['  (literal "/dev/null") (literal "/dev/dtracehelper") (literal "/dev/tty") (literal "/dev/ptmx")',
           '  (regex #"^/dev/ttys[0-9]+$")', ")",
-          "(deny file-read* file-write*"]
-    for p in secrets:
+          f'(deny file-read* (subpath "{_sb_path(home)}"))',
+          "(allow file-read*"]
+    for p in (wd, gem, os.path.join(home, "Library", "Keychains"), *EXTRA_READ_PATHS):
         L.append(f'  (subpath "{_sb_path(p)}")')
-    L.append(f'  (regex #"^{re.escape(home)}/.*[^/]*\\.env([.][^/]*)?$")')
     L.append(")")
-    # carve-outs, after the denies: the workdir (may live under ~/dev or ~/develop), agy state
-    L.append("(allow file-read* file-write*")
-    L.append(f'  (subpath "{_sb_path(wd)}")')
+    # stat() of $HOME itself and its parents so getcwd/realpath work (no listing, no contents)
+    L.append("(allow file-read-metadata")
+    L.append(f'  (literal "{_sb_path(home)}")')
+    parent = os.path.dirname(home)
+    while parent and parent != "/":
+        L.append(f'  (literal "{_sb_path(parent)}")')
+        parent = os.path.dirname(parent)
     L.append(")")
-    L.append("(allow file-read* file-write*")
-    L.append(f'  (subpath "{_sb_path(gem)}")')
+    for e in DENIED_EXEC_LITERAL:
+        L.append(f'(deny process-exec (literal "{e}"))')
+    L.append("(deny process-exec")
+    for e in DENIED_EXEC_SUBPATH:
+        L.append(f'  (subpath "{e}")')
     L.append(")")
-    # a workdir nested inside a denied dir would have been re-allowed above: refuse earlier
-    # (validate) for the hard ones; ~/dev and ~/develop are the legitimate exceptions.
-    L.append("(deny process-info* (target others))")
-    L.append("(deny mach-priv-task-port)")
+    for m in DENIED_MACH:
+        L.append(f'(deny mach-lookup (global-name "{m}"))')
+    L += ["(deny process-info* (target others))", "(deny mach-priv-task-port)"]
     return "\n".join(L) + "\n"
 
 
@@ -234,6 +257,10 @@ async def _drain(stream, cap: int) -> bytes:
     return bytes(buf)
 
 
+AUTH_HINT = ("agy session not readable in the jail (authentication failed inside the sandbox). "
+             "Check `agy models` outside the jail; the login flow is never started by delegate-local.")
+
+
 def parse_output(stdout: bytes, stderr: bytes, rc: int | None) -> dict:
     """Turn agy's raw output into a result dict."""
     tail = stderr_tail(stderr)
@@ -265,6 +292,9 @@ def parse_output(stdout: bytes, stderr: bytes, rc: int | None) -> dict:
     }
     if status != "SUCCESS" or rc != 0:
         detail = redact(str(data.get("error") or data.get("message") or ""))[:300]
+        if re.search(r"(?i)authenticat|not logged in", f"{data.get('error', '')} {data.get('message', '')} {tail}"):
+            out.update(success=False, error=AUTH_HINT + f" (status={status!r} rc={rc})")
+            return out
         out.update(success=False, error=f"agy terminó con status={status!r} rc={rc}"
                    + (f": {detail}" if detail else "") + (f" | stderr: {tail}" if tail else ""))
         return out
