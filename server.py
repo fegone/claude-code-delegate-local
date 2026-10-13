@@ -283,6 +283,13 @@ NUDGE_TEXT = (
 )
 
 DEFAULT_MAX_TOKENS = 65536
+BIFROST_LOCAL_MAX_TOKENS_ENV = "DELEGATE_BIFROST_LOCAL_MAX_TOKENS"
+try:
+    BIFROST_LOCAL_MAX_TOKENS = int(os.getenv(BIFROST_LOCAL_MAX_TOKENS_ENV, "16384"))
+except ValueError:
+    raise ValueError(f"{BIFROST_LOCAL_MAX_TOKENS_ENV} must be an integer in 1..1_000_000") from None
+if not 1 <= BIFROST_LOCAL_MAX_TOKENS <= 1_000_000:
+    raise ValueError(f"{BIFROST_LOCAL_MAX_TOKENS_ENV} must be an integer in 1..1_000_000")
 MAX_TIER_MAX_TOKENS = 150_000
 MAX_TIER_SUFFIXES = ("-max",)  # extend here if new "-max"-style aliases appear
 
@@ -2060,6 +2067,8 @@ async def _delegate_one_impl(
     # max_tokens=None (sentinel) => resolver por alias: "-max" tiers get more headroom
     # so deep reasoning doesn't eat the whole budget with nothing left to answer with.
     max_tokens = _resolve_max_tokens(model, max_tokens)
+    if GATEWAY == GATEWAY_BIFROST and url is None and _is_local_backend(model):
+        max_tokens = min(max_tokens, BIFROST_LOCAL_MAX_TOKENS)
 
     workdir_abs = os.path.abspath(workdir)
     if not os.path.isdir(workdir_abs):
