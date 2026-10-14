@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed (2026-10-14)
+- **Gemini (agy) with a workdir under HOME (#61).** The jail denied file metadata for the whole HOME, so `stat` and `git` failed in any `~/develop` project. Each job now runs agy with a private HOME under `~/Library/Caches/delegate-agy/<pid>-<random>` (0700, swept when the owner pid is dead). The jail can write nothing in the real `~/.gemini` and nothing under `<workdir>/.git`. A 5 s pre-flight refuses a workdir the jail cannot stat, and the job is refused when the repo config carries credentials (remote URL, extraheader, credential.helper, include, insteadOf) or uses git-crypt. Git run by the delegate outside the jail uses `core.hooksPath=/dev/null`, `core.fsmonitor=false` and `GIT_CONFIG_NOSYSTEM=1`. Security vetoed it twice (a writable `agentapi` that ran outside the jail, private homes shared in tmp, `.git` hooks and fsmonitor); both are closed.
+- **dsh jobs with an ok result marked failed (#59).** The runner killed `dsh-herdr.sh` while it waited for `result.json`. It now waits up to 15 s, treats ok/rc 0 as done, and reports the launcher stderr when `launcher.pid` never appears (e.g. "herdr server not reachable").
+
+### Changed (2026-10-14)
+- **Gemini default effort is medium (#60)** (`gemini-3.8-flash-medium`); low and high still work when asked for.
+
 ### Added (2026-10-13, T16: delegate through Bifrost)
 
 - `DELEGATE_GATEWAY_FILE` selector file and `scripts/reload-delegate.sh` (#49).
