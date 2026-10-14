@@ -23,10 +23,16 @@ if kv.get("detach") == "1":
     child = os.fork()
     if child:
         if kv.get("waiter_exit") == "1":
-            sys.exit(0)
+            if kv.get("waiter_err"):
+                sys.stderr.write(kv["waiter_err"] + "\\n")
+            sys.exit(int(kv.get("waiter_exit_code", "0")))
         while not os.path.exists(out + "/result.json"):
             time.sleep(0.02)
-        sys.exit(0)
+        # like dsh-herdr.sh: polls result.json every DSH_POLL_S, then prints and exits
+        time.sleep(float(kv.get("waiter_poll", "0")))
+        if kv.get("waiter_err"):
+            sys.stderr.write(kv["waiter_err"] + "\\n")
+        sys.exit(int(kv.get("waiter_exit_code", "0")))
     os.setsid()
     os.close(2)
     # Real pane launchers do not inherit the waiter's flock descriptors.
@@ -472,3 +478,37 @@ def test_example_allowlist_accepts_new_and_legacy_aliases(env, monkeypatch):
     allowed, error = dsh_jobs.load_models()
     assert error is None
     assert {"qwen-3-8-27b", "ornith-1-5", "local-qwen-3-8", "ornith"} <= allowed
+
+
+# ── 2026-10-14: ok result marked failed; Herdr-down reason hidden ────────────────────────────
+async def test_ok_result_is_done_even_if_waiter_is_slow_to_exit(env, monkeypatch):
+    """dsh-run.sh (launcher.pid) exits right after result.json; dsh-herdr.sh is still in its poll sleep.
+    Teardown used to SIGTERM it (rc=-15) and read_result then called a good run failed."""
+    monkeypatch.setattr(dsh_jobs, "TERM_WAIT_S", 0.2)
+    J = dsh_jobs.JOBS
+    r = await J.submit([T(workdir(env / "slow-waiter"), "detach=1;waiter_poll=1.0")])
+    v = await wait_status(J, r["jobs"][0]["id"], {"done", "failed"})
+    assert v["status"] == "done", v
+    assert not v.get("error")
+
+
+async def test_waiter_exiting_nonzero_after_ok_result_still_fails_and_names_both_rcs(env):
+    J = dsh_jobs.JOBS
+    r = await J.submit([T(workdir(env / "bad-waiter"), "detach=1;waiter_exit_code=7;rc=0")])
+    v = await wait_status(J, r["jobs"][0]["id"], {"done", "failed"})
+    assert v["status"] == "failed"
+    assert "launcher rc=7" in v["error"] and "dsh rc=0" in v["error"], v["error"]
+
+
+async def test_launcher_stderr_is_surfaced_when_pid_never_appears(env, monkeypatch):
+    monkeypatch.setattr(dsh_jobs, "LAUNCHER_PID_WAIT_S", 0.3)
+    monkeypatch.setattr(dsh_jobs, "CANCEL_WAIT_S", 0.1)
+    monkeypatch.setattr(dsh_jobs, "TERM_WAIT_S", 0.1)
+    J = dsh_jobs.JOBS
+    task = ("detach=1;waiter_exit=1;nopid=1;waiter_exit_code=2;"
+            "waiter_err=dsh-herdr: herdr server not reachable token=abc123secretvalue")
+    r = await J.submit([T(workdir(env / "herdr-down"), task)])
+    v = await wait_status(J, r["jobs"][0]["id"], {"lost", "failed"}, t=5)
+    assert "launcher.pid" in v["error"]
+    assert "herdr server not reachable" in v["error"], v["error"]
+    assert "abc123secretvalue" not in v["error"]

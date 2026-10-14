@@ -26,6 +26,8 @@ import time
 import uuid
 from collections import deque
 
+from gemini_jobs import redact
+
 MAX_TIMEOUT_S = 7200
 DEFAULT_TIMEOUT_S = 2400
 POLL_WORDS = 300
@@ -34,6 +36,9 @@ JOBS_KEEP = 200
 CANCEL_WAIT_S = 15
 TERM_WAIT_S = 2
 LAUNCHER_PID_WAIT_S = 30
+# After dsh-run.sh (launcher.pid) exits, dsh-herdr.sh still has to notice result.json (DSH_POLL_S, 2 s),
+# print it and exit 0. Tearing it down sooner SIGTERMs it (rc=-15) and a good run is called failed.
+WAITER_EXIT_GRACE_S = 15
 TERMINAL = frozenset({"done", "failed", "timeout", "cancelled", "lost"})
 # Xiaomi Token Plan terms forbid automation: these aliases never run from submit_dsh.
 REFUSED_AUTOMATED = ("mimo", "xiaomi")
@@ -242,6 +247,12 @@ def _killpg(pid: int | None, sig=signal.SIGTERM) -> None:
             os.killpg(pid, sig)
     except OSError:
         pass
+
+
+def _lost_error(rc: int | None, stderr: bytes | None) -> str:
+    """launcher.pid never appeared: say why (dsh-herdr.sh prints its reason on stderr)."""
+    tail = redact((stderr or b"")[-500:].decode("utf-8", "replace")).strip()[-300:]
+    return f"launcher.pid no apareció; run lost (launcher rc={rc})" + (f": {tail}" if tail else "")
 
 
 class DshJobs:
@@ -596,6 +607,7 @@ class DshJobs:
                "--model", j["model"], "--task-file", str(task_file), "--out-dir", j["out_dir"],
                "--timeout", str(j["timeout_s"]), "--wait-timeout", str(j["timeout_s"] + 30)]
         proc = None
+        waiter_killed = False
         try:
             await self.stagger()
             j["started_at"] = time.time()  # timeout counts from the real launch
@@ -623,10 +635,13 @@ class DshJobs:
                     await self.stop_run(j, rt)
                     if rt.get("teardown_pending"):
                         return
-                    await communication
-                    j.update(status="lost", error="launcher.pid no apareció; run lost")
+                    _, werr = await communication
+                    j.update(status="lost", error=_lost_error(proc.returncode, werr))
                     return
                 if rt.get("launcher_identity") and not self.launcher_alive(rt):
+                    # Let dsh-herdr.sh exit by itself first; only kill it if it hangs.
+                    await asyncio.wait({communication}, timeout=WAITER_EXIT_GRACE_S)
+                    waiter_killed = proc.returncode is None
                     await self.teardown_processes(j, rt)
                     if rt.get("teardown_pending"):
                         return
@@ -644,7 +659,8 @@ class DshJobs:
                     return
                 await asyncio.sleep(0.05)
             _, err = await communication
-            self.read_result(j, run_dir, rc=proc.returncode, stderr=(err or b"")[-500:].decode("utf-8", "replace"))
+            self.read_result(j, run_dir, rc=proc.returncode, stderr=(err or b"")[-500:].decode("utf-8", "replace"),
+                             waiter_killed=waiter_killed)
         except asyncio.CancelledError:
             if proc is not None:
                 await self.stop_run(j, rt)
@@ -827,7 +843,7 @@ class DshJobs:
         await self.teardown_processes(j, rt)
 
     def read_result(self, j: dict, run_dir: pathlib.Path, rc: int | None = None,
-                    stderr: str = "", force_status: str | None = None) -> None:
+                    stderr: str = "", force_status: str | None = None, waiter_killed: bool = False) -> None:
         j["exit_code"] = rc
         res = None
         try:
@@ -850,7 +866,10 @@ class DshJobs:
         if force_status:
             return
         st = res.get("status")
-        if st == "ok" and rc == 0:
+        # result.json is written last and atomically: "ok" is the source of truth. The launcher's own rc
+        # only vetoes it when dsh-herdr.sh exited by itself with an error; a waiter we had to kill
+        # (negative rc) after the result was already on disk does not.
+        if st == "ok" and (rc == 0 or waiter_killed):
             j["status"] = "done"
         elif st == "cancelled":
             j["status"], j["error"] = "cancelled", "dsh reportó cancelled"
@@ -858,7 +877,9 @@ class DshJobs:
             j["status"], j["error"] = "timeout", "dsh reportó timeout"
         else:
             j["status"] = "failed"
-            j["error"] = f"dsh status={st!r} rc={j['exit_code']}"
+            dsh_rc = res["rc"] if isinstance(res.get("rc"), int) else None
+            j["error"] = f"dsh status={st!r} dsh rc={dsh_rc}; launcher rc={rc}" + (
+                f": {redact(stderr.strip())[-300:]}" if stderr.strip() else "")
 
     # ── poll / cancel ────────────────────────────────────────────────────────────────
     async def poll(self, ids) -> dict:
