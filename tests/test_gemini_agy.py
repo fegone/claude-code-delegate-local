@@ -83,7 +83,7 @@ def _alive(pid):
 async def test_success_parses_json_and_builds_argv(fake_agy, wd):
     r = await _tool("delegate_to_gemini", "OK crea algo", wd)
     assert r["success"] is True and r["status"] == "SUCCESS"
-    assert r["response"] == "hecho gemini-3.8-flash-low"
+    assert r["response"] == "hecho gemini-3.8-flash-medium"
     assert r["conversation_id"] == "c-1" and r["usage"]["total_tokens"] == 7
     assert r["duration_s"] == 1.5 and r["exit_code"] == 0
     a = open(os.path.join(wd, "argv.txt")).read().split("\n")
@@ -410,3 +410,12 @@ def test_auth_failure_gets_clear_jail_error():
     out = gemini_jobs.parse_output(
         b'{"status":"ERROR","response":"","error":"authentication failed or timed out"}', b"", 1)
     assert out["success"] is False and "agy session not readable in the jail" in out["error"]
+
+
+def test_default_effort_is_medium():
+    # Felix 2026-10-14: Gemini runs at medium unless the caller asks otherwise.
+    import inspect
+    import server
+    assert gemini_jobs.DEFAULT_EFFORT == "medium"
+    assert inspect.signature(server.delegate_to_gemini).parameters["effort"].default == "medium"
+    assert gemini_jobs.validate("t", ".", "", 5)[1]["model"] == "gemini-3.8-flash-medium"

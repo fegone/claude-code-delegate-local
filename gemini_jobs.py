@@ -33,7 +33,7 @@ import uuid
 from collections import deque
 
 EFFORTS = ("low", "medium", "high")
-DEFAULT_EFFORT = "low"
+DEFAULT_EFFORT = "medium"
 # Allowlist of exposed models. `agy models` also lists claude-* and gpt-oss models: not exposed.
 GEMINI_MODELS = {f"gemini-3.8-flash-{e}": e for e in EFFORTS}
 DEFAULT_TIMEOUT_S = 900
