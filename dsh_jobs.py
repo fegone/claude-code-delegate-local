@@ -855,7 +855,7 @@ class DshJobs:
                 return
             j["status"] = "failed"
             j["error"] = (f"launcher salió con rc={rc} y sin result.json"
-                          + (f": {stderr.strip()[-300:]}" if stderr.strip() else ""))
+                          + (f": {redact(stderr.strip())[-300:]}" if stderr.strip() else ""))
             return
         j["final_response"] = res.get("summary") if isinstance(res.get("summary"), str) else None
         j["diff_stat"] = res.get("diff_stat") if isinstance(res.get("diff_stat"), (str, dict, list)) else None
