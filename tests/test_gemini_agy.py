@@ -631,3 +631,142 @@ def test_git_crypt_repo_refused(tmp_path):
     (main / ".git" / "git-crypt").mkdir()
     dirs, err = gemini_jobs.resolve_git_dirs(str(wt))
     assert dirs == () and "git-crypt" in err
+
+
+# ── Security PR61 delta: H3 (cross-job homes) and M2 (.git plants) ─────────────────────
+def test_h3_job_cannot_list_read_or_replace_another_jobs_home(tmp_path, request):
+    import shutil
+    home, work, secrets, run = _jail(tmp_path, request)
+    b = gemini_jobs.make_agy_home(real_home=str(home))       # job B, created after job A's profile
+    request.addfinalizer(lambda: shutil.rmtree(b, ignore_errors=True))
+    a = _jail.agy_home
+    assert os.path.dirname(a) == os.path.dirname(b) == str(home / "Library" / "Caches" / "delegate-agy")
+    assert os.stat(os.path.dirname(a)).st_mode & 0o777 == 0o700
+    bin_b = f"{b}/.gemini/antigravity-cli/bin/agentapi"
+    assert run(f"ls '{os.path.dirname(a)}'").returncode != 0           # parent listing denied
+    assert run(f"ls '{b}'").returncode != 0
+    assert run(f"cat '{bin_b}'").returncode != 0
+    assert run(f"echo EVIL > '{bin_b}'").returncode != 0
+    assert run(f"rm '{bin_b}'").returncode != 0
+    assert "EVIL" not in open(bin_b).read()
+    assert run(f"echo ok > '{a}/.gemini/own.txt' && cat '{a}/.gemini/own.txt'").stdout.strip() == "ok"
+
+
+def test_agy_homes_parent_refuses_symlink_and_foreign(tmp_path):
+    home = tmp_path / "h"
+    (home / "Library" / "Caches").mkdir(parents=True)
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (home / "Library" / "Caches" / "delegate-agy").symlink_to(target)
+    with pytest.raises(OSError):
+        gemini_jobs.make_agy_home(real_home=str(home))
+    assert list(target.iterdir()) == []
+
+
+def test_sweep_removes_only_dead_owner_dirs(tmp_path):
+    home = tmp_path / "h"
+    parent = home / "Library" / "Caches" / "delegate-agy"
+    parent.mkdir(parents=True, mode=0o700)
+    live = parent / f"{os.getpid()}-aaa"
+    dead = parent / "999999-bbb"
+    other = parent / "notmine"
+    for d in (live, dead, other):
+        d.mkdir()
+        (d / "x").write_text("1")
+    assert gemini_jobs.sweep_stale_agy_homes(str(home)) == 1
+    assert live.exists() and other.exists() and not dead.exists()
+
+
+def _clone_home(tmp_path):
+    home, main, wt = _worktree(tmp_path)
+    return home, main, wt
+
+
+def _jail_for(tmp_path, workdir, home, git_dirs=()):
+    import subprocess
+    prof = tmp_path / "m2.sb"
+    prof.write_text(gemini_jobs.build_profile(str(workdir), home=str(home), tmp_dirs=(), git_dirs=git_dirs))
+
+    def jailed(script):
+        return subprocess.run([gemini_jobs.SANDBOX_EXEC, "-f", str(prof), "/bin/sh", "-c", script],
+                              capture_output=True, text=True, cwd=str(workdir),
+                              env={**gemini_jobs.child_env(), **gemini_jobs.git_env(), "HOME": str(home)})
+    return jailed
+
+
+def test_m2_clone_git_config_hooks_and_nested_git_cannot_be_planted(tmp_path):
+    if not gemini_jobs.sandbox_available():
+        pytest.skip("sandbox-exec unavailable here")
+    home, main, wt = _clone_home(tmp_path)
+    jailed = _jail_for(tmp_path, main, home)
+    before = gemini_jobs.git_guard_snapshot(str(main))
+    cfg = main / ".git" / "config"
+    assert jailed("echo '[core]' >> .git/config; echo 'fsmonitor = /tmp/x' >> .git/config").returncode != 0
+    assert jailed("printf '#!/bin/sh\\ntouch /tmp/pwn\\n' > .git/hooks/pre-commit").returncode != 0
+    assert jailed("git config core.hooksPath /tmp/evil").returncode != 0
+    assert jailed("mv .git .git.old").returncode != 0
+    assert jailed("rm -rf .git/hooks").returncode != 0
+    assert jailed("mkdir sub && mkdir sub/.git && echo x > sub/.git/config").returncode != 0
+    assert jailed("echo 'gitdir: .evil' > sub/.git").returncode != 0
+    assert "fsmonitor" not in cfg.read_text()
+    assert gemini_jobs.git_guard_check(before, str(main)) is None   # nothing changed
+    # normal work in the tree still works
+    assert jailed("echo hi > ok.txt && cat ok.txt").stdout.strip() == "hi"
+
+
+def test_m2_worktree_pointer_file_cannot_be_rewritten(tmp_path):
+    if not gemini_jobs.sandbox_available():
+        pytest.skip("sandbox-exec unavailable here")
+    home, main, wt = _clone_home(tmp_path)
+    dirs, err = gemini_jobs.resolve_git_dirs(str(wt))
+    jailed = _jail_for(tmp_path, wt, home, dirs)
+    pointer = (wt / ".git").read_text()
+    before = gemini_jobs.git_guard_snapshot(str(wt))
+    assert jailed("mkdir .evil && echo 'gitdir: .evil' > .git").returncode != 0
+    assert jailed("rm .git").returncode != 0
+    assert jailed("mv .git .git.bak").returncode != 0
+    assert jailed("ln -sf .evil .git").returncode != 0
+    assert (wt / ".git").read_text() == pointer
+    assert gemini_jobs.git_guard_check(before, str(wt)) is None
+    r = jailed("git status --short")
+    assert r.returncode == 0
+
+
+def test_git_guard_detects_changes_made_outside_the_jail(tmp_path):
+    home, main, wt = _clone_home(tmp_path)
+    for wd, mutate in ((main, lambda: (main / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\n")),
+                       (main, lambda: (main / ".git" / "config").write_text("[core]\n\tfsmonitor = x\n")),
+                       (wt, lambda: (wt / ".git").write_text("gitdir: .evil\n"))):
+        before = gemini_jobs.git_guard_snapshot(str(wd))
+        mutate()
+        err = gemini_jobs.git_guard_check(before, str(wd))
+        assert err and "INTEGRIDAD" in err and "core.hooksPath" in err
+
+
+@pytest.mark.asyncio
+async def test_run_agy_fails_loudly_when_git_changes_during_job(fake_agy, tmp_path, monkeypatch):
+    home, main, wt = _clone_home(tmp_path)
+    async def fake_jailed(*a, **k):
+        (main / ".git" / "hooks" / "post-commit").write_text("#!/bin/sh\n")   # simulate a bypass
+        return {"success": True, "response": "ok"}
+    monkeypatch.setattr(gemini_jobs, "_run_agy_jailed", fake_jailed)
+    monkeypatch.setattr(gemini_jobs, "make_agy_home", lambda *a, **k: str(tmp_path / "ah"))
+    (tmp_path / "ah").mkdir()
+    r = await gemini_jobs.run_agy("T", {"workdir": str(main), "model": "m", "effort": "low", "timeout_s": 5})
+    assert r["success"] is False and "INTEGRIDAD" in r["error"]
+
+
+def test_outside_jail_git_uses_safe_flags(monkeypatch, tmp_path):
+    seen = {}
+    def fake_run(cmd, **kw):
+        seen["cmd"], seen["env"] = cmd, kw["env"]
+        class R: returncode, stdout = 1, ""
+        return R()
+    monkeypatch.setattr(gemini_jobs.subprocess, "run", fake_run)
+    gemini_jobs._git(["rev-parse", "HEAD"], str(tmp_path))
+    assert "core.hooksPath=/dev/null" in seen["cmd"] and "core.fsmonitor=false" in seen["cmd"]
+    assert seen["env"]["GIT_CONFIG_NOSYSTEM"] == "1"
+
+
+def test_quoted_inline_helper_refused():
+    assert gemini_jobs._config_credential_problem('[credential]\n\thelper = "!f() { echo x; }; f"\n')

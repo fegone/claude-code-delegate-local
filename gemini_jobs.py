@@ -128,6 +128,12 @@ def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ..
         L.append(f'  (subpath "{_sb_path(p)}")')
     L += ['  (literal "/dev/null") (literal "/dev/dtracehelper") (literal "/dev/tty") (literal "/dev/ptmx")',
           '  (regex #"^/dev/ttys[0-9]+$")', ")",
+          "; Security PR61 M2: the jail must never write/create/rename/delete ANY .git in the workdir tree",
+          "; (config, hooks, worktree pointer file): unjailed git run later would execute it. Last rule wins."]
+    L.append(f'(deny file-write* (literal "{_sb_path(os.path.join(wd, ".git"))}") '
+             f'(subpath "{_sb_path(os.path.join(wd, ".git"))}")')
+    L.append(f'  (regex #"^{re.escape(wd)}/(.*/)?\\.git(/.*)?$"))')
+    L += [
           "; reads: deny the WHOLE filesystem, then allow back a short list (round 3: /Volumes held a",
           "; Time Machine copy of HOME). stat() works everywhere except HOME, /Users and /Volumes.",
           "(deny file-read*)", "(allow file-read-metadata)"]
@@ -184,10 +190,15 @@ _CRED_KEYS = re.compile(r"(?i)(extraheader|token|password|passwd|secret|apikey|a
 _HELPER_KEY = re.compile(r"(?i)^\s*helper\s*$")
 
 
+# Every git the delegate runs OUTSIDE the jail on a job's repo. The same flags are what the caller must use
+# in that workdir after a job (a jailed agent could have left config/hooks there before the guard existed).
+SAFE_GIT_FLAGS = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+
+
 def _git(args: list[str], cwd: str) -> str | None:
     try:
-        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=5,
-                           env={**child_env(), "GIT_TERMINAL_PROMPT": "0"})
+        r = subprocess.run(["git", *SAFE_GIT_FLAGS, *args], cwd=cwd, capture_output=True, text=True, timeout=5,
+                           env={**child_env(), "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"})
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout.strip() if r.returncode == 0 else None
@@ -208,7 +219,7 @@ def _config_credential_problem(text: str) -> str | None:
         key, _, val = line.partition("=")
         if _URL_CRED.search(line) or _URL_QUERY_CRED.search(line) or _CRED_KEYS.search(key):
             return "parece contener una credencial (URL con usuario/token, query con token o cabecera)"
-        if _HELPER_KEY.match(key) and val.strip().startswith("!"):
+        if _HELPER_KEY.match(key) and val.strip().strip('"\' ').startswith("!"):
             return "tiene un credential.helper inline (shell) que puede llevar un secreto"
         if val and any(pat.search(val) for pat in _SECRET_PATS[:3]):  # not the 40-char blob: refspecs match it
             return "tiene un valor con forma de token"
@@ -257,13 +268,56 @@ SEED_FILES = ("settings.json", "installation_id", "jetski_state.pbtxt", "jetbox_
 SEED_DIRS = ("builtin", "bin")
 
 
+def _agy_homes_parent(real_home: str) -> str:
+    """~/Library/Caches/delegate-agy: 0700, ours, never a symlink. The jail gets only ITS OWN child, so one
+    job cannot list, read or replace another job's private HOME (Security PR61 H3)."""
+    parent = os.path.join(real_home, "Library", "Caches", "delegate-agy")
+    os.makedirs(os.path.dirname(parent), exist_ok=True)
+    try:
+        os.mkdir(parent, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(parent)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise OSError(f"{parent} no es un directorio propio (symlink o de otro usuario)")
+    if st.st_mode & 0o077:
+        os.chmod(parent, 0o700)
+    return parent
+
+
+def sweep_stale_agy_homes(real_home: str | None = None) -> int:
+    """Delete private HOMEs whose owning server process (pid in the dir name) is dead, e.g. after a SIGKILL."""
+    real_home = os.path.realpath(real_home or os.path.expanduser("~"))
+    try:
+        parent = _agy_homes_parent(real_home)
+        names = os.listdir(parent)
+    except OSError:
+        return 0
+    n = 0
+    for name in names:
+        m = re.match(r"^(\d+)-", name)
+        full = os.path.join(parent, name)
+        if not m or os.path.islink(full):
+            continue
+        try:
+            os.kill(int(m.group(1)), 0)
+            continue  # owner alive (possibly another server): leave it
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue
+        shutil.rmtree(full, ignore_errors=True)
+        n += 1
+    return n
+
+
 def make_agy_home(real_home: str | None = None) -> str:
     """Per-job private HOME for agy (Security PR61 H1/H2). State, and bin/agentapi which agy rewrites on
     every run_command, live ONLY here. Seeded by COPYING regular files (no links, no symlink follow) from
     the real ~/.gemini; deleted after the job. Nothing outside the jail ever executes anything from it."""
     real_home = os.path.realpath(real_home or os.path.expanduser("~"))
     src = os.path.join(real_home, ".gemini", "antigravity-cli")
-    root = os.path.realpath(tempfile.mkdtemp(prefix="agy-home-"))
+    root = os.path.realpath(tempfile.mkdtemp(prefix=f"{os.getpid()}-", dir=_agy_homes_parent(real_home)))
     dst = os.path.join(root, ".gemini", "antigravity-cli")
     os.makedirs(dst, mode=0o700)
 
@@ -298,6 +352,46 @@ def make_agy_home(real_home: str | None = None) -> str:
         shutil.rmtree(root, ignore_errors=True)
         raise
     return root
+
+
+def git_guard_snapshot(workdir: str) -> dict:
+    """Outside the jail, before the job: identity and content of <wd>/.git (pointer file, or config + hooks)."""
+    import hashlib
+    g = os.path.join(os.path.realpath(workdir), ".git")
+    try:
+        st = os.lstat(g)
+    except FileNotFoundError:
+        return {"kind": "absent"}
+    except OSError as e:
+        return {"kind": "unreadable", "err": e.__class__.__name__}
+
+    def h(path):
+        try:
+            with open(path, "rb") as f:
+                return hashlib.sha256(f.read(4 << 20)).hexdigest()
+        except OSError:
+            return None
+    if stat.S_ISREG(st.st_mode):
+        return {"kind": "file", "ino": st.st_ino, "sha": h(g)}
+    if not stat.S_ISDIR(st.st_mode):
+        return {"kind": "other", "mode": st.st_mode}
+    files = {}
+    for rel in ("config", "config.worktree", "info/attributes", "info/exclude"):
+        files[rel] = h(os.path.join(g, rel))
+    hooks = os.path.join(g, "hooks")
+    if os.path.isdir(hooks) and not os.path.islink(hooks):
+        for name in sorted(os.listdir(hooks)):
+            files["hooks/" + name] = h(os.path.join(hooks, name))
+    return {"kind": "dir", "ino": st.st_ino, "files": files, "has_hooks_dir": os.path.isdir(hooks)}
+
+
+def git_guard_check(before: dict, workdir: str) -> str | None:
+    after = git_guard_snapshot(workdir)
+    if after != before:
+        return ("INTEGRIDAD: el .git del workdir cambió durante el job (config, hooks o archivo puntero). "
+                "No ejecutes git ahí sin -c core.hooksPath=/dev/null -c core.fsmonitor=false y revisa "
+                "`git config --local --list` y .git/hooks antes de confiar en el resultado.")
+    return None
 
 
 PREFLIGHT_TIMEOUT_S = 5.0
@@ -510,7 +604,12 @@ async def run_agy(task: str, norm: dict, on_proc=None) -> dict:
         pre = await preflight(profile_path, norm["workdir"], git_dirs)
         if pre:
             return {"success": False, "error": pre}
-        return await _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc)
+        guard = git_guard_snapshot(norm["workdir"])
+        res = await _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc)
+        bad = git_guard_check(guard, norm["workdir"])
+        if bad:
+            res = {**res, "success": False, "error": bad + (f" | {res['error']}" if res.get("error") else "")}
+        return res
     finally:
         shutil.rmtree(agy_home, ignore_errors=True)
         try:
@@ -583,6 +682,7 @@ class GeminiJobs:
         self.jobs: dict[str, dict] = {}
         self.queue: deque[str] = deque()
         self.rt: dict[str, dict] = {}  # id -> {"task", "proc", "atask"}
+        sweep_stale_agy_homes()
 
     def _max_concurrent(self) -> int:
         return _env_int("DELEGATE_GEMINI_MAX_CONCURRENT", 4)
