@@ -4913,7 +4913,11 @@ async def delegate_to_gemini(
     secretos, ni en la tarea NI en ningún archivo bajo `workdir` (agy los lee y los sube a Google).
     Corre con --dangerously-skip-permissions, por eso exige DELEGATE_GEMINI_ALLOW_DANGER=1 y
     siempre corre dentro de sandbox-exec (sin lectura de ~/.ssh, ~/.claude, ~/dev, etc.;
-    escritura solo en workdir, tmp y ~/.gemini). Usa un worktree/scratch dir.
+    escritura solo en workdir, tmp y un HOME privado por job; el jail NO puede escribir ningún
+    `.git` del workdir). Usa un worktree/scratch dir.
+    ⚠️ Después del job, NO corras git en ese workdir sin
+    `git -c core.hooksPath=/dev/null -c core.fsmonitor=false ...` (y GIT_CONFIG_NOSYSTEM=1): si el
+    `.git` cambió durante el job, el resultado vuelve success=False con error INTEGRIDAD.
     Requiere `agy` (brew install --cask antigravity-cli) con sesión iniciada (`agy` una vez);
     ruta con DELEGATE_AGY_BIN.
 
