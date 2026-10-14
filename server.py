@@ -4897,7 +4897,7 @@ import gemini_jobs as _gemini_jobs
 async def delegate_to_gemini(
     task: str,
     workdir: str = ".",
-    effort: str = "low",
+    effort: str = _gemini_jobs.DEFAULT_EFFORT,
     timeout_s: int = _gemini_jobs.DEFAULT_TIMEOUT_S,
 ) -> dict:
     """
@@ -4906,7 +4906,7 @@ async def delegate_to_gemini(
     escribe archivos en `workdir` y devuelve su respuesta final. Bloquea hasta que termina;
     para varios en paralelo usa submit_gemini / poll_gemini / cancel_gemini.
 
-    effort -> modelo: low = gemini-3.8-flash-low (default), medium, high. Cualquier otro valor
+    effort -> modelo: low, medium = gemini-3.8-flash-medium (default, Felix 2026-10-14), high. Cualquier otro valor
     se rechaza (solo se exponen los gemini-3.8-flash-*).
 
     ⚠️ PRIVACIDAD: plan de consumidor de Google, SIN BAA. NUNCA PHI, datos de pacientes ni
@@ -4933,7 +4933,7 @@ async def delegate_to_gemini(
 async def submit_gemini(tasks: list[dict]) -> dict:
     """
     Lanza una o varias tareas de Gemini (agy) SIN esperar; devuelve ids de inmediato y se
-    consultan con `poll_gemini(ids)`. Cada elemento: {task, workdir='.', effort='low',
+    consultan con `poll_gemini(ids)`. Cada elemento: {task, workdir='.', effort='medium',
     timeout_s=900}. Mismas reglas que `delegate_to_gemini`. ATÓMICO: se validan todas antes de
     lanzar ninguna. Tope DELEGATE_GEMINI_MAX_CONCURRENT (default 4) corriendo y
     DELEGATE_GEMINI_MAX_QUEUE (32) en cola; un job por workdir a la vez. Los jobs mueren con el
