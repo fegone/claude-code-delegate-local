@@ -141,11 +141,34 @@ async def test_sonnet_effort_runs_with_model(fake_agy, wd, effort):
     assert r["response"].endswith(f"claude-sonnet-5-5-{effort}")
 
 
-@pytest.mark.parametrize("bad", ["opus", "claude-opus", "gpt-oss", "gpt-oss-120b", "other", "claude-sonnet"])
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_argon_maps_to_model(wd, effort):
+    assert gemini_jobs.model_for(effort, "argon") == f"gemini-4-argon-{effort}"
+    err, norm = gemini_jobs.validate("t", wd, effort, 30, family="Argon")
+    assert err is None
+    assert norm["family"] == "argon"
+    assert norm["model"] == f"gemini-4-argon-{effort}"
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+async def test_argon_effort_runs_with_model_in_argv(fake_agy, wd, effort):
+    norm = gemini_jobs.validate("OK x", wd, effort, 30, family="argon")[1]
+    r = await gemini_jobs.run_agy("OK x", norm)
+    assert r["model"] == f"gemini-4-argon-{effort}"
+    a = open(os.path.join(wd, "argv.txt")).read().split("\n")
+    assert a[a.index("--model") + 1] == f"gemini-4-argon-{effort}"
+
+
+def test_argon_bad_effort_rejected(wd):
+    err, _ = gemini_jobs.validate("t", wd, "max", 30, family="argon")
+    assert err and "effort inválido" in err["error"] and "gemini-4-argon-*" in err["error"]
+
+
+@pytest.mark.parametrize("bad", ["opus", "claude-opus", "gpt-oss", "gpt-oss-120b", "other", "claude-sonnet", "argon-4", "gemini-4"])
 def test_invalid_family_rejected(wd, bad):
     err, _ = gemini_jobs.validate("t", wd, "medium", 30, family=bad)
     assert err and "family inválido" in err["error"]
-    assert "Solo se admiten 'gemini' y 'sonnet'" in err["error"]
+    assert "Solo se admiten 'gemini', 'sonnet' y 'argon'" in err["error"]
 
 
 def test_opus_and_gpt_oss_rejected(wd):

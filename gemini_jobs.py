@@ -35,14 +35,16 @@ from collections import deque
 
 EFFORTS = ("low", "medium", "high")
 DEFAULT_EFFORT = "medium"
-FAMILIES = ("gemini", "sonnet")
+FAMILIES = ("gemini", "sonnet", "argon")
 DEFAULT_FAMILY = "gemini"
 # Allowlist of exposed models. `agy models` also lists claude-opus-* and gpt-oss-* models: not exposed.
 GEMINI_MODELS = {f"gemini-3.8-flash-{e}": e for e in EFFORTS}
 SONNET_MODELS = {f"claude-sonnet-5-5-{e}": e for e in EFFORTS}
+ARGON_MODELS = {f"gemini-4-argon-{e}": e for e in EFFORTS}
 FAMILY_MODELS = {
     "gemini": GEMINI_MODELS,
     "sonnet": SONNET_MODELS,
+    "argon": ARGON_MODELS,
 }
 DEFAULT_TIMEOUT_S = 900
 MAX_TIMEOUT_S = 7200
@@ -463,6 +465,8 @@ def model_for(effort: str, family: str = DEFAULT_FAMILY) -> str:
     fam = (family or DEFAULT_FAMILY).strip().lower()
     if fam == "sonnet":
         return f"claude-sonnet-5-5-{effort}"
+    if fam == "argon":
+        return f"gemini-4-argon-{effort}"
     if fam == "gemini":
         return f"gemini-3.8-flash-{effort}"
     raise ValueError(f"family inválido: {family!r} (válidos: {', '.join(FAMILIES)})")
@@ -510,10 +514,11 @@ def validate(task, workdir, effort, timeout_s, family: str = DEFAULT_FAMILY) -> 
     if fam not in FAMILIES:
         return {"success": False,
                 "error": f"family inválido: {family!r} (válidos: {', '.join(FAMILIES)}). "
-                         "Solo se admiten 'gemini' y 'sonnet'."}, {}
+                         "Solo se admiten 'gemini', 'sonnet' y 'argon'."}, {}
     eff = effort.strip().lower() or DEFAULT_EFFORT
     if eff not in EFFORTS:
-        allowed = "gemini-3.8-flash-*" if fam == "gemini" else "claude-sonnet-5-5-*"
+        allowed = {"gemini": "gemini-3.8-flash-*", "sonnet": "claude-sonnet-5-5-*",
+                   "argon": "gemini-4-argon-*"}[fam]
         return {"success": False,
                 "error": f"effort inválido: {effort!r} (válidos: {', '.join(EFFORTS)}). "
                          f"Solo se exponen los modelos {allowed}."}, {}
