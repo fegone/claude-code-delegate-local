@@ -5,11 +5,22 @@ import os
 import stat
 import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 
 import gemini_jobs
 import server
+
+
+def pytest_pyfunc_call(pyfuncitem):
+    if asyncio.iscoroutinefunction(pyfuncitem.obj):
+        testargs = {arg: pyfuncitem.funcargs[arg] for arg in pyfuncitem._fixtureinfo.argnames}
+        asyncio.run(pyfuncitem.obj(**testargs))
+        return True
+
 
 FAKE = r"""#!/bin/sh
 # fake agy: runs INSIDE sandbox-exec in the tests, so it must be plain sh (no venv python).
@@ -113,6 +124,43 @@ def test_only_gemini_models_exposed():
     assert set(gemini_jobs.GEMINI_MODELS) == {f"gemini-3.8-flash-{e}" for e in ("low", "medium", "high")}
 
 
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_sonnet_maps_to_model(wd, effort):
+    assert gemini_jobs.model_for(effort, "sonnet") == f"claude-sonnet-5-5-{effort}"
+    err, norm = gemini_jobs.validate("t", wd, effort, 30, family="sonnet")
+    assert err is None
+    assert norm["family"] == "sonnet"
+    assert norm["model"] == f"claude-sonnet-5-5-{effort}"
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+async def test_sonnet_effort_runs_with_model(fake_agy, wd, effort):
+    norm = gemini_jobs.validate("OK x", wd, effort, 30, family="sonnet")[1]
+    r = await gemini_jobs.run_agy("OK x", norm)
+    assert r["model"] == f"claude-sonnet-5-5-{effort}"
+    assert r["response"].endswith(f"claude-sonnet-5-5-{effort}")
+
+
+@pytest.mark.parametrize("bad", ["opus", "claude-opus", "gpt-oss", "gpt-oss-120b", "other", "claude-sonnet"])
+def test_invalid_family_rejected(wd, bad):
+    err, _ = gemini_jobs.validate("t", wd, "medium", 30, family=bad)
+    assert err and "family inválido" in err["error"]
+    assert "Solo se admiten 'gemini' y 'sonnet'" in err["error"]
+
+
+def test_opus_and_gpt_oss_rejected(wd):
+    # Neither claude-opus-* nor gpt-oss-* are exposed in any family or effort
+    for bad in ("opus", "claude-opus", "claude-opus-4", "gpt-oss", "gpt-oss-120b"):
+        err_fam, _ = gemini_jobs.validate("t", wd, "medium", 30, family=bad)
+        assert err_fam and "family inválido" in err_fam["error"]
+        err_eff_sonnet, _ = gemini_jobs.validate("t", wd, bad, 30, family="sonnet")
+        assert err_eff_sonnet and "effort inválido" in err_eff_sonnet["error"]
+        err_eff_gemini, _ = gemini_jobs.validate("t", wd, bad, 30, family="gemini")
+        assert err_eff_gemini and "effort inválido" in err_eff_gemini["error"]
+    for m in list(gemini_jobs.GEMINI_MODELS) + list(gemini_jobs.SONNET_MODELS):
+        assert "opus" not in m and "gpt" not in m
+
+
 async def test_non_success_status_is_error_and_redacted(fake_agy, wd):
     r = await gemini_jobs.run_agy("FAIL", gemini_jobs.validate("FAIL", wd, "low", 30)[1])
     assert r["success"] is False and "status='ERROR'" in r["error"] and "rc=1" in r["error"]
@@ -180,6 +228,39 @@ async def test_submit_atomic_rejects_all_on_one_bad(fake_agy, wd):
     s = await gemini_jobs.JOBS.submit([{"task": "OK", "workdir": wd}, {"task": "OK", "workdir": wd, "effort": "max"}])
     assert s["success"] is False and s["jobs"][0]["index"] == 1
     assert gemini_jobs.JOBS.jobs == {}
+
+
+async def test_submit_atomic_rejects_bad_family(fake_agy, wd):
+    s = await gemini_jobs.JOBS.submit([
+        {"task": "OK 1", "workdir": wd, "family": "sonnet"},
+        {"task": "OK 2", "workdir": wd, "family": "opus"},
+    ])
+    assert s["success"] is False and s["jobs"][0]["index"] == 1
+    assert "family inválido" in s["jobs"][0]["error"]
+    assert gemini_jobs.JOBS.jobs == {}
+
+
+async def test_submit_gemini_tool_atomic_rejects_bad_family(wd):
+    s = await _tool("submit_gemini", [
+        {"task": "OK 1", "workdir": wd, "family": "gemini"},
+        {"task": "OK 2", "workdir": wd, "family": "invalid_family"},
+    ])
+    assert s["success"] is False
+    assert s["jobs"][0]["index"] == 1
+    assert "family inválido" in s["jobs"][0]["error"]
+    assert gemini_jobs.JOBS.jobs == {}
+
+
+async def test_delegate_and_submit_sonnet_success(fake_agy, wd):
+    r = await _tool("delegate_to_gemini", "OK sonnet", wd, effort="high", family="sonnet")
+    assert r["success"] is True and r["status"] == "SUCCESS"
+    assert r["model"] == "claude-sonnet-5-5-high"
+    assert r["response"] == "hecho claude-sonnet-5-5-high"
+    s = await gemini_jobs.JOBS.submit([{"task": "OK sub", "workdir": wd, "effort": "low", "family": "sonnet"}])
+    jid = s["jobs"][0]["id"]
+    v = await _wait_status(jid, {"done", "failed"})
+    assert v["status"] == "done" and v["final_response"] == "hecho claude-sonnet-5-5-low"
+    assert v["model"] == "claude-sonnet-5-5-low"
 
 
 async def test_cancel_running_kills_tree(fake_agy, wd):
@@ -443,6 +524,21 @@ def test_default_effort_is_medium():
     assert gemini_jobs.DEFAULT_EFFORT == "medium"
     assert inspect.signature(server.delegate_to_gemini).parameters["effort"].default == "medium"
     assert gemini_jobs.validate("t", ".", "", 5)[1]["model"] == "gemini-3.8-flash-medium"
+
+
+def test_default_family_is_gemini():
+    import inspect
+    import server
+    assert gemini_jobs.DEFAULT_FAMILY == "gemini"
+    assert inspect.signature(server.delegate_to_gemini).parameters["family"].default == "gemini"
+    err, norm = gemini_jobs.validate("t", ".", "medium", 5)
+    assert err is None
+    assert norm["family"] == "gemini"
+    assert norm["model"] == "gemini-3.8-flash-medium"
+    err_empty, norm_empty = gemini_jobs.validate("t", ".", "", 5, family="")
+    assert err_empty is None
+    assert norm_empty["family"] == "gemini"
+    assert norm_empty["model"] == "gemini-3.8-flash-medium"
 
 
 # ── workdir under HOME: stat/ls/find/git (fix 2026-10-14) ───────────────────────────
@@ -770,3 +866,31 @@ def test_outside_jail_git_uses_safe_flags(monkeypatch, tmp_path):
 
 def test_quoted_inline_helper_refused():
     assert gemini_jobs._config_credential_problem('[credential]\n\thelper = "!f() { echo x; }; f"\n')
+
+
+# ── quota failover (Felix 2026-10-15) ──
+def test_quota_in_json_error_marks_failover():
+    out = gemini_jobs.parse_output(
+        b'{"status": "ERROR", "error": "RESOURCE_EXHAUSTED: weekly usage limit reached"}', b"", 1)
+    assert out["success"] is False
+    assert out["quota_exhausted"] is True
+    assert out["failover"] == "anthropic-sonnet-5-5"
+    assert out["error"].startswith("CUOTA")
+
+
+def test_quota_in_stderr_without_json_marks_failover():
+    out = gemini_jobs.parse_output(b"", b"Error 429: Too Many Requests, try again in 5h", 1)
+    assert out.get("quota_exhausted") is True
+
+
+def test_plain_failure_is_not_quota():
+    out = gemini_jobs.parse_output(b'{"status": "ERROR", "error": "tool crashed"}', b"boom", 1)
+    assert out["success"] is False
+    assert "quota_exhausted" not in out
+
+
+def test_success_mentioning_quota_is_not_marked():
+    out = gemini_jobs.parse_output(
+        b'{"status": "SUCCESS", "response": "added a quota check to the code"}', b"", 0)
+    assert out["success"] is True
+    assert "quota_exhausted" not in out

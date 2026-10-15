@@ -4899,6 +4899,7 @@ async def delegate_to_gemini(
     workdir: str = ".",
     effort: str = _gemini_jobs.DEFAULT_EFFORT,
     timeout_s: int = _gemini_jobs.DEFAULT_TIMEOUT_S,
+    family: str = _gemini_jobs.DEFAULT_FAMILY,
 ) -> dict:
     """
     Delega una tarea a Gemini vía Google Antigravity CLI (`agy -p`), autenticado con la
@@ -4906,15 +4907,23 @@ async def delegate_to_gemini(
     escribe archivos en `workdir` y devuelve su respuesta final. Bloquea hasta que termina;
     para varios en paralelo usa submit_gemini / poll_gemini / cancel_gemini.
 
-    effort -> modelo: low, medium = gemini-3.8-flash-medium (default, Felix 2026-10-14), high. Cualquier otro valor
-    se rechaza (solo se exponen los gemini-3.8-flash-*).
+    family -> familia de modelos: "gemini" (default) o "sonnet".
+    effort -> modelo:
+      - Con family="gemini": gemini-3.8-flash-{low,medium,high} (default medium).
+      - Con family="sonnet": claude-sonnet-5-5-{low,medium,high}.
+    Cualquier otro valor de family o effort se rechaza (no se exponen claude-opus-* ni gpt-oss-*).
 
-    ⚠️ PRIVACIDAD: plan de consumidor de Google, SIN BAA. NUNCA PHI, datos de pacientes ni
-    secretos, ni en la tarea NI en ningún archivo bajo `workdir` (agy los lee y los sube a Google).
-    Corre con --dangerously-skip-permissions, por eso exige DELEGATE_GEMINI_ALLOW_DANGER=1 y
-    siempre corre dentro de sandbox-exec (sin lectura de ~/.ssh, ~/.claude, ~/dev, etc.;
-    escritura solo en workdir, tmp y un HOME privado por job; el jail NO puede escribir ningún
-    `.git` del workdir). Usa un worktree/scratch dir.
+    🔁 CUOTA (Felix 2026-10-15): si agy se queda sin cuota (tope de 5 h, semanal, 429, capacidad), el
+    resultado trae `quota_exhausted: true` y `failover: "anthropic-sonnet-5-5"`. El que llama (Mario)
+    relanza ENSEGUIDA la misma tarea y el mismo workdir con un subagente Sonnet 5.5 medium de Claude
+    Code (suscripción, nunca API key) y lo avisa en una línea. El delegate no llama a Anthropic.
+
+    ⚠️ PRIVACIDAD: plan de consumidor de Google, SIN BAA (Sonnet vía agy sigue la misma regla).
+    NUNCA PHI, datos de pacientes ni secretos, ni en la tarea NI en ningún archivo bajo `workdir`
+    (agy los lee y los sube a Google). Corre con --dangerously-skip-permissions, por eso exige
+    DELEGATE_GEMINI_ALLOW_DANGER=1 y siempre corre dentro de sandbox-exec (sin lectura de ~/.ssh,
+    ~/.claude, ~/dev, etc.; escritura solo en workdir, tmp y un HOME privado por job; el jail NO
+    puede escribir ningún `.git` del workdir). Usa un worktree/scratch dir.
     ⚠️ Después del job, NO corras git en ese workdir sin
     `git -c core.hooksPath=/dev/null -c core.fsmonitor=false ...` (y GIT_CONFIG_NOSYSTEM=1): si el
     `.git` cambió durante el job, el resultado vuelve success=False con error INTEGRIDAD.
@@ -4926,11 +4935,12 @@ async def delegate_to_gemini(
         workdir: directorio de trabajo ('/' y $HOME se rechazan).
         effort: low | medium | high.
         timeout_s: tope de pared (default 900, máx 7200); se mata todo el grupo de procesos.
+        family: "gemini" (default) | "sonnet".
 
     Returns: {success, status, response, conversation_id, usage, duration_s, exit_code, model,
               effort, elapsed_s} o {success: False, error}.
     """
-    return await _gemini_jobs.JOBS.run_blocking(task, workdir, effort, timeout_s)
+    return await _gemini_jobs.JOBS.run_blocking(task, workdir, effort, timeout_s, family)
 
 
 @mcp.tool()
@@ -4938,11 +4948,14 @@ async def submit_gemini(tasks: list[dict]) -> dict:
     """
     Lanza una o varias tareas de Gemini (agy) SIN esperar; devuelve ids de inmediato y se
     consultan con `poll_gemini(ids)`. Cada elemento: {task, workdir='.', effort='medium',
-    timeout_s=900}. Mismas reglas que `delegate_to_gemini`. ATÓMICO: se validan todas antes de
-    lanzar ninguna. Tope DELEGATE_GEMINI_MAX_CONCURRENT (default 4) corriendo y
+    timeout_s=900, family='gemini'}. family admite "gemini" (default) o "sonnet"
+    (claude-sonnet-5-5-<effort>). Mismas reglas que `delegate_to_gemini`. ATÓMICO: se validan todas
+    antes de lanzar ninguna. Tope DELEGATE_GEMINI_MAX_CONCURRENT (default 4) corriendo y
     DELEGATE_GEMINI_MAX_QUEUE (32) en cola; un job por workdir a la vez. Los jobs mueren con el
     server. Misma puerta (DELEGATE_GEMINI_ALLOW_DANGER=1) y sandbox que delegate_to_gemini.
-    ⚠️ Nunca PHI, ni en la tarea ni en archivos del workdir (plan de consumidor, sin BAA).
+    ⚠️ Nunca PHI, ni en la tarea ni en archivos del workdir (plan de consumidor de Google, sin BAA;
+    Sonnet vía agy sigue la misma regla). Cuota agotada: `poll_gemini` da `quota_exhausted` y
+    `failover`, igual que delegate_to_gemini (relanzar con Sonnet 5.5 de Claude Code).
     """
     return await _gemini_jobs.JOBS.submit(tasks)
 

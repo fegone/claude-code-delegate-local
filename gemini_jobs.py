@@ -35,8 +35,15 @@ from collections import deque
 
 EFFORTS = ("low", "medium", "high")
 DEFAULT_EFFORT = "medium"
-# Allowlist of exposed models. `agy models` also lists claude-* and gpt-oss models: not exposed.
+FAMILIES = ("gemini", "sonnet")
+DEFAULT_FAMILY = "gemini"
+# Allowlist of exposed models. `agy models` also lists claude-opus-* and gpt-oss-* models: not exposed.
 GEMINI_MODELS = {f"gemini-3.8-flash-{e}": e for e in EFFORTS}
+SONNET_MODELS = {f"claude-sonnet-5-5-{e}": e for e in EFFORTS}
+FAMILY_MODELS = {
+    "gemini": GEMINI_MODELS,
+    "sonnet": SONNET_MODELS,
+}
 DEFAULT_TIMEOUT_S = 900
 MAX_TIMEOUT_S = 7200
 KILL_GRACE_S = 10.0  # extra wall time beyond --print-timeout before we kill the group
@@ -48,9 +55,10 @@ JOBS_KEEP = 200
 TERMINAL = frozenset({"done", "failed", "timeout", "cancelled"})
 DENIED_DIRS = (".ssh", ".gnupg", ".aws", ".config", ".claude", ".codex", ".gemini", ".docker", ".kube", "Library")
 _ENV_ALLOW = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TZ", "LANG"})
-PUBLIC_FIELDS = ("id", "status", "model", "effort", "workdir", "timeout_s", "task_preview",
+PUBLIC_FIELDS = ("id", "status", "model", "effort", "family", "workdir", "timeout_s", "task_preview",
                  "submitted_at", "started_at", "finished_at", "pid", "error", "final_response",
-                 "conversation_id", "usage", "duration_s", "exit_code", "queue_reason")
+                 "conversation_id", "usage", "duration_s", "exit_code", "queue_reason",
+                 "quota_exhausted", "failover")
 
 _SECRET_PATS = (
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{8,}"),
@@ -445,8 +453,13 @@ def stderr_tail(raw: bytes) -> str:
     return text[-STDERR_TAIL:]
 
 
-def model_for(effort: str) -> str:
-    return f"gemini-3.8-flash-{effort}"
+def model_for(effort: str, family: str = DEFAULT_FAMILY) -> str:
+    fam = (family or DEFAULT_FAMILY).strip().lower()
+    if fam == "sonnet":
+        return f"claude-sonnet-5-5-{effort}"
+    if fam == "gemini":
+        return f"gemini-3.8-flash-{effort}"
+    raise ValueError(f"family inválido: {family!r} (válidos: {', '.join(FAMILIES)})")
 
 
 def child_env() -> dict[str, str]:
@@ -473,24 +486,35 @@ def reap_group(proc) -> None:
         pass
 
 
-def validate(task, workdir, effort, timeout_s) -> tuple[dict | None, dict]:
-    """Returns (error | None, normalized {workdir, effort, model, timeout_s})."""
+def validate(task, workdir, effort, timeout_s, family: str = DEFAULT_FAMILY) -> tuple[dict | None, dict]:
+    """Returns (error | None, normalized {workdir, effort, model, timeout_s, family})."""
     if not danger_allowed():
         return {"success": False,
                 "error": "Gemini/agy corre con --dangerously-skip-permissions (no puede pedir permiso en "
                          f"modo -p). Deshabilitado: define {ALLOW_DANGER_ENV}=1 para permitirlo. "
                          "Siempre corre dentro de un sandbox-exec; nunca con PHI."}, {}
-    for name, val in (("task", task), ("workdir", workdir), ("effort", effort)):
+    if family is None:
+        family = DEFAULT_FAMILY
+    for name, val in (("task", task), ("workdir", workdir), ("effort", effort), ("family", family)):
         if not isinstance(val, str):
             return {"success": False, "error": f"{name} debe ser texto"}, {}
     if not task.strip():
         return {"success": False, "error": "task vacío"}, {}
+    fam = family.strip().lower() or DEFAULT_FAMILY
+    if fam not in FAMILIES:
+        return {"success": False,
+                "error": f"family inválido: {family!r} (válidos: {', '.join(FAMILIES)}). "
+                         "Solo se admiten 'gemini' y 'sonnet'."}, {}
     eff = effort.strip().lower() or DEFAULT_EFFORT
-    model = model_for(eff)
-    if eff not in EFFORTS or model not in GEMINI_MODELS:
+    if eff not in EFFORTS:
+        allowed = "gemini-3.8-flash-*" if fam == "gemini" else "claude-sonnet-5-5-*"
         return {"success": False,
                 "error": f"effort inválido: {effort!r} (válidos: {', '.join(EFFORTS)}). "
-                         "Solo se exponen los modelos gemini-3.8-flash-*."}, {}
+                         f"Solo se exponen los modelos {allowed}."}, {}
+    model = model_for(eff, fam)
+    if model not in FAMILY_MODELS[fam]:
+        return {"success": False,
+                "error": f"modelo no permitido: {model!r}."}, {}
     if (isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float))
             or not math.isfinite(timeout_s) or timeout_s <= 0):
         return {"success": False, "error": "timeout_s debe ser un número finito > 0"}, {}
@@ -503,7 +527,7 @@ def validate(task, workdir, effort, timeout_s) -> tuple[dict | None, dict]:
     denied = {os.path.join(home, d) for d in DENIED_DIRS}
     if real in ("/", home) or any(real == p or real.startswith(p + os.sep) for p in denied):
         return {"success": False, "error": f"workdir demasiado amplio o sensible: {real}"}, {}
-    return None, {"workdir": wd, "effort": eff, "model": model, "timeout_s": timeout_s}
+    return None, {"workdir": wd, "effort": eff, "model": model, "timeout_s": timeout_s, "family": fam}
 
 
 AGY_SANDBOX_FLAG = os.getenv("DELEGATE_GEMINI_AGY_SANDBOX_FLAG", "1").lower() in ("1", "true", "yes")
@@ -534,6 +558,24 @@ AUTH_HINT = ("agy session not readable in the jail (authentication failed inside
              "Check `agy models` outside the jail; the login flow is never started by delegate-local.")
 
 
+# Quota / rate-limit signatures (Felix 2026-10-15: on these, fail over to Anthropic Sonnet 5.5).
+# Not yet checked against a real agy quota event: widen it the first time one arrives.
+QUOTA_RE = re.compile(r"(?i)resource[_ ]?exhausted|quota|rate[ -]?limit|\b429\b|usage limit|"
+                      r"capacity[_ ]?exhausted|too many requests|limit reached|try again (?:at|in|later)")
+FAILOVER_TARGET = "anthropic-sonnet-5-5"
+
+
+def _quota_hit(*parts) -> bool:
+    return bool(QUOTA_RE.search(" ".join(str(p) for p in parts if p)))
+
+
+def _mark_quota(out: dict) -> dict:
+    out.update(quota_exhausted=True, failover=FAILOVER_TARGET,
+               error="CUOTA agy agotada (Google): relanzar con un subagente Sonnet 5.5 de Claude Code | "
+                     + out.get("error", ""))
+    return out
+
+
 def parse_output(stdout: bytes, stderr: bytes, rc: int | None) -> dict:
     """Turn agy's raw output into a result dict."""
     tail = stderr_tail(stderr)
@@ -551,8 +593,9 @@ def parse_output(stdout: bytes, stderr: bytes, rc: int | None) -> dict:
                 except ValueError:
                     continue
     if not isinstance(data, dict):
-        return {"success": False, "exit_code": rc,
-                "error": f"agy no devolvió JSON (rc={rc})" + (f": {tail}" if tail else "")}
+        out = {"success": False, "exit_code": rc,
+               "error": f"agy no devolvió JSON (rc={rc})" + (f": {tail}" if tail else "")}
+        return _mark_quota(out) if _quota_hit(tail, text[-2000:]) else out
     status = data.get("status")
     out = {
         "status": status,
@@ -570,6 +613,8 @@ def parse_output(stdout: bytes, stderr: bytes, rc: int | None) -> dict:
             return out
         out.update(success=False, error=f"agy terminó con status={status!r} rc={rc}"
                    + (f": {detail}" if detail else "") + (f" | stderr: {tail}" if tail else ""))
+        if _quota_hit(status, data.get("error"), data.get("message"), tail):
+            _mark_quota(out)
         return out
     out["success"] = True
     return out
@@ -633,7 +678,7 @@ async def _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc) 
         return {"success": False, "error": f"no se pudo lanzar agy: {e.__class__.__name__}"}
     if on_proc is not None:
         on_proc(proc)
-    base = {"model": norm["model"], "effort": norm["effort"]}
+    base = {"model": norm["model"], "effort": norm["effort"], "family": norm.get("family", DEFAULT_FAMILY)}
     try:
         out_t = asyncio.ensure_future(_drain(proc.stdout, STDOUT_CAP))
         err_t = asyncio.ensure_future(_drain(proc.stderr, STDOUT_CAP))
@@ -713,7 +758,7 @@ class GeminiJobs:
                 errors.append({"index": i, "error": "cada tarea debe ser un objeto"})
                 continue
             err, norm = validate(t.get("task"), t.get("workdir", "."), t.get("effort", DEFAULT_EFFORT),
-                                 t.get("timeout_s", DEFAULT_TIMEOUT_S))
+                                 t.get("timeout_s", DEFAULT_TIMEOUT_S), t.get("family", DEFAULT_FAMILY))
             if err:
                 errors.append({"index": i, "error": err["error"]})
             else:
@@ -729,6 +774,7 @@ class GeminiJobs:
             jid = f"gm-{uuid.uuid4().hex[:10]}"
             self.jobs[jid] = {
                 "id": jid, "status": "queued", "model": norm["model"], "effort": norm["effort"],
+                "family": norm["family"],
                 "workdir": norm["workdir"], "timeout_s": norm["timeout_s"],
                 "task_preview": task.strip()[:60], "submitted_at": time.time(),
                 "root": os.path.realpath(norm["workdir"]), "queue_reason": "waiting_for_slot",
@@ -768,6 +814,7 @@ class GeminiJobs:
     async def _run(self, jid: str) -> None:
         j, rt = self.jobs[jid], self.rt[jid]
         norm = {"workdir": j["workdir"], "effort": j["effort"], "model": j["model"],
+                "family": j.get("family", DEFAULT_FAMILY),
                 "timeout_s": j["timeout_s"]}
 
         def on_proc(proc):
@@ -786,6 +833,8 @@ class GeminiJobs:
                 else:
                     j["status"] = "timeout" if res.get("status") == "timeout" else "failed"
                     j["error"] = res.get("error")
+                    if res.get("quota_exhausted"):
+                        j["quota_exhausted"], j["failover"] = True, res.get("failover")
         except asyncio.CancelledError:
             if j["status"] == "running":
                 j["status"], j["error"] = "cancelled", "cancelled"
@@ -804,10 +853,10 @@ class GeminiJobs:
             self.jobs.pop(k, None)
             self.rt.pop(k, None)
 
-    async def run_blocking(self, task: str, workdir: str, effort: str, timeout_s) -> dict:
+    async def run_blocking(self, task: str, workdir: str, effort: str, timeout_s, family: str = DEFAULT_FAMILY) -> dict:
         """delegate_to_gemini: same caps, per-workdir lock and kill_all as submit (L4)."""
         sub = await self.submit([{"task": task, "workdir": workdir, "effort": effort,
-                                  "timeout_s": timeout_s}])
+                                  "timeout_s": timeout_s, "family": family}])
         if "jobs" not in sub or "id" not in (sub["jobs"][0] if sub["jobs"] else {}):
             return sub if not sub.get("jobs") else {"success": False, "error": sub["jobs"][0].get("error", sub.get("error"))}
         jid = sub["jobs"][0]["id"]
