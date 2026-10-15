@@ -201,7 +201,7 @@ DISPATCH_TIMEOUT = int(os.getenv("DELEGATE_DISPATCH_TIMEOUT", "3600"))
 # morira a medias.
 DISPATCH_MIN_SLICE = 30
 # Real-world finding (2026-07-06 benchmark): a deep-reasoning "-max" tier alias
-# (e.g. deepseek-v4-pro-max, glm-coding-plan-max) can burn its ENTIRE max_tokens
+# (e.g. deepseek-v4-flash-max, glm-coding-plan-max) can burn its ENTIRE max_tokens
 # budget on thinking before emitting any usable output — with DeepSeek this once
 # meant 0 tool calls and an empty final_response at the 65536 default. Callers
 # forgetting to pass a bigger max_tokens for a "-max" dispatch is a silent-failure
@@ -298,11 +298,11 @@ MAX_TIER_SUFFIXES = ("-max",)  # extend here if new "-max"-style aliases appear
 # 2026-08-04: deepseek-v4-flash — which reasons at "high" out of the box, which is
 # why no separate "-think" alias exists for it — burned ~16k tokens of reasoning and
 # returned an EMPTY response at the 65536 default, reproducibly, on open-ended
-# prompts. deepseek-v4-pro likewise defaults to high effort. Matching only on the
+# prompts. Matching only on the
 # suffix left the plain aliases exposed to the failure the suffix rule was written
 # to prevent. Prefix match, so a tier variant ("-max") and the plain alias both get
 # the headroom.
-HIGH_REASONING_PREFIXES = ("deepseek-v4-flash", "deepseek-v4-pro")
+HIGH_REASONING_PREFIXES = ("deepseek-v4-flash",)
 
 # Hard per-provider output-token ceilings. A provider REJECTS a request whose
 # max_tokens exceeds its cap, so the "-max" auto-bump above (and any over-eager
@@ -368,7 +368,6 @@ PROVIDER_CONCURRENCY = {
     # equivalent measurement for DeepSeek, so this is the first number to
     # revisit if 429s start appearing.
     "deepseek-v4-flash": 6,
-    "deepseek-v4-pro": 6,
     "qwen-3-8-max": 6,
     # 🚨 GLM is the DELIBERATE exception: every glm-* alias shares ONE pool of six
     # (Felix, 2026-08-28). There is no "glm-coding-plan" entry on purpose, so the
@@ -429,24 +428,22 @@ DEFAULT_PROVIDER_CONCURRENCY = int(os.getenv("DELEGATE_CONCURRENCY_DEFAULT", "4"
 NO_FAILOVER_PREFIXES = ("local-", "ornith", "codex", "gpt-")
 
 FAILOVER_CHAINS = {
-    "glm-coding-plan":       ["qwen-3-8-max", "deepseek-v4-flash", "deepseek-v4-pro"],
-    "glm-coding-plan-think": ["qwen-3-8-max", "deepseek-v4-flash", "deepseek-v4-pro"],
-    "glm-coding-plan-max":   ["qwen-3-8-max", "deepseek-v4-flash-max", "deepseek-v4-pro-max"],
+    "glm-coding-plan":       ["qwen-3-8-max", "deepseek-v4-flash"],
+    "glm-coding-plan-think": ["qwen-3-8-max", "deepseek-v4-flash"],
+    "glm-coding-plan-max":   ["qwen-3-8-max", "deepseek-v4-flash-max"],
     # No GLM in this chain: every glm-* alias shares one pool, so a hop from one
     # GLM to another would queue for the very slot that is already full.
-    "glm-5-3-flash":         ["qwen-3-8-max", "deepseek-v4-flash", "deepseek-v4-pro"],
-    "qwen-3-8-max":          ["glm-coding-plan-think", "deepseek-v4-flash", "deepseek-v4-pro"],
-    "qwen-3-8-max-think":    ["glm-coding-plan-think", "deepseek-v4-flash", "deepseek-v4-pro"],
-    "deepseek-v4-flash":     ["deepseek-v4-pro", "glm-coding-plan-think", "qwen-3-8-max"],
-    "deepseek-v4-flash-max": ["deepseek-v4-pro-max", "glm-coding-plan-max", "qwen-3-8-max"],
-    "deepseek-v4-pro":       ["glm-coding-plan-think", "qwen-3-8-max", "deepseek-v4-flash"],
-    "deepseek-v4-pro-max":   ["glm-coding-plan-max", "qwen-3-8-max", "deepseek-v4-flash-max"],
+    "glm-5-3-flash":         ["qwen-3-8-max", "deepseek-v4-flash"],
+    "qwen-3-8-max":          ["glm-coding-plan-think", "deepseek-v4-flash"],
+    "qwen-3-8-max-think":    ["glm-coding-plan-think", "deepseek-v4-flash"],
+    "deepseek-v4-flash":     ["glm-coding-plan-think", "qwen-3-8-max"],
+    "deepseek-v4-flash-max": ["glm-coding-plan-max", "qwen-3-8-max"],
     "minimax-m3":            ["glm-coding-plan-think", "qwen-3-8-max", "deepseek-v4-flash"],
     "grok-4-5":              ["glm-coding-plan-think", "qwen-3-8-max", "deepseek-v4-flash"],
     # No MiMo inside MiMo chains: all mimo-* share one pool (see PROVIDER_CONCURRENCY).
     "mimo-flash":            ["glm-5-3-flash", "qwen-3-8-max", "deepseek-v4-flash"],
     "mimo-flash-think":      ["glm-coding-plan-think", "qwen-3-8-max", "deepseek-v4-flash"],
-    "mimo-pro":              ["glm-coding-plan-max", "qwen-3-8-max-think", "deepseek-v4-pro"],
+    "mimo-pro":              ["glm-coding-plan-max", "qwen-3-8-max-think", "deepseek-v4-flash"],
 }
 
 # Seconds a FALLBACK waits for its own slot. Short on purpose: the point is to
@@ -557,8 +554,6 @@ MODEL_BUDGET_POLICY = {
     "glm-5-3-flash": 65_536,
     "deepseek-v4-flash": 150_000,
     "deepseek-v4-flash-max": 150_000,
-    "deepseek-v4-pro": 150_000,
-    "deepseek-v4-pro-max": 150_000,
     # MiMo reasons by default ("thinking" enabled) and caps output at 131072.
     # mimo-flash runs with thinking disabled, so the default budget is enough.
     "mimo-flash": 65_536,
@@ -2732,11 +2727,11 @@ async def delegate_to_local_agent(
                Default 'local-qwen-3-6-35b'. Override via DELEGATE_LOCAL_MODEL env var.
         max_tokens: Tope de tokens por turno del modelo. Default = 65536, EXCEPTO para
                modelos que razonan fuerte, donde sube a 150000 automático. Califican
-               dos grupos: (a) los tiers "-max" (glm-coding-plan-max, deepseek-v4-pro-max)
+               dos grupos: (a) los tiers "-max" (glm-coding-plan-max, deepseek-v4-flash-max)
                y (b) los alias que razonan por default aunque nada en el nombre lo
-               anuncie (deepseek-v4-flash, deepseek-v4-pro). Motivo: el modelo puede
+               anuncie (deepseek-v4-flash). Motivo: el modelo puede
                gastar TODO el budget pensando y no dejar nada para la respuesta
-               (verificado: deepseek-v4-pro-max con 32K devolvió 0 tool_calls y
+               (verificado: deepseek-v4-pro-max (retirado) con 32K devolvió 0 tool_calls y
                respuesta vacía; deepseek-v4-flash con el default 65536 quemó ~16k de
                razonamiento y devolvió respuesta vacía en prompts abiertos).
                Pasar un valor explícito siempre gana sobre el auto-bump.
@@ -2779,7 +2774,7 @@ async def delegate_batch(
 
     Concurrency is enforced PER PROVIDER, not globally: local/ornith get 2 slots (real
     oMLX capacity, one reserved for production work), while cloud providers get their own
-    independent pools (all glm-* share 6, deepseek-v4-flash 6, deepseek-v4-pro 6, others 4).
+    independent pools (all glm-* share 6, deepseek-v4-flash 6, others 4).
     A mixed batch of 6 GLM + 6 DeepSeek
     runs all 12 at once. Tasks beyond a provider's slots queue instead of failing.
 

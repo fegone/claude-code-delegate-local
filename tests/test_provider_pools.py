@@ -49,9 +49,9 @@ def test_glm_flash_has_a_failover_chain_at_all():
     assert server._failover_candidates("glm-5-3-flash")
 
 
-def test_deepseek_flash_and_pro_keep_separate_pools():
-    """They bill per token and were measured apart; only GLM is pooled together."""
-    assert server._provider_key("deepseek-v4-flash") != server._provider_key("deepseek-v4-pro")
+def test_deepseek_flash_and_qwen_keep_separate_pools():
+    """Separate providers keep separate pools; only GLM is pooled together."""
+    assert server._provider_key("deepseek-v4-flash") != server._provider_key("qwen-3-8-max")
 
 
 def test_local_and_codex_never_fail_over_outward():

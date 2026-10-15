@@ -41,9 +41,7 @@ model_list:
   # DEEPSEEK — cloud, needs API key from platform.deepseek.com
   # deepseek-chat/deepseek-reasoner are DEPRECATED (removed 2026-07-24) — use the
   # v4 model ids below. Thinking is now a RUNTIME PARAMETER (extra_body.thinking +
-  # reasoning_effort), not a separate model. deepseek-v4-pro reasons even with no
-  # extra_body set, so pin reasoning_effort explicitly rather than relying on the
-  # implicit default. ⚠️ Use the `deepseek/` provider prefix, NOT `openai/` — with
+  # reasoning_effort), not a separate model. ⚠️ Use the `deepseek/` provider prefix, NOT `openai/` — with
   # `openai/` LiteLLM 1.83.9 bridges /v1/messages (the Anthropic-format route this
   # MCP uses) through the Responses API, which DeepSeek's endpoint doesn't
   # implement → silent 404 with an empty message. `deepseek/` uses chat/completions
@@ -55,24 +53,6 @@ model_list:
     litellm_params:
       model: deepseek/deepseek-v4-flash
       api_key: os.environ/DEEPSEEK_API_KEY
-
-  - model_name: deepseek-v4-pro       # reasoning_effort: high, explicit — no ambiguous "default" tier
-    litellm_params:
-      model: deepseek/deepseek-v4-pro
-      api_key: os.environ/DEEPSEEK_API_KEY
-      extra_body:
-        thinking:
-          type: enabled
-        reasoning_effort: high
-
-  - model_name: deepseek-v4-pro-max   # deepest reasoning — only for genuinely hard problems (slower, more tokens)
-    litellm_params:
-      model: deepseek/deepseek-v4-pro
-      api_key: os.environ/DEEPSEEK_API_KEY
-      extra_body:
-        thinking:
-          type: enabled
-        reasoning_effort: max
 
   # ═══════════════════════════════════════════════════════════════════════════
   # Z.AI — GLM CODING PLAN (flat-rate subscription, Anthropic-compatible endpoint)

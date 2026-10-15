@@ -103,7 +103,7 @@ def test_max_turns_explicito_se_clampea_al_guard_rail(tmp_path, monkeypatch):
 def test_defaults_de_run_bash_timeout_por_backend(monkeypatch):
     monkeypatch.delenv("DELEGATE_RUN_BASH_TIMEOUT", raising=False)
     assert server._default_bash_timeout("glm-coding-plan-think") == 600
-    assert server._default_bash_timeout("deepseek-v4-pro") == 600
+    assert server._default_bash_timeout("deepseek-v4-flash") == 600
     assert server._default_bash_timeout("local-qwen-3-6-35b") == 120, \
         "local conserva 120: GPU/event-loop compartidos y el semáforo global"
     assert server._default_bash_timeout("ornith-think") == 120

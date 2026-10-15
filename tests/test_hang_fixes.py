@@ -45,7 +45,7 @@ def test_alias_de_la_tabla_no_dependen_del_sufijo():
         "glm-coding-plan-think": 65_536,
         "glm-coding-plan-max": 131_072,
         "deepseek-v4-flash": 150_000,
-        "deepseek-v4-pro-max": 150_000,
+        "deepseek-v4-flash-max": 150_000,
     }
     for alias, budget in esperado.items():
         assert srv._resolve_max_tokens(alias, None) == budget, alias

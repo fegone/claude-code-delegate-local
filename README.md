@@ -95,7 +95,6 @@ The bucket is chosen by **longest matching prefix**, so specific entries win ove
 | Bucket | Slots | Covers |
 |---|---|---|
 | `deepseek-v4-flash` | 6 | `-flash`, `-flash-max` |
-| `deepseek-v4-pro` | 6 | `-pro`, `-pro-max` |
 | `qwen-3-8-max` | 6 | `-max`, `-max-think` |
 | `glm-coding-plan` | 6 | plain, `-think`, `-max` |
 | `ornith` | 6 | `ornith*` |
@@ -111,8 +110,8 @@ Override any of them with `DELEGATE_CONCURRENCY_<BUCKET>` (e.g.
 When a pool is full, the dispatch walks a chain of equivalent models rather than failing:
 
 ```
-glm-coding-plan-think → qwen-3-8-max → deepseek-v4-flash → deepseek-v4-pro
-deepseek-v4-flash     → deepseek-v4-pro → glm-coding-plan-think → qwen-3-8-max
+glm-coding-plan-think → qwen-3-8-max → deepseek-v4-flash
+deepseek-v4-flash     → glm-coding-plan-think → qwen-3-8-max
 ```
 
 Flash goes straight to Pro because Flash already bills per token — hopping to Pro does not
@@ -290,11 +289,10 @@ Then run `litellm --config config.yaml --port 4000` and point this MCP at it.
 |---|---|:-:|:-:|
 | LiteLLM + llama.cpp | `local-qwen-3-6-35b` (Qwen3.6 35B-A3B) | ✅ | ✅ |
 | LiteLLM + DeepSeek API | `deepseek-v4-flash` | ✅ | ✅ |
-| LiteLLM + DeepSeek API | `deepseek-v4-pro` | ✅ | ✅ |
 | LiteLLM + Z.ai | `glm-coding-plan` | ✅ | ✅ |
 | LiteLLM + AWS Bedrock | `bedrock-sonnet-4-6`, `bedrock-llama4-*` | ✅ | ✅ |
 
-> **Picking a DeepSeek tier:** `deepseek-v4-flash` is the better default for coding and agentic work — the 2026-07-31 rebuild beats `deepseek-v4-pro` across DeepSeek's published benchmarks at roughly a third of the output cost, and it already reasons at high effort by default (which is why it has no `-think` variant). Reserve `deepseek-v4-pro` for very long reasoning chains. Note these are the vendor's own self-reported numbers on their own harness — good enough to pick a default, worth validating on your own task before you move serious work.
+> **Picking a DeepSeek tier:** `deepseek-v4-flash` is the default for coding and agentic work; it already reasons at high effort by default (which is why it has no `-think` variant). `deepseek-v4-pro` was removed from the supported set on 2026-10-15.
 >
 > ⚠️ Both tiers can spend their whole token budget reasoning and return nothing. The server auto-raises the default budget for them; see [max_tokens troubleshooting](docs/TROUBLESHOOTING.md#stop_reason-max_tokens-and-final_response-).
 
