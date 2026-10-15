@@ -915,3 +915,21 @@ def test_model_stdout_mentioning_rate_limit_is_not_quota():
     """Security L1: without JSON, only stderr can mark quota, not the model's own text."""
     out = gemini_jobs.parse_output(b"I added a rate limit and a quota check", b"", 1)
     assert "quota_exhausted" not in out
+
+
+def test_private_home_sets_default_keychain(tmp_path):
+    """2026-10-15: without a DEFAULT keychain in the private HOME, agy's token refresh raised the macOS
+    'Keychain Not Found ... to store antigravity' dialog every ~30 min. Search list AND default must point
+    at the real login keychain (the jail keeps it read-only)."""
+    import plistlib
+    kc = os.path.expanduser("~/Library/Keychains/login.keychain-db")
+    if sys.platform != "darwin" or not os.path.isfile(kc):
+        pytest.skip("needs macOS with a login keychain")
+    root = gemini_jobs.make_agy_home()
+    try:
+        d = plistlib.load(open(os.path.join(root, "Library", "Preferences", "com.apple.security.plist"), "rb"))
+        assert d.get("DLDBSearchList"), "search list missing"
+        assert d.get("DefaultKeychain"), "default keychain missing: the GUI dialog comes back"
+        assert d["DefaultKeychain"][0]["DbName"].endswith("/Library/Keychains/login.keychain")
+    finally:
+        __import__("shutil").rmtree(root, ignore_errors=True)

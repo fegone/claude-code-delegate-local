@@ -356,6 +356,12 @@ def make_agy_home(real_home: str | None = None) -> str:
             os.makedirs(os.path.join(root, "Library", "Preferences"), mode=0o700)
             subprocess.run(["/usr/bin/security", "list-keychains", "-d", "user", "-s", kc],
                            env={"HOME": root, "PATH": "/usr/bin:/bin"}, capture_output=True, timeout=10)
+            # Also the DEFAULT keychain (2026-10-15): with only the search list, agy's OAuth refresh (about
+            # every 30 min) found no default keychain to store into and macOS raised the GUI dialog
+            # "Keychain Not Found ... to store antigravity" with "Reset To Defaults" on Felix's screen.
+            # With a default set, the store hits the jail's read-only rule and fails quietly instead.
+            subprocess.run(["/usr/bin/security", "default-keychain", "-d", "user", "-s", kc],
+                           env={"HOME": root, "PATH": "/usr/bin:/bin"}, capture_output=True, timeout=10)
     except OSError:
         shutil.rmtree(root, ignore_errors=True)
         raise
