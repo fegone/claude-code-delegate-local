@@ -894,3 +894,24 @@ def test_success_mentioning_quota_is_not_marked():
         b'{"status": "SUCCESS", "response": "added a quota check to the code"}', b"", 0)
     assert out["success"] is True
     assert "quota_exhausted" not in out
+
+
+@pytest.mark.asyncio
+async def test_git_integrity_failure_drops_quota_failover(fake_agy, tmp_path, monkeypatch):
+    """Security M1 (PR #63): a tampered .git never carries the automatic relaunch marker."""
+    home, main, wt = _clone_home(tmp_path)
+    async def fake_jailed(*a, **k):
+        (main / ".git" / "hooks" / "post-commit").write_text("#!/bin/sh\n")
+        return {"success": False, "error": "CUOTA", "quota_exhausted": True, "failover": "anthropic-sonnet-5-5"}
+    monkeypatch.setattr(gemini_jobs, "_run_agy_jailed", fake_jailed)
+    monkeypatch.setattr(gemini_jobs, "make_agy_home", lambda *a, **k: str(tmp_path / "ah"))
+    (tmp_path / "ah").mkdir()
+    r = await gemini_jobs.run_agy("T", {"workdir": str(main), "model": "m", "effort": "low", "timeout_s": 5})
+    assert "INTEGRIDAD" in r["error"]
+    assert "quota_exhausted" not in r and "failover" not in r
+
+
+def test_model_stdout_mentioning_rate_limit_is_not_quota():
+    """Security L1: without JSON, only stderr can mark quota, not the model's own text."""
+    out = gemini_jobs.parse_output(b"I added a rate limit and a quota check", b"", 1)
+    assert "quota_exhausted" not in out

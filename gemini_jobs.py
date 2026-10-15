@@ -595,7 +595,8 @@ def parse_output(stdout: bytes, stderr: bytes, rc: int | None) -> dict:
     if not isinstance(data, dict):
         out = {"success": False, "exit_code": rc,
                "error": f"agy no devolvió JSON (rc={rc})" + (f": {tail}" if tail else "")}
-        return _mark_quota(out) if _quota_hit(tail, text[-2000:]) else out
+        # Security L1: only agy's stderr, never the model's own stdout text, can mark quota
+        return _mark_quota(out) if _quota_hit(tail) else out
     status = data.get("status")
     out = {
         "status": status,
@@ -654,6 +655,9 @@ async def run_agy(task: str, norm: dict, on_proc=None) -> dict:
         bad = git_guard_check(guard, norm["workdir"])
         if bad:
             res = {**res, "success": False, "error": bad + (f" | {res['error']}" if res.get("error") else "")}
+            # Security M1 (PR #63): a tampered .git must never trigger an automatic relaunch
+            res.pop("quota_exhausted", None)
+            res.pop("failover", None)
         return res
     finally:
         shutil.rmtree(agy_home, ignore_errors=True)
