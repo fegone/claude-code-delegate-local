@@ -111,7 +111,7 @@ def test_resolve_max_tokens_guard():
     assert server._resolve_max_tokens("m", 0) == server.DEFAULT_MAX_TOKENS
     assert server._resolve_max_tokens("m", None) == server.DEFAULT_MAX_TOKENS
     assert server._resolve_max_tokens("glm-coding-plan", 999999) == 131072      # capped
-    assert server._resolve_max_tokens("deepseek-v4-pro-max", None) == server.MAX_TIER_MAX_TOKENS
+    assert server._resolve_max_tokens("deepseek-v4-flash-max", None) == server.MAX_TIER_MAX_TOKENS
     print("PASS max_tokens guards bad input, caps, and -max bump")
 
 
@@ -122,7 +122,6 @@ def test_resolve_max_tokens_high_reasoning_defaults():
     spent reasoning, empty response. Matching on the suffix alone left it exposed.
     """
     assert server._resolve_max_tokens("deepseek-v4-flash", None) == server.MAX_TIER_MAX_TOKENS
-    assert server._resolve_max_tokens("deepseek-v4-pro", None) == server.MAX_TIER_MAX_TOKENS
     # Case-insensitive, like the routing prefix match.
     assert server._resolve_max_tokens("DeepSeek-V4-Flash", None) == server.MAX_TIER_MAX_TOKENS
     # An explicit value still wins over the auto-bump.

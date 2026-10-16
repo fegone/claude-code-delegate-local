@@ -248,11 +248,11 @@ All three cloud coding providers support extended thinking, but the API shape di
 - ⚠️ **This MCP now routes `glm-*` through `/v1/messages` (fixed 2026-07-06)** — this matters more than it sounds. `glm-*` used to be in `_OPENAI_FORMAT_PREFIXES`, forcing every dispatch through `/v1/chat/completions`. But the alias points at Z.ai's Anthropic-native endpoint, so that route made LiteLLM translate OpenAI→Anthropic with `drop_params:true`, which **silently discarded the alias's `thinking` config** — no error, `glm-coding-plan-think`/`-max` just quietly ran with no real extended thinking (verified: 211 vs 196 completion tokens between `-think` and plain, essentially the same). If you're on an older version of this repo, update — this was live-broken through this MCP for a while even though manual `/v1/messages` tests (bypassing the MCP) looked fine.
 - If you ever probe this manually with curl, remember: `/v1/chat/completions` silently strips `thinking` on this Anthropic-native endpoint (the exact bug above) — always test via `/v1/messages` directly, or better, through this MCP now that it's fixed.
 
-### DeepSeek V4 (`deepseek-v4-pro` / `-max`, plus `deepseek-v4-flash`)
-- `deepseek-chat` / `deepseek-reasoner` are **deprecated, removed 2026-07-24** — use `deepseek-v4-flash` / `deepseek-v4-pro` model ids. Thinking moved from "pick a different model" to a runtime parameter: `extra_body: {thinking: {type: enabled}, reasoning_effort: high|max}`.
-- `deepseek-v4-pro` reasons even with nothing set (implicit default) — don't rely on that. Pin `reasoning_effort: high` explicitly on the base alias so there's no ambiguous tier, and add a `-max` alias for the hardest problems.
-- ⚠️ **`reasoning_effort` (`high` vs `max`) is currently a no-op in LiteLLM 1.83.9.** Confirmed by reading the installed `DeepSeekChatConfig.map_openai_params` source: it pops `reasoning_effort`, checks it isn't `"none"`, and always sets the same generic `thinking: {"type": "enabled"}` — the actual "high"/"max" value is discarded. Right now `deepseek-v4-pro` and `deepseek-v4-pro-max` behave **identically**. Tracked upstream: [BerriAI/litellm#27439](https://github.com/BerriAI/litellm/issues/27439). Keep both aliases configured (harmless, forward-compatible once litellm ships a fix) but don't market this as real effort control today — for genuine difficulty-based routing, lean on GLM's tiers (which do work) or Sonnet/Opus.
-- ⚠️ **`deepseek-v4-pro-max` can burn its whole `max_tokens` budget on reasoning and return nothing** (0 tool calls, empty response) if `max_tokens` is too small — this MCP's server now auto-bumps the default to 150000 for any `-max`-suffixed alias (see CHANGELOG), but if you call the raw LiteLLM endpoint directly, pass a generous `max_tokens` yourself.
+### DeepSeek V4 (`deepseek-v4-flash`)
+- `deepseek-chat` / `deepseek-reasoner` are **deprecated, removed 2026-07-24** — use the `deepseek-v4-flash` model id. Thinking moved from "pick a different model" to a runtime parameter: `extra_body: {thinking: {type: enabled}, reasoning_effort: high|max}`.
+- `deepseek-v4-flash` reasons even with nothing set (implicit default) — don't rely on that. Pin `reasoning_effort: high` explicitly on the base alias so there's no ambiguous tier, and add a `-max` alias for the hardest problems. `deepseek-v4-pro` and `-pro-max` were removed from the supported set on 2026-10-15.
+- ⚠️ **`reasoning_effort` (`high` vs `max`) is currently a no-op in LiteLLM 1.83.9.** Confirmed by reading the installed `DeepSeekChatConfig.map_openai_params` source: it pops `reasoning_effort`, checks it isn't `"none"`, and always sets the same generic `thinking: {"type": "enabled"}` — the actual "high"/"max" value is discarded. Right now `deepseek-v4-flash` and `deepseek-v4-flash-max` behave **identically**. Tracked upstream: [BerriAI/litellm#27439](https://github.com/BerriAI/litellm/issues/27439). Keep both aliases configured (harmless, forward-compatible once litellm ships a fix) but don't market this as real effort control today — for genuine difficulty-based routing, lean on GLM's tiers (which do work) or Sonnet/Opus.
+- ⚠️ **`deepseek-v4-flash-max` can burn its whole `max_tokens` budget on reasoning and return nothing** (0 tool calls, empty response) if `max_tokens` is too small — this MCP's server now auto-bumps the default to 150000 for any `-max`-suffixed alias (see CHANGELOG), but if you call the raw LiteLLM endpoint directly, pass a generous `max_tokens` yourself.
 - ⚠️ **Use the `deepseek/` provider prefix, not `openai/`.** With `openai/MODEL`, LiteLLM 1.83.9 bridges `/v1/messages` through the Responses API — which DeepSeek's endpoint doesn't implement, giving a silent 404 (`NotFoundError`, empty message) that's easy to misdiagnose as a config problem. `deepseek/` uses `/chat/completions` under the hood (this MCP already routes `deepseek-*` there — see `_OPENAI_FORMAT_PREFIXES`) and correctly maps `reasoning_content` into an Anthropic `thinking` block on `/v1/messages` when probed directly.
 
 ### MiniMax M3 (`minimax-m3`)
@@ -289,15 +289,6 @@ model_list:
     litellm_params:
       model: deepseek/deepseek-v4-flash
       api_key: os.environ/DEEPSEEK_API_KEY
-
-  - model_name: deepseek-v4-pro
-    litellm_params:
-      model: deepseek/deepseek-v4-pro
-      api_key: os.environ/DEEPSEEK_API_KEY
-      extra_body:
-        thinking:
-          type: enabled
-        reasoning_effort: high
 
   # AWS Bedrock
   - model_name: bedrock-sonnet-4-6
@@ -357,7 +348,7 @@ If you want to skip LiteLLM and hit DeepSeek directly, use `delegate_to_provider
 mcp__delegate-local__delegate_to_provider(
     provider_url="https://api.deepseek.com/v1/messages",
     api_key="sk-your-deepseek-key",
-    model="deepseek-v4-flash",  # or deepseek-v4-pro — deepseek-chat/deepseek-reasoner are deprecated (removed 2026-07-24)
+    model="deepseek-v4-flash",  # deepseek-chat/deepseek-reasoner are deprecated (removed 2026-07-24)
     agent_name="webdev",
     task="implement X",
 )

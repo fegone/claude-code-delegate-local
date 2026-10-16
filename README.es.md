@@ -207,7 +207,6 @@ Luego corre `litellm --config config.yaml --port 4000` y apunta este MCP ahí.
 | Backend | Modelo | Single-turn | Multi-turn |
 |---|---|:-:|:-:|
 | LiteLLM + llama.cpp | `local-qwen-3-6-35b` (Qwen3.6 35B-A3B) | ✅ | ✅ |
-| LiteLLM + DeepSeek API | `deepseek-v4-pro` | ✅ | ✅ |
 | LiteLLM + DeepSeek API | `deepseek-v4-flash` | ✅ | ✅ |
 | LiteLLM + AWS Bedrock | `bedrock-sonnet-4-6`, `bedrock-llama4-*` | ✅ | ✅ |
 

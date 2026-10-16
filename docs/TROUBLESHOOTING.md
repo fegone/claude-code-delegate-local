@@ -73,7 +73,7 @@ The server now auto-bumps the default to 150000 for both groups — `-max` suffi
 ```python
 mcp__delegate-local__delegate_to_local_agent(
     agent_name="webdev",
-    model="deepseek-v4-pro",
+    model="deepseek-v4-flash",
     max_tokens=131072,  # for very large outputs
     task="..."
 )
