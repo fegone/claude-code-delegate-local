@@ -26,7 +26,7 @@ import time
 import uuid
 from collections import deque
 
-from delegate_state import redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata, persist_failed, owner_alive, watch_fields
+from delegate_state import enforce_isolation, isolation_environment, redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata, persist_failed, owner_alive, watch_fields
 from gemini_jobs import redact
 
 MAX_TIMEOUT_S = 7200
@@ -61,7 +61,7 @@ class Config:
 
     @property
     def state_dir(self) -> str:
-        return os.getenv("DELEGATE_DSH_STATE_DIR") or os.path.expanduser("~/.dsh-jobs")
+        return enforce_isolation(os.getenv("DELEGATE_DSH_STATE_DIR") or os.path.expanduser("~/.dsh-jobs"))
 
     @property
     def max_concurrent(self) -> int:
@@ -142,6 +142,14 @@ def _release(locks) -> None:
             fh.close()
         except OSError:
             pass
+
+
+def child_env() -> dict[str, str]:
+    env = {k: os.environ[k] for k in ("PATH", "HOME", "USER", "LANG", "TMPDIR") if k in os.environ}
+    for k in ("NEOLA_DSH_PHI_URL", "NEOLA_DSH_PHI_KEY_FILE", "DELEGATE_BIFROST_URL"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    return env | isolation_environment()
 
 
 def state_dir() -> pathlib.Path:
@@ -278,10 +286,10 @@ class DshJobs:
         held: list = []
         try:
             base = state_dir()
-            slots = base / "slots"
+            slots = enforce_isolation(base / "slots")
             slots.mkdir(mode=0o700, exist_ok=True)
-            (base / "wd").mkdir(mode=0o700, exist_ok=True)
-            proj = slots / f"proj-{hashlib.sha1(project.encode()).hexdigest()}"
+            enforce_isolation(base / "wd").mkdir(mode=0o700, exist_ok=True)
+            proj = enforce_isolation(slots / f"proj-{hashlib.sha1(project.encode()).hexdigest()}")
             proj.mkdir(mode=0o700, exist_ok=True)
             wd = _flock_try(base / "wd" / f"{hashlib.sha1(root.encode()).hexdigest()}.lock")
             if wd is None:
@@ -601,7 +609,7 @@ class DshJobs:
     # ── running one job ──────────────────────────────────────────────────────────
     async def runner(self, jid: str) -> None:
         j, rt = self.jobs[jid], self.rt[jid]
-        run_dir = state_dir() / "runs" / jid
+        run_dir = enforce_isolation(state_dir() / "runs" / jid)
         run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         task_file = run_dir / "task.md"
         fd = os.open(task_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -616,10 +624,7 @@ class DshJobs:
         try:
             await self.stagger()
             j["started_at"] = time.time()  # timeout counts from the real launch
-            env = {k: os.environ[k] for k in ("PATH", "HOME", "USER", "LANG", "TMPDIR") if k in os.environ}
-            for k in ("NEOLA_DSH_PHI_URL", "NEOLA_DSH_PHI_KEY_FILE", "DELEGATE_BIFROST_URL"):
-                if k in os.environ:
-                    env[k] = os.environ[k]
+            env = child_env()
             lock_fds = tuple(fh.fileno() for fh in rt["locks"] or [])
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
@@ -833,7 +838,7 @@ class DshJobs:
 
     async def stop_run(self, j: dict, rt: dict) -> None:
         rt["teardown_pending"] = True
-        out = pathlib.Path(j["out_dir"])
+        out = pathlib.Path(enforce_isolation(j["out_dir"]))
         out.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(out / "cancel", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         os.close(fd)

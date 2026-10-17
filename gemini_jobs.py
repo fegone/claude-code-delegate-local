@@ -35,7 +35,7 @@ import time
 import uuid
 from collections import deque
 
-from delegate_state import redacted_exception, workdir_forbidden, state_directories, METADATA_FIELDS, TERMINAL, metadata, persist_failed, remote_jobs, read_json, watch_fields, sanitize_snapshot
+from delegate_state import enforce_isolation, isolation_environment, redacted_exception, workdir_forbidden, state_directories, METADATA_FIELDS, TERMINAL, metadata, persist_failed, remote_jobs, read_json, watch_fields, sanitize_snapshot
 
 EFFORTS = ("low", "medium", "high")
 DEFAULT_EFFORT = "medium"
@@ -286,7 +286,7 @@ SEED_DIRS = ("builtin", "bin")
 def _agy_homes_parent(real_home: str) -> str:
     """~/Library/Caches/delegate-agy: 0700, ours, never a symlink. The jail gets only ITS OWN child, so one
     job cannot list, read or replace another job's private HOME (Security PR61 H3)."""
-    parent = os.path.join(real_home, "Library", "Caches", "delegate-agy")
+    parent = enforce_isolation(os.path.join(real_home, "Library", "Caches", "delegate-agy"))
     os.makedirs(os.path.dirname(parent), exist_ok=True)
     try:
         os.mkdir(parent, 0o700)
@@ -362,13 +362,13 @@ def make_agy_home(real_home: str | None = None) -> str:
         if os.path.isfile(kc):
             os.makedirs(os.path.join(root, "Library", "Preferences"), mode=0o700)
             subprocess.run(["/usr/bin/security", "list-keychains", "-d", "user", "-s", kc],
-                           env={"HOME": root, "PATH": "/usr/bin:/bin"}, capture_output=True, timeout=10)
+                           env={"HOME": root, "PATH": "/usr/bin:/bin", **isolation_environment()}, capture_output=True, timeout=10)
             # Also the DEFAULT keychain (2026-10-15): with only the search list, agy's OAuth refresh (about
             # every 30 min) found no default keychain to store into and macOS raised the GUI dialog
             # "Keychain Not Found ... to store antigravity" with "Reset To Defaults" on Felix's screen.
             # With a default set, the store hits the jail's read-only rule and fails quietly instead.
             subprocess.run(["/usr/bin/security", "default-keychain", "-d", "user", "-s", kc],
-                           env={"HOME": root, "PATH": "/usr/bin:/bin"}, capture_output=True, timeout=10)
+                           env={"HOME": root, "PATH": "/usr/bin:/bin", **isolation_environment()}, capture_output=True, timeout=10)
     except OSError:
         shutil.rmtree(root, ignore_errors=True)
         raise
@@ -478,7 +478,7 @@ def model_for(effort: str, family: str = DEFAULT_FAMILY) -> str:
 
 
 def child_env() -> dict[str, str]:
-    return {k: v for k, v in os.environ.items() if k in _ENV_ALLOW or k.startswith("LC_")}
+    return {k: v for k, v in os.environ.items() if k in _ENV_ALLOW or k.startswith("LC_")} | isolation_environment()
 
 
 def kill_group(proc) -> None:
@@ -706,8 +706,9 @@ async def _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc) 
     try:
         out_t = asyncio.ensure_future(_drain(proc.stdout, STDOUT_CAP))
         err_t = asyncio.ensure_future(_drain(proc.stderr, STDOUT_CAP))
+        drains = asyncio.gather(out_t, err_t)
         try:
-            stdout, stderr = await asyncio.wait_for(asyncio.gather(out_t, err_t),
+            stdout, stderr = await asyncio.wait_for(drains,
                                                     timeout=timeout_s + KILL_GRACE_S)
             await asyncio.wait_for(proc.wait(), timeout=10)
         except asyncio.TimeoutError:
@@ -722,6 +723,13 @@ async def _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc) 
                     "elapsed_s": round(time.time() - t0, 1), **base}
     except BaseException:
         kill_group(proc)  # client cancel or any failure: never leave the tree alive
+        for t in (out_t, err_t):
+            t.cancel()
+        await asyncio.gather(drains, out_t, err_t, return_exceptions=True)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
         raise
     reap_group(proc)  # L3: children agy left in its session die with it
     res = parse_output(stdout, stderr, proc.returncode)
@@ -747,7 +755,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def state_dir() -> pathlib.Path:
-    base = pathlib.Path(os.getenv("DELEGATE_GEMINI_STATE_DIR") or os.path.expanduser("~/.gemini-jobs"))
+    base = pathlib.Path(enforce_isolation(os.getenv("DELEGATE_GEMINI_STATE_DIR") or os.path.expanduser("~/.gemini-jobs")))
     base.mkdir(mode=0o700, parents=True, exist_ok=True)
     st = os.lstat(base)
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
@@ -1014,7 +1022,7 @@ class GeminiJobs:
         if not isinstance(ids, list):
             return {"success": False, "error": "ids debe ser una lista"}
         self.ensure_loaded()
-        base = pathlib.Path(os.getenv("DELEGATE_GEMINI_STATE_DIR") or os.path.expanduser("~/.gemini-jobs"))
+        base = pathlib.Path(enforce_isolation(os.getenv("DELEGATE_GEMINI_STATE_DIR") or os.path.expanduser("~/.gemini-jobs")))
         remote = remote_jobs(base, [i for i in ids if isinstance(i, str) and i not in self.jobs], self.sid)
         out = []
         for jid in ids:

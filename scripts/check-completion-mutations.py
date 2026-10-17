@@ -1,6 +1,8 @@
 """Offline guard-removal checks. Mutates only disposable copies; never touches git."""
 from pathlib import Path
 import os
+import ast
+import re
 import shutil
 import subprocess
 import sys
@@ -44,12 +46,136 @@ CASES = [
     ('gemini-state-workdir', 'gemini_jobs.py', 'if workdir_forbidden(real):', 'if False:', 'test_completion_security.py::test_state_workdir_forbidden[symlink-DSH-gemini]'),
     ('state-parent-workdir', 'delegate_state.py', 'real == state or real in state.parents or state in real.parents', 'real == state or state in real.parents', 'test_completion_security.py::test_state_workdir_forbidden[parent-GEMINI-codex]'),
     ('profile-state-deny', 'gemini_jobs.py', 'for protected in state_directories(home=home):', 'for protected in ():', 'test_completion_security.py::test_profile_denies_state_writes'),
-    ('import-time-home', 'tests/conftest.py', "os.environ['HOME'] = str(SESSION_HOME)", 'pass', 'test_completion_security.py::test_import_isolation'),
-    ('real-home-foreign-pid-filter', 'tests/conftest.py', 'if named_pids & pids:', 'if True:', 'test_completion_security.py::test_real_home_guard_ignores_foreign_pid'),
-    ('real-home-test-pid-detection', 'tests/conftest.py', 'if named_pids & pids:', 'if False:', 'test_completion_security.py::test_real_home_guard_rejects_test_pid'),
+    ('import-time-home', 'tests/conftest.py', "os.environ['HOME'] = str(SESSION_HOME)", 'pass', '@conftest-home'),
     ('exception-path-redaction', 'delegate_state.py', '{redacted_exception(error)}', '{error}', 'test_completion_security.py::test_exception_redacts_paths_and_controls'),
     ('queued-exception-redaction', 'server.py', '"failed", redacted_exception(err), "infra"', '"failed", str(err), "infra"', 'test_completion_security.py::test_queued_exception_redacts_path'),
 ]
+
+
+
+def isolation_tests(endpoint):
+    return [f'test_isolation_enforcement.py::test_directory_escape[{escape}-{endpoint}]'
+            for escape in ('outside', 'symlink', 'dotdot', 'real-home')]
+
+
+# Each call site is mutated independently, including checks on nested storage.
+# Use AST spans so identical expressions in the store and poller cannot mask one another.
+ISOLATION_SITES = {
+    ('delegate_state.py', 'state_directories', 'str(p)'): isolation_tests('state'),
+    ('delegate_wait.py', 'read_jobs', None): sum((isolation_tests('wait-' + b) for b in ('codex', 'dsh', 'gemini')), []),
+    ('dsh_jobs.py', 'state_dir', None): isolation_tests('dsh') + isolation_tests('dsh-config'),
+    ('dsh_jobs.py', 'try_locks', 'base / "slots"'): ['test_isolation_enforcement.py::test_nested_lock_escape[slots-dsh]'],
+    ('dsh_jobs.py', 'try_locks', 'base / "wd"'): ['test_isolation_enforcement.py::test_nested_lock_escape[wd-dsh]'],
+    ('dsh_jobs.py', 'try_locks', 'slots /'): ['test_isolation_enforcement.py::test_nested_lock_escape[project-dsh]'],
+    ('dsh_jobs.py', 'runner', None): ['test_isolation_enforcement.py::test_nested_job_escape[dsh-run]'],
+    ('dsh_jobs.py', 'stop_run', None): ['test_isolation_enforcement.py::test_nested_job_escape[dsh-stop]'],
+    ('gemini_jobs.py', '_agy_homes_parent', None): isolation_tests('cache'),
+    ('gemini_jobs.py', 'state_dir', None): isolation_tests('gemini'),
+    ('gemini_jobs.py', 'poll', None): isolation_tests('gemini-poll'),
+    ('server.py', '<module>', 'os.getenv("DELEGATE_LOG_PATH"'): ['test_isolation_enforcement.py::test_import_override_escape[DELEGATE_LOG_PATH]'],
+    ('server.py', '<module>', 'os.getenv("DELEGATE_SLOT_DIR"'): ['test_isolation_enforcement.py::test_import_override_escape[DELEGATE_SLOT_DIR]'],
+    ('server.py', '<module>', 'os.getenv("DELEGATE_CODEX_SESSIONS_DIR"'): ['test_isolation_enforcement.py::test_import_override_escape[DELEGATE_CODEX_SESSIONS_DIR]'],
+    ('server.py', '_log_dispatch', None): isolation_tests('log'),
+    ('server.py', '_cross_process_slot', None): isolation_tests('slots'),
+    ('server.py', '_run_codex_job', None): ['test_isolation_enforcement.py::test_nested_job_escape[codex-sqlite]'],
+    ('server.py', '_codex_state_base', None): isolation_tests('codex'),
+    ('server.py', '_codex_try_locks', 'base / "slots"'): ['test_isolation_enforcement.py::test_nested_lock_escape[slots-codex]'],
+    ('server.py', '_codex_try_locks', 'base / "wd"'): ['test_isolation_enforcement.py::test_nested_lock_escape[wd-codex]'],
+    ('server.py', '_codex_try_locks', 'slots /'): ['test_isolation_enforcement.py::test_nested_lock_escape[project-codex]'],
+    ('server.py', '_codex_weekly_used_percent', None): ['test_isolation_enforcement.py::test_late_sessions_escape'],
+}
+
+
+def isolation_cases():
+    found = set()
+    cases = []
+    for filename in ('delegate_state.py', 'delegate_wait.py', 'dsh_jobs.py', 'gemini_jobs.py', 'server.py'):
+        source = (ROOT / filename).read_text()
+        class Visitor(ast.NodeVisitor):
+            scope = '<module>'
+            def visit_FunctionDef(self, node):
+                previous, self.scope = self.scope, node.name
+                self.generic_visit(node)
+                self.scope = previous
+            visit_AsyncFunctionDef = visit_FunctionDef
+            def visit_Call(self, node):
+                if isinstance(node.func, ast.Name) and node.func.id == 'enforce_isolation':
+                    argument = ast.get_source_segment(source, node.args[0])
+                    keys = [key for key in ISOLATION_SITES if key[:2] == (filename, self.scope)
+                            and (key[2] is None or argument.startswith(key[2]))]
+                    assert len(keys) == 1, (filename, self.scope, argument, keys)
+                    key = keys[0]
+                    found.add(key)
+                    before = ast.get_source_segment(source, node)
+                    # Include line indentation to distinguish store/poller expressions.
+                    lines = source.splitlines(keepends=True)
+                    before = ''.join(lines[node.lineno - 1:node.end_lineno])
+                    call = ast.get_source_segment(source, node)
+                    after = before.replace(call, argument, 1)
+                    cases.append((f'isolation-{filename}-{self.scope}-{node.lineno}', filename,
+                                  before, after, ISOLATION_SITES[key]))
+                self.generic_visit(node)
+        Visitor().visit(ast.parse(source))
+    assert found == set(ISOLATION_SITES), set(ISOLATION_SITES) - found
+    return cases
+
+
+CASES.extend(isolation_cases())
+CASES.extend([
+    ('isolation-empty-flag', 'delegate_state.py', "if 'DELEGATE_TEST_ISOLATION' in os.environ:",
+     "if os.environ.get('DELEGATE_TEST_ISOLATION'):", ['test_isolation_enforcement.py::test_empty_flag_still_enforces']),
+    ('isolation-disabled', 'delegate_state.py', "if 'DELEGATE_TEST_ISOLATION' in os.environ:",
+     'if True:', ['test_isolation_enforcement.py::test_allowed_and_disabled[False-codex]']),
+    ('isolation-path-realpath', 'delegate_state.py', 'real = Path(os.path.realpath(path))',
+     'real = Path(os.path.abspath(path))', [f'test_isolation_enforcement.py::test_directory_escape[symlink-{e}]'
+                                         for e in ('codex', 'dsh', 'gemini', 'cache', 'slots', 'state')]),
+    ('isolation-root-realpath', 'delegate_state.py', 'allowed = Path(os.path.realpath(root))',
+     'allowed = Path(os.path.abspath(root))', ['test_isolation_enforcement.py::test_realpath_boundary']),
+    ('isolation-component-boundary', 'delegate_state.py', 'if not real.is_relative_to(allowed):',
+     'if not str(real).startswith(str(allowed)):', ['test_isolation_enforcement.py::test_realpath_boundary']),
+    ('isolation-root-required', 'delegate_state.py', 'if not root or not os.path.isabs(root):',
+     'if False:', [f'test_isolation_enforcement.py::test_invalid_isolation_root[{r}]' for r in ('None', '', 'relative/root')]),
+    ('isolation-containment', 'delegate_state.py', 'if not real.is_relative_to(allowed):', 'if False:',
+     [f'test_isolation_enforcement.py::test_inherited_enforcement[{e}-{d}]'
+      for e in ('codex', 'dsh', 'gemini', 'cache', 'slots', 'state', 'wait') for d in (1, 2)]),
+    ('isolation-log-propagation', 'server.py', '    except IsolationViolation:\n        raise',
+     '    except IsolationViolation:\n        pass', isolation_tests('log')),
+])
+
+for backend, filename in (('codex', 'server.py'), ('dsh', 'dsh_jobs.py'), ('gemini', 'gemini_jobs.py')):
+    CASES.append((f'isolation-child-env-{backend}', filename, '| isolation_environment()', '| {}',
+                  [f'test_isolation_enforcement.py::test_filtered_environment_inherits_boundary[{depth}-{backend}]'
+                   for depth in (1, 2)]))
+CASES.append(('isolation-env-root', 'delegate_state.py', "('DELEGATE_TEST_ISOLATION', 'DELEGATE_TEST_ISOLATION_ROOT')",
+              "('DELEGATE_TEST_ISOLATION',)", ['test_isolation_enforcement.py::test_filtered_environment_inherits_boundary[1-codex]']))
+CASES.append(('isolation-env-flag', 'delegate_state.py', "('DELEGATE_TEST_ISOLATION', 'DELEGATE_TEST_ISOLATION_ROOT')",
+              "('DELEGATE_TEST_ISOLATION_ROOT',)", ['test_isolation_enforcement.py::test_filtered_environment_inherits_boundary[1-codex]']))
+CASES.append(('isolation-dsh-launch-env', 'dsh_jobs.py', '            env = child_env()',
+              '            env = {}', ['test_isolation_enforcement.py::test_dsh_launcher_inherits_boundary']))
+CASES.append(('isolation-env-disabled', 'delegate_state.py', "if 'DELEGATE_TEST_ISOLATION' not in os.environ:",
+              'if False:', ['test_isolation_enforcement.py::test_filtered_environment_inherits_boundary[1-codex]']))
+
+
+CASES.extend([
+    ('pytest-temp-outside-home', 'tests/conftest.py', "str(SESSION_ROOT / 'pytest')",
+     "str(SESSION_HOME / 'pytest')", 'test_isolation_enforcement.py::test_pytest_storage_is_allowed_but_outside_private_home'),
+    ('subprocess-temp-outside-home', 'tests/conftest.py', "SESSION_TMP = SESSION_ROOT / 'tmp'",
+     "SESSION_TMP = SESSION_HOME / 'tmp'", 'test_isolation_enforcement.py::test_pytest_storage_is_allowed_but_outside_private_home'),
+])
+for backend, filename, scope in (('codex', 'server.py', '_run_codex_core'),
+                                  ('gemini', 'gemini_jobs.py', '_run_agy_jailed')):
+    source = (ROOT / filename).read_text()
+    function = next(n for n in ast.walk(ast.parse(source))
+                    if isinstance(n, ast.AsyncFunctionDef) and n.name == scope)
+    handler = next(n for n in ast.walk(function)
+                   if isinstance(n, ast.ExceptHandler) and isinstance(n.type, ast.Name)
+                   and n.type.id == 'BaseException')
+    reap = next(n for n in handler.body if isinstance(n, ast.Try))
+    lines = source.splitlines(keepends=True)
+    before = ''.join(lines[handler.lineno - 1:handler.end_lineno])
+    after = before.replace(''.join(lines[reap.lineno - 1:reap.end_lineno]), '', 1)
+    CASES.append((f'cancel-reap-{backend}', filename, before, after,
+                  f'test_isolation_enforcement.py::test_cancel_reaps_process_before_runner_exits[{backend}]'))
 
 
 def main():
@@ -60,10 +186,10 @@ def main():
         sources = ['server.py', 'gemini_jobs.py', 'dsh_jobs.py', 'delegate_state.py', 'delegate_wait.py', 'pyproject.toml']
         for name in sources:
             shutil.copy2(ROOT / name, dest / name)
-        for name in ['conftest.py', 'test_delegate_wait.py', 'test_job_completion.py', 'test_codex_jobs.py', 'test_dsh_jobs.py', 'test_completion_security.py']:
+        for name in ['conftest.py', 'test_delegate_wait.py', 'test_job_completion.py', 'test_codex_jobs.py', 'test_dsh_jobs.py', 'test_completion_security.py', 'test_isolation_enforcement.py']:
             shutil.copy2(ROOT / 'tests' / name, dest / 'tests' / name)
         env = dict(os.environ, HOME=str(dest / 'outer-home'), PYTHONPATH=str(dest), UV_OFFLINE='1', DELEGATE_GEMINI_STATE_DIR=str(dest / 'gm-state'))
-        baseline = subprocess.run([sys.executable, '-m', 'pytest', 'tests/test_delegate_wait.py', 'tests/test_job_completion.py', 'tests/test_completion_security.py', '-q', '-p', 'no:cacheprovider'], cwd=dest, env=env, capture_output=True, text=True, timeout=30)
+        baseline = subprocess.run([sys.executable, '-m', 'pytest', 'tests/test_delegate_wait.py', 'tests/test_job_completion.py', 'tests/test_completion_security.py', 'tests/test_isolation_enforcement.py', '-q', '-p', 'no:cacheprovider'], cwd=dest, env=env, capture_output=True, text=True, timeout=30)
         if baseline.returncode:
             print(baseline.stdout + baseline.stderr)
             return 1
@@ -75,8 +201,19 @@ def main():
             # Avoid same-second bytecode reuse across mutations.
             shutil.rmtree(dest / '__pycache__', ignore_errors=True)
             try:
-                result = subprocess.run([sys.executable, '-m', 'pytest', 'tests/' + test, '-q', '-p', 'no:cacheprovider'], cwd=dest, env=env, capture_output=True, text=True, timeout=20)
+                targets = test if isinstance(test, list) else [test]
+                command = [sys.executable, '-m', 'pytest', *['tests/' + t for t in targets], '-q', '-p', 'no:cacheprovider']
+                if test == '@conftest-home':
+                    command = [sys.executable, '-c', "import runpy, os; n=runpy.run_path('tests/conftest.py'); assert os.environ['HOME'] == str(n['SESSION_HOME'])"]
+                result = subprocess.run(command, cwd=dest, env=env, capture_output=True, text=True, timeout=20)
                 caught = result.returncode == 1 and 'failed' in result.stdout
+                if isinstance(test, list):
+                    # Every selected regression must fail, not merely one in a group.
+                    count = re.search(r'(\d+) failed', result.stdout)
+                    caught = caught and count is not None and int(count[1]) == len(test) and 'ERROR ' not in result.stdout
+                if name == 'import-time-home':
+                    # Exercise the initializer directly before pytest/provider imports can fail closed.
+                    caught = result.returncode == 1 and 'AssertionError' in result.stderr
                 print(f'{name}: {"KILLED" if caught else "SURVIVED/ERROR"}', flush=True)
                 if not caught:
                     print(result.stdout + result.stderr)

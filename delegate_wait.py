@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import time
 
-from delegate_state import TERMINAL, remote_jobs, safe_text, safe_output
+from delegate_state import enforce_isolation, TERMINAL, remote_jobs, safe_text, safe_output
 
 UNKNOWN_GRACE_S = 30
 
@@ -20,7 +20,7 @@ def read_jobs(ids) -> dict:
                                       ('dsh-', 'DSH', '.dsh-jobs')]:
         wanted = {j for j in ids if j.startswith(prefix)}
         if wanted:
-            base = Path(os.getenv(f'DELEGATE_{backend}_STATE_DIR') or Path.home() / default)
+            base = Path(enforce_isolation(os.getenv(f'DELEGATE_{backend}_STATE_DIR') or Path.home() / default))
             out.update(remote_jobs(base, wanted))
     return out
 

@@ -17,6 +17,36 @@ WATCH_HINT = ('Start this with the Monitor tool (or Bash run_in_background) righ
               'it is the only way you get notified when the jobs end. Never rely on remembering to poll.')
 
 
+class IsolationViolation(RuntimeError):
+    """A test attempted to resolve provider storage outside its allowed root."""
+
+
+def enforce_isolation(path):
+    """Validate realpath before any storage access; preserve production path semantics.
+
+    Presence enables the guard (including an empty value). Children inherit both
+    variables, so enforcement needs neither process attribution nor background work.
+    Never cache this decision: tests and callers can change paths after import.
+    """
+    if 'DELEGATE_TEST_ISOLATION' in os.environ:
+        root = os.environ.get('DELEGATE_TEST_ISOLATION_ROOT', '')
+        if not root or not os.path.isabs(root):
+            raise IsolationViolation('test isolation requires an absolute DELEGATE_TEST_ISOLATION_ROOT')
+        real = Path(os.path.realpath(path))
+        allowed = Path(os.path.realpath(root))
+        if not real.is_relative_to(allowed):
+            raise IsolationViolation(f'test isolation: storage {real} is outside {allowed}')
+    return path
+
+
+def isolation_environment() -> dict[str, str]:
+    """Carry the test boundary through provider allowlists without widening them."""
+    if 'DELEGATE_TEST_ISOLATION' not in os.environ:
+        return {}
+    return {key: os.environ[key] for key in
+            ('DELEGATE_TEST_ISOLATION', 'DELEGATE_TEST_ISOLATION_ROOT') if key in os.environ}
+
+
 def safe_text(value, limit: int = 4000) -> str:
     """Bounded single-line text: no terminal, bidi, format or line controls."""
     text = ''.join(' ' if unicodedata.category(c) in ('Cc', 'Cf', 'Zl', 'Zp') else c
@@ -54,7 +84,7 @@ def state_directories(extra=(), home=None) -> tuple[str, ...]:
         paths.append(os.path.join(home, '.' + backend.lower() + '-jobs'))
         if override := os.getenv(f'DELEGATE_{backend}_STATE_DIR'):
             paths.append(override)
-    return tuple(sorted({os.path.realpath(str(p)) for p in paths if p}))
+    return tuple(sorted({os.path.realpath(enforce_isolation(str(p))) for p in paths if p}))
 
 
 def workdir_forbidden(workdir, extra=()) -> bool:

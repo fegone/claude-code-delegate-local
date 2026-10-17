@@ -14,7 +14,7 @@ License: MIT
 """
 from __future__ import annotations
 
-from delegate_state import redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata as job_metadata, persist_failed, owner_alive, watch_fields, sanitize_metadata
+from delegate_state import enforce_isolation, isolation_environment, IsolationViolation, redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata as job_metadata, persist_failed, owner_alive, watch_fields, sanitize_metadata
 
 import asyncio
 import atexit
@@ -1117,7 +1117,7 @@ def _child_env(extra: tuple[str, ...] = ()) -> dict[str, str]:
     return {
         k: v for k, v in os.environ.items()
         if k in allowed or k.startswith(_ENV_ALLOWLIST_PREFIXES)
-    }
+    } | isolation_environment()
 
 
 # ── Semáforo CROSS-PROCESS ───────────────────────────────────────────────────
@@ -1143,10 +1143,10 @@ CROSS_PROCESS_SLOTS = os.getenv("DELEGATE_CROSS_PROCESS_SLOTS", "1").lower() not
 # 🔒 Lo que se escribe es METADATO Y NADA MAS: ni la tarea, ni la respuesta, ni rutas
 # del proyecto. Este fichero vive en el disco del que despacha y no debe poder
 # reconstruir el trabajo — menos aun en los proyectos con PHI.
-_LOG_PATH = pathlib.Path(
+_LOG_PATH = pathlib.Path(enforce_isolation(
     os.getenv("DELEGATE_LOG_PATH",
               os.path.expanduser("~/.cache/claude-delegate-local/dispatches.jsonl"))
-)
+))
 _LOG_MAX_BYTES = int(os.getenv("DELEGATE_LOG_MAX_BYTES", str(8 * 1024 * 1024)))
 _LOG_FIELDS = (
     "success", "model", "response_model", "fallback_note", "terminal_text", "agent_name", "agent_source",
@@ -1181,6 +1181,7 @@ def _log_dispatch(result: dict, requested: str, bucket: str, queued_s: float) ->
         # Lo que la auditoria queria contar: exito certificado por un turno anterior.
         if result.get("success") and result.get("terminal_text") is False:
             rec["hollow_success"] = True
+        enforce_isolation(_LOG_PATH)
         _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         # Rotacion de un solo archivo: al pasar el tope se renombra a .1 (se pisa el
         # anterior). Sin hilos ni dependencias; si se pierde una linea en la carrera,
@@ -1192,13 +1193,15 @@ def _log_dispatch(result: dict, requested: str, bucket: str, queued_s: float) ->
             pass
         with _LOG_PATH.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    except IsolationViolation:
+        raise
     except Exception:  # noqa: BLE001 — telemetria jamas rompe un despacho
         pass
 
 
-_SLOT_DIR = pathlib.Path(
+_SLOT_DIR = pathlib.Path(enforce_isolation(
     os.getenv("DELEGATE_SLOT_DIR", os.path.expanduser("~/.cache/claude-delegate-local/slots"))
-)
+))
 _SLOT_POLL = float(os.getenv("DELEGATE_SLOT_POLL", "0.5"))
 
 
@@ -1218,7 +1221,7 @@ async def _cross_process_slot(bucket: str, limit: int, wait_max: float):
         yield
         return
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", bucket) or "_default"
-    d = _SLOT_DIR / safe
+    d = enforce_isolation(_SLOT_DIR / safe)
     try:
         d.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -3478,7 +3481,7 @@ async def _run_codex_job(
     CODEX_HOME) to avoid SQLite contention between parallel agents."""
     sqlite_home = ""
     try:
-        sqlite_home = str(_codex_state_dir() / "sqlite" / (job_id or f"run-{uuid.uuid4().hex[:12]}"))
+        sqlite_home = str(enforce_isolation(_codex_state_dir() / "sqlite" / (job_id or f"run-{uuid.uuid4().hex[:12]}")))
         os.makedirs(sqlite_home, mode=0o700, exist_ok=True)
     except OSError as e:
         return {"success": False, "error": f"no se pudo crear el CODEX_SQLITE_HOME del job: {redacted_exception(e)}",
@@ -3551,6 +3554,10 @@ async def _run_codex_core(
         # the drain, etc. — must still kill the codex process tree and remove the temp file.
         # Listing only Timeout/Cancelled left orphaned processes on an unexpected exception.
         _kill_process_group(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
         _cleanup_file(out_file)
         raise
 
@@ -3673,7 +3680,7 @@ CODEX_LOCK_WAIT_S = float(os.getenv("DELEGATE_CODEX_LOCK_WAIT_S", "600"))  # del
 # Private state dir (0700): per-server job files, slot locks, workdir locks.
 # Optional explicit override; otherwise resolve the environment on each call.
 CODEX_STATE_DIR: str | None = None
-CODEX_SESSIONS_DIR = os.getenv("DELEGATE_CODEX_SESSIONS_DIR") or os.path.expanduser("~/.codex/sessions")
+CODEX_SESSIONS_DIR = enforce_isolation(os.getenv("DELEGATE_CODEX_SESSIONS_DIR") or os.path.expanduser("~/.codex/sessions"))
 CODEX_QUOTA_WARN = float(os.getenv("DELEGATE_CODEX_QUOTA_WARN", "85"))
 CODEX_MAX_PER_PROJECT = int(os.getenv("DELEGATE_CODEX_MAX_PER_PROJECT", "6"))  # project = git common dir
 CODEX_STAGGER_S = float(os.getenv("DELEGATE_CODEX_STAGGER_S", "2.5"))  # min gap between launches, account-wide
@@ -3709,8 +3716,8 @@ _codex_hooks_installed = False
 
 
 def _codex_state_base() -> pathlib.Path:
-    return pathlib.Path(CODEX_STATE_DIR or os.getenv("DELEGATE_CODEX_STATE_DIR")
-                        or os.path.expanduser("~/.codex-jobs"))
+    return pathlib.Path(enforce_isolation(CODEX_STATE_DIR or os.getenv("DELEGATE_CODEX_STATE_DIR")
+                        or os.path.expanduser("~/.codex-jobs")))
 
 
 def _codex_state_dir() -> pathlib.Path:
@@ -4175,10 +4182,10 @@ def _codex_try_locks(workdir: str, ident: tuple[str, str] | None = None,
     held: list = []
     try:
         base = _codex_state_dir()
-        slots = base / "slots"
+        slots = enforce_isolation(base / "slots")
         slots.mkdir(mode=0o700, exist_ok=True)
-        (base / "wd").mkdir(mode=0o700, exist_ok=True)
-        proj_dir = slots / f"proj-{hashlib.sha1(project.encode()).hexdigest()}"
+        enforce_isolation(base / "wd").mkdir(mode=0o700, exist_ok=True)
+        proj_dir = enforce_isolation(slots / f"proj-{hashlib.sha1(project.encode()).hexdigest()}")
         proj_dir.mkdir(mode=0o700, exist_ok=True)
         wd = _flock_try(base / "wd" / f"{hashlib.sha1(root.encode()).hexdigest()}.lock")
         if wd is None:
@@ -4211,7 +4218,7 @@ def _codex_release(locks: list | None) -> None:
 # ── weekly quota (reads the rate_limits Codex itself logs in ~/.codex/sessions) ───────
 def _codex_weekly_used_percent() -> float | None:
     """Latest weekly (>= 7 days window) used_percent still inside its window, or None."""
-    root = pathlib.Path(CODEX_SESSIONS_DIR)
+    root = pathlib.Path(enforce_isolation(CODEX_SESSIONS_DIR))
     now = time.time()
     seen = 0
     try:
