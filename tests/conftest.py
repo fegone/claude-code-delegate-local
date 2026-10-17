@@ -9,6 +9,7 @@ import shutil
 import re
 import subprocess
 import time
+import threading
 import warnings
 
 SESSION_STARTED = time.time()
@@ -94,8 +95,15 @@ _refresh_test_pids()
 
 
 def _listing(home):
-    return {name: {str(p.relative_to(home / name)) for p in (home / name).rglob('*')}
-            for name in STATE_NAMES}
+    snapshot = {name: {} for name in STATE_NAMES}
+    for name, entries in snapshot.items():
+        for path in (home / name).rglob('*'):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:  # A live foreign writer may remove it.
+                continue
+            entries[str(path.relative_to(home / name))] = (stat.st_mtime_ns, stat.st_size)
+    return snapshot
 
 
 # A cache directory's PID also attributes its descendants. Match complete PID
@@ -128,7 +136,9 @@ def _assert_no_real_writes(home, before, started, pids):
     changed = []
     open_files = None
     for name in STATE_NAMES:
-        for relative in sorted(after[name] - before[name]):
+        for relative in sorted(before[name].keys() | after[name].keys()):
+            if relative in before[name] and before[name][relative] == after[name].get(relative):
+                continue
             named_pids = _named_pids(relative)
             if named_pids:
                 if named_pids & pids:
@@ -136,7 +146,7 @@ def _assert_no_real_writes(home, before, started, pids):
                 continue
             path = home / name / relative
             try:
-                if not path.is_file() or path.stat().st_mtime <= started:
+                if not path.is_file() or path.stat().st_mtime < started:
                     continue
             except FileNotFoundError:  # A live foreign writer may remove it.
                 continue
@@ -151,14 +161,31 @@ def _assert_no_real_writes(home, before, started, pids):
 REAL_HOME_BEFORE = _listing(REAL_HOME)
 
 
+def _sample_test_pids(stop):
+    # Polling narrows, but cannot close, the attribution race: a descendant that
+    # starts and exits between samples (or is reparented first) can still escape.
+    while not stop.wait(0.05):
+        _refresh_test_pids()
+
+
+_PID_SAMPLER_STOP = threading.Event()
+_PID_SAMPLER = threading.Thread(target=_sample_test_pids, args=(_PID_SAMPLER_STOP,),
+                                name='test-pid-sampler', daemon=True)
+_PID_SAMPLER.start()  # Cover collection as well as fixture execution.
+
+
 @pytest.fixture(scope='session', autouse=True)
 def state_home_guard(tmp_path_factory):
     for key, expected in ISOLATED_ENV.items():
         assert os.environ[key] == expected and Path(expected).is_relative_to(SESSION_HOME), (
             f'{key} escaped the temporary HOME')
-    yield SESSION_HOME
-    _refresh_test_pids()
-    _assert_no_real_writes(REAL_HOME, REAL_HOME_BEFORE, SESSION_STARTED, TEST_PIDS)
+    try:
+        yield SESSION_HOME
+    finally:
+        _PID_SAMPLER_STOP.set()
+        _PID_SAMPLER.join()
+        _refresh_test_pids()
+        _assert_no_real_writes(REAL_HOME, REAL_HOME_BEFORE, SESSION_STARTED, TEST_PIDS)
 
 
 @pytest_asyncio.fixture(autouse=True)

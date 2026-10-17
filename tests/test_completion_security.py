@@ -165,7 +165,7 @@ def test_real_home_guard_collects_transitive_descendants(monkeypatch):
     monkeypatch.setattr(guard, '_inspect_processes', process_table)
     guard._refresh_test_pids()
     assert guard.TEST_PIDS == {root, child, grandchild}
-    assert calls == [['ps', '-axo', 'pid,ppid']]
+    assert calls and all(args == ['ps', '-axo', 'pid,ppid'] for args in calls)
     monkeypatch.setattr(guard, '_inspect_processes', lambda args: (0, 'PID PPID\n'))
     guard._refresh_test_pids()
     assert guard.TEST_PIDS == {root, child, grandchild}, 'retain descendants after exit'
@@ -287,3 +287,118 @@ def test_state_override_uses_provider_path_semantics(tmp_path, monkeypatch):
     state.mkdir(parents=True)
     monkeypatch.setenv('DELEGATE_GEMINI_STATE_DIR', '~/state')
     assert workdir_forbidden(str(state))
+
+
+@pytest.mark.parametrize('change', ['delete', 'mtime', 'size'])
+@pytest.mark.parametrize('state', ['.codex-jobs', 'Library/Caches/delegate-agy'])
+def test_real_home_guard_rejects_preexisting_test_pid(tmp_path, change, state):
+    import conftest as guard
+    base = tmp_path / state
+    base.mkdir(parents=True)
+    path = base / f'jobs.{os.getpid()}-abcdef.json'
+    path.write_text('old')
+    original = path.stat()
+    before = guard._listing(tmp_path)
+    if change == 'delete':
+        path.unlink()
+    elif change == 'mtime':
+        os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns + 1000000000))
+    else:
+        path.write_text('longer content')
+        os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    with pytest.raises(AssertionError, match=path.name):
+        guard._assert_no_real_writes(tmp_path, before, 0, {os.getpid()})
+
+
+@pytest.mark.parametrize('change', ['delete', 'modify'])
+def test_real_home_guard_ignores_preexisting_foreign_pid(tmp_path, monkeypatch, change):
+    import conftest as guard
+    base = tmp_path / '.codex-jobs'
+    base.mkdir()
+    # The parent is alive, but belongs to the surrounding session, not pytest.
+    path = base / f'jobs.{os.getppid()}-abcdef.json'
+    path.write_text('old')
+    before = guard._listing(tmp_path)
+    if change == 'delete':
+        path.unlink()
+    else:
+        path.write_text('foreign update')
+    # A foreign PID name takes precedence even if pytest has the file open.
+    monkeypatch.setattr(guard, '_test_open_files', lambda pids: {path.resolve()})
+    guard._assert_no_real_writes(tmp_path, before, 0, {os.getpid()})
+
+
+def test_real_home_guard_preexisting_pidless_requires_recent_test_owner(tmp_path):
+    import conftest as guard
+    base = tmp_path / '.codex-jobs'
+    base.mkdir()
+    path = base / 'slot.lock'
+    path.write_text('old')
+    before = guard._listing(tmp_path)
+    started = guard.SESSION_STARTED
+    with path.open('w') as handle:
+        handle.write('modified')
+        handle.flush()
+        # Equality is recent too; test both timestamp and open-owner conditions.
+        os.utime(path, (started, started))
+        with pytest.raises(AssertionError, match='slot.lock'):
+            guard._assert_no_real_writes(tmp_path, before, started, {os.getpid()})
+        guard._assert_no_real_writes(tmp_path, before, started, {os.getppid()})
+        os.utime(path, (started - 10, started - 10))
+        guard._assert_no_real_writes(tmp_path, before, started, {os.getpid()})
+    os.utime(path, (started, started))
+    guard._assert_no_real_writes(tmp_path, before, started, {os.getpid()})
+
+
+def test_real_home_guard_sampler_attributes_short_lived_grandchild(tmp_path, monkeypatch):
+    import conftest as guard
+    base = tmp_path / '.codex-jobs'
+    base.mkdir()
+    before = guard._listing(tmp_path)
+    trigger = tmp_path / 'spawn'
+    pid_file = tmp_path / 'grandchild.pid'
+    live_table = tmp_path / 'live-ps-table'
+    inspect = guard._inspect_processes
+
+    def process_table(args):
+        if args[0] != 'ps':
+            return inspect(args)
+        # The sandbox denies ps. Supply its table from the real grandchild's
+        # lifetime marker, leaving the daemon and transitive attribution real.
+        try:
+            return 0, live_table.read_text()
+        except FileNotFoundError:
+            return 0, ''
+
+    monkeypatch.setattr(guard, '_inspect_processes', process_table)
+    grandchild_code = '''
+import os, pathlib, sys, time
+pid = os.getpid()
+pathlib.Path(sys.argv[1]).write_text(str(pid))
+table = pathlib.Path(sys.argv[3])
+table.write_text(f'{pid} {os.getppid()}\\n')
+(pathlib.Path(sys.argv[2]) / f'jobs.{pid}-abcdef.json').write_text('leak')
+time.sleep(0.5)
+table.unlink()
+'''
+    parent_code = '''
+import pathlib, subprocess, sys, time
+trigger = pathlib.Path(sys.argv[1])
+while not trigger.exists():
+    time.sleep(0.01)
+subprocess.run([sys.executable, '-c', sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]], check=True)
+'''
+    with subprocess.Popen([sys.executable, '-c', parent_code, str(trigger),
+                           grandchild_code, str(pid_file), str(base), str(live_table)]) as parent:
+        # Popen's synchronous refresh has finished; only the daemon can observe
+        # the grandchild before it exits. No subprocess/refresh calls until wait.
+        trigger.touch()
+        try:
+            assert parent.wait(timeout=10) == 0
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+    pid = int(pid_file.read_text())
+    assert pid in guard.TEST_PIDS, 'sampler missed the short-lived grandchild'
+    with pytest.raises(AssertionError, match=f'jobs.{pid}-abcdef.json'):
+        guard._assert_no_real_writes(tmp_path, before, 0, guard.TEST_PIDS)

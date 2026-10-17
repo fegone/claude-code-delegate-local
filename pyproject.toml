@@ -10,6 +10,8 @@ dependencies = [
 ]
 
 [tool.pytest.ini_options]
+# Keep standalone local integration scripts outside offline test collection.
+testpaths = ["tests"]
 # The stream-accumulator tests are `async def`. Without this, pytest collects them,
 # never awaits the coroutine, and reports 8 failures for tests that actually pass
 # (they were written to run standalone: `python tests/test_streaming.py`).
