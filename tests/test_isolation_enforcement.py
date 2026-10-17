@@ -175,8 +175,8 @@ def test_realpath_boundary(tmp_path, monkeypatch):
     alias = tmp_path / 'alias'
     alias.symlink_to(root, target_is_directory=True)
     monkeypatch.setenv('DELEGATE_TEST_ISOLATION_ROOT', str(alias))
-    assert delegate_state.enforce_isolation(root) is root
-    assert delegate_state.enforce_isolation(alias / 'new') == alias / 'new'
+    assert delegate_state.enforce_isolation(root) == root.resolve()
+    assert delegate_state.enforce_isolation(alias / 'new') == root.resolve() / 'new'
     with pytest.raises(delegate_state.IsolationViolation):
         delegate_state.enforce_isolation(tmp_path / 'allowed-sibling')
     monkeypatch.delenv('DELEGATE_TEST_ISOLATION')
@@ -394,3 +394,121 @@ async def test_cancel_reaps_process_before_runner_exits(backend, tmp_path, monke
             if proc.returncode is None:
                 proc.kill()
             await asyncio.wait_for(proc.wait(), timeout=5)
+
+
+@pytest.mark.parametrize('endpoint', ['slots', 'log', 'codex-lock', 'dsh-lock',
+                                      'gemini-owner', 'state-owner', 'state-json',
+                                      'codex-json', 'dsh-json', 'gemini-json'])
+async def test_final_symlink_escape(endpoint, tmp_path, monkeypatch):
+    root = tmp_path / 'allowed'
+    root.mkdir()
+    outside = tmp_path / 'outside'
+    outside.write_text('sentinel')
+    monkeypatch.setenv('DELEGATE_TEST_ISOLATION_ROOT', str(root))
+    link = root / 'link'
+    link.symlink_to(outside)
+    try:
+        if endpoint == 'slots':
+            bucket = root / 'test'
+            bucket.mkdir()
+            (bucket / 'slot-0').symlink_to(outside)
+            monkeypatch.setattr(server, '_SLOT_DIR', root)
+            monkeypatch.setattr(server, 'CROSS_PROCESS_SLOTS', True)
+            with pytest.raises((OSError, delegate_state.IsolationViolation)):
+                async with server._cross_process_slot('test', 1, 1):
+                    pytest.fail('final slot symlink was followed')
+        elif endpoint == 'log':
+            monkeypatch.setattr(server, '_LOG_PATH', link)
+            monkeypatch.setenv('DELEGATE_LOG', '1')
+            with pytest.raises(delegate_state.IsolationViolation):
+                server._log_dispatch({}, 'test', 'test', 0)
+        elif endpoint in ('codex-lock', 'dsh-lock', 'gemini-owner'):
+            if endpoint == 'gemini-owner':
+                (root / 'owner.test.lock').symlink_to(outside)
+            with pytest.raises(OSError):
+                {'codex-lock': lambda: server._flock_open(link),
+                 'dsh-lock': lambda: dsh_jobs._flock_try(link),
+                 'gemini-owner': lambda: gemini_jobs._owner_lock(root, 'test')}[endpoint]()
+        elif endpoint == 'state-owner':
+            (root / 'owner.test.lock').symlink_to(outside)
+            assert delegate_state.owner_alive(root, 'test') is False
+        elif endpoint == 'state-json':
+            with pytest.raises(OSError):
+                delegate_state.read_json(link)
+        else:
+            writer = {'codex-json': server._write_json_atomic,
+                      'dsh-json': dsh_jobs.write_json_atomic,
+                      'gemini-json': gemini_jobs.write_json_atomic}[endpoint]
+            writer(link, {'safe': True})
+            assert not link.is_symlink()
+    finally:
+        assert outside.read_text() == 'sentinel'
+
+
+@pytest.mark.parametrize('backend', ['codex', 'dsh', 'gemini'])
+def test_relative_storage_is_canonical(backend, tmp_path, monkeypatch):
+    root = tmp_path / 'allowed'
+    root.mkdir()
+    monkeypatch.setenv('DELEGATE_TEST_ISOLATION_ROOT', str(root))
+    monkeypatch.chdir(root)
+    monkeypatch.setenv(f'DELEGATE_{backend.upper()}_STATE_DIR', 'state')
+    result = {'codex': server._codex_state_base, 'dsh': lambda: dsh_jobs.CFG.state_dir,
+              'gemini': gemini_jobs.state_dir}[backend]()
+    assert Path(result) == root.resolve() / 'state'
+    monkeypatch.chdir(tmp_path)
+    Path(result).mkdir(exist_ok=True)
+    assert not (tmp_path / 'state').exists()
+
+
+async def test_profile_tempdir_escape(tmp_path, monkeypatch):
+    root = tmp_path / 'allowed'
+    root.mkdir()
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    monkeypatch.setenv('DELEGATE_TEST_ISOLATION_ROOT', str(root))
+    monkeypatch.setattr(tempfile, 'tempdir', str(outside))
+    monkeypatch.setattr(gemini_jobs, 'agy_bin', lambda: 'fake-agy')
+    monkeypatch.setattr(gemini_jobs, 'sandbox_available', lambda: True)
+    monkeypatch.setattr(gemini_jobs, 'resolve_git_dirs', lambda _: ((), None))
+    private = root / 'private'
+    private.mkdir()
+    monkeypatch.setattr(gemini_jobs, 'make_agy_home', lambda: str(private))
+    # Stop immediately after profile creation if the destination check is removed.
+    monkeypatch.setattr(gemini_jobs, 'build_profile', lambda *a, **kw: 'profile')
+    async def stop(*a):
+        return 'stop before launch'
+    monkeypatch.setattr(gemini_jobs, 'preflight', stop)
+    with pytest.raises(delegate_state.IsolationViolation):
+        await gemini_jobs.run_agy('task', {'timeout_s': 1, 'workdir': str(root)})
+    assert not list(outside.iterdir())
+
+
+def test_snapshot_tempdir_escape(tmp_path, monkeypatch):
+    root = tmp_path / 'allowed'
+    root.mkdir()
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    monkeypatch.setenv('DELEGATE_TEST_ISOLATION_ROOT', str(root))
+    monkeypatch.setattr(tempfile, 'tempdir', str(outside))
+    with pytest.raises(delegate_state.IsolationViolation):
+        gemini_jobs.write_json_atomic(outside / 'jobs.json', {})
+    assert not list(outside.iterdir())
+
+
+def test_snapshot_ignores_global_tempdir(tmp_path, monkeypatch):
+    root = tmp_path / 'allowed'
+    root.mkdir()
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    monkeypatch.setenv('DELEGATE_TEST_ISOLATION_ROOT', str(root))
+    monkeypatch.setattr(tempfile, 'tempdir', str(outside))
+    created = []
+    mkstemp = tempfile.mkstemp
+    def record(*args, **kwargs):
+        result = mkstemp(*args, **kwargs)
+        created.append(Path(result[1]))
+        return result
+    monkeypatch.setattr(tempfile, 'mkstemp', record)
+    gemini_jobs.write_json_atomic(root / 'jobs.json', {'safe': True})
+    assert created and all(p.is_relative_to(root.resolve()) for p in created)
+    assert not list(outside.iterdir())

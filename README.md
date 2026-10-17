@@ -382,3 +382,21 @@ delegate-wait --help
 ```
 
 Restart Claude Code: each session loads its MCP server once. Keep the existing MCP command pointing to this checkout.
+
+
+### Test storage safety net
+
+`DELEGATE_TEST_ISOLATION` (presence, even empty) enables a safety net against
+accidental test writes to the real HOME. `DELEGATE_TEST_ISOLATION_ROOT` must be an
+absolute path; storage resolvers validate containment and use canonical absolute
+paths, including for relative overrides. Final lock components reject symlinks,
+atomic snapshot writes replace rather than follow destination symlinks, and
+production temporary files/directories use explicitly validated destinations.
+Children inherit the guard through provider environment allowlists.
+
+This is **not a security boundary against a hostile process**. Whoever controls
+the startup environment or filesystem can disable it by removing
+`DELEGATE_TEST_ISOLATION` or setting `DELEGATE_TEST_ISOLATION_ROOT=/`; this is
+accepted by design. Closing the TOCTOU race where a concurrent attacker replaces
+an intermediate directory is out of scope, as is preventing environment-based
+disabling. The tests use disposable storage; they do not probe writes to real HOME.

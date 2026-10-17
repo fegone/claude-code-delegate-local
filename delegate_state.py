@@ -22,20 +22,27 @@ class IsolationViolation(RuntimeError):
 
 
 def enforce_isolation(path):
-    """Validate realpath before any storage access; preserve production path semantics.
+    """Return canonical absolute storage paths while the test safety net is enabled.
 
     Presence enables the guard (including an empty value). Children inherit both
     variables, so enforcement needs neither process attribution nor background work.
     Never cache this decision: tests and callers can change paths after import.
+
+    This is a safety net against accidental test writes to the real HOME, not a
+    security boundary against hostile processes. Whoever controls the startup
+    environment or filesystem can disable it (remove DELEGATE_TEST_ISOLATION or
+    set DELEGATE_TEST_ISOLATION_ROOT=/); that is accepted by design. Concurrent
+    attacker replacement of intermediate directories (TOCTOU) is out of scope.
     """
     if 'DELEGATE_TEST_ISOLATION' in os.environ:
         root = os.environ.get('DELEGATE_TEST_ISOLATION_ROOT', '')
         if not root or not os.path.isabs(root):
             raise IsolationViolation('test isolation requires an absolute DELEGATE_TEST_ISOLATION_ROOT')
-        real = Path(os.path.realpath(path))
+        real = Path(os.path.realpath(os.path.abspath(path)))
         allowed = Path(os.path.realpath(root))
         if not real.is_relative_to(allowed):
             raise IsolationViolation(f'test isolation: storage {real} is outside {allowed}')
+        return str(real) if isinstance(path, str) else real
     return path
 
 

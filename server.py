@@ -1181,17 +1181,17 @@ def _log_dispatch(result: dict, requested: str, bucket: str, queued_s: float) ->
         # Lo que la auditoria queria contar: exito certificado por un turno anterior.
         if result.get("success") and result.get("terminal_text") is False:
             rec["hollow_success"] = True
-        enforce_isolation(_LOG_PATH)
-        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        log_path = pathlib.Path(enforce_isolation(_LOG_PATH))
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         # Rotacion de un solo archivo: al pasar el tope se renombra a .1 (se pisa el
         # anterior). Sin hilos ni dependencias; si se pierde una linea en la carrera,
         # se pierde una linea de telemetria, no trabajo.
         try:
-            if _LOG_PATH.exists() and _LOG_PATH.stat().st_size > _LOG_MAX_BYTES:
-                _LOG_PATH.replace(_LOG_PATH.with_suffix(".jsonl.1"))
+            if log_path.exists() and log_path.stat().st_size > _LOG_MAX_BYTES:
+                log_path.replace(log_path.with_suffix(".jsonl.1"))
         except OSError:
             pass
-        with _LOG_PATH.open("a", encoding="utf-8") as fh:
+        with log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
     except IsolationViolation:
         raise
@@ -1232,7 +1232,8 @@ async def _cross_process_slot(bucket: str, limit: int, wait_max: float):
     fh = None
     while fh is None:
         for i in range(limit):
-            f = open(d / f"slot-{i}", "a+")
+            fd = os.open(d / f"slot-{i}", os.O_RDWR | os.O_NOFOLLOW | os.O_CREAT | os.O_APPEND, 0o600)
+            f = os.fdopen(fd, "a+")
             try:
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fh = f

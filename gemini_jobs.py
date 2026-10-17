@@ -660,7 +660,8 @@ async def run_agy(task: str, norm: dict, on_proc=None) -> dict:
         return {"success": False, "error": f"no se pudo crear el HOME privado de agy: {e.__class__.__name__}"}
     norm = {**norm, "agy_home": agy_home}
     try:
-        fd, profile_path = tempfile.mkstemp(prefix="gemini-jail-", suffix=".sb")
+        fd, profile_path = tempfile.mkstemp(prefix="gemini-jail-", suffix=".sb",
+                                            dir=enforce_isolation(tempfile.gettempdir()))
         with os.fdopen(fd, "w") as f:
             f.write(build_profile(norm["workdir"], git_dirs=git_dirs, agy_home=agy_home))
     except (OSError, ValueError) as e:
@@ -767,7 +768,7 @@ def state_dir() -> pathlib.Path:
 
 def write_json_atomic(path, data) -> None:
     path = pathlib.Path(path)
-    fd, tmp = tempfile.mkstemp(prefix=".jobs-", dir=path.parent)
+    fd, tmp = tempfile.mkstemp(prefix=".jobs-", dir=enforce_isolation(path.parent))
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, ensure_ascii=False)

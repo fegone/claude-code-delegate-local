@@ -71,6 +71,8 @@ ISOLATION_SITES = {
     ('dsh_jobs.py', 'stop_run', None): ['test_isolation_enforcement.py::test_nested_job_escape[dsh-stop]'],
     ('gemini_jobs.py', '_agy_homes_parent', None): isolation_tests('cache'),
     ('gemini_jobs.py', 'state_dir', None): isolation_tests('gemini'),
+    ('gemini_jobs.py', 'run_agy', None): ['test_isolation_enforcement.py::test_profile_tempdir_escape'],
+    ('gemini_jobs.py', 'write_json_atomic', None): ['test_isolation_enforcement.py::test_snapshot_tempdir_escape'],
     ('gemini_jobs.py', 'poll', None): isolation_tests('gemini-poll'),
     ('server.py', '<module>', 'os.getenv("DELEGATE_LOG_PATH"'): ['test_isolation_enforcement.py::test_import_override_escape[DELEGATE_LOG_PATH]'],
     ('server.py', '<module>', 'os.getenv("DELEGATE_SLOT_DIR"'): ['test_isolation_enforcement.py::test_import_override_escape[DELEGATE_SLOT_DIR]'],
@@ -126,7 +128,7 @@ CASES.extend([
      "if os.environ.get('DELEGATE_TEST_ISOLATION'):", ['test_isolation_enforcement.py::test_empty_flag_still_enforces']),
     ('isolation-disabled', 'delegate_state.py', "if 'DELEGATE_TEST_ISOLATION' in os.environ:",
      'if True:', ['test_isolation_enforcement.py::test_allowed_and_disabled[False-codex]']),
-    ('isolation-path-realpath', 'delegate_state.py', 'real = Path(os.path.realpath(path))',
+    ('isolation-path-realpath', 'delegate_state.py', 'real = Path(os.path.realpath(os.path.abspath(path)))',
      'real = Path(os.path.abspath(path))', [f'test_isolation_enforcement.py::test_directory_escape[symlink-{e}]'
                                          for e in ('codex', 'dsh', 'gemini', 'cache', 'slots', 'state')]),
     ('isolation-root-realpath', 'delegate_state.py', 'allowed = Path(os.path.realpath(root))',
@@ -176,6 +178,38 @@ for backend, filename, scope in (('codex', 'server.py', '_run_codex_core'),
     after = before.replace(''.join(lines[reap.lineno - 1:reap.end_lineno]), '', 1)
     CASES.append((f'cancel-reap-{backend}', filename, before, after,
                   f'test_isolation_enforcement.py::test_cancel_reaps_process_before_runner_exits[{backend}]'))
+
+
+# Concrete accident regressions: canonical returns, final components, explicit temp dirs.
+CASES.extend([
+    ('isolation-return-canonical', 'delegate_state.py',
+     'return str(real) if isinstance(path, str) else real', 'return path',
+     [f'test_isolation_enforcement.py::test_relative_storage_is_canonical[{b}]'
+      for b in ('codex', 'dsh', 'gemini')]),
+    ('slot-final-nofollow', 'server.py',
+     'os.O_RDWR | os.O_NOFOLLOW | os.O_CREAT | os.O_APPEND',
+     'os.O_RDWR | os.O_CREAT | os.O_APPEND',
+     'test_isolation_enforcement.py::test_final_symlink_escape[slots]'),
+    ('profile-explicit-tempdir', 'gemini_jobs.py',
+     ',\n                                            dir=enforce_isolation(tempfile.gettempdir())', '',
+     'test_isolation_enforcement.py::test_profile_tempdir_escape'),
+    ('snapshot-explicit-tempdir', 'gemini_jobs.py',
+     ', dir=enforce_isolation(path.parent)', '',
+     'test_isolation_enforcement.py::test_snapshot_ignores_global_tempdir'),
+])
+for name, filename, before, test in (
+    ('codex-lock', 'server.py',
+     'os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW', 'codex-lock'),
+    ('dsh-lock', 'dsh_jobs.py',
+     'os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW', 'dsh-lock'),
+    ('gemini-owner', 'gemini_jobs.py',
+     'os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW', 'gemini-owner'),
+    ('state-read', 'delegate_state.py',
+     'fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)', 'state-json'),
+):
+    CASES.append((f'final-nofollow-{name}', filename, before,
+                  before.replace(' | os.O_NOFOLLOW', ''),
+                  f'test_isolation_enforcement.py::test_final_symlink_escape[{test}]'))
 
 
 def main():
