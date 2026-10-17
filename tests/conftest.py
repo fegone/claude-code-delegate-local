@@ -99,8 +99,8 @@ def _listing(home):
 
 
 # A cache directory's PID also attributes its descendants. Match complete PID
-# tokens, never substrings (e.g. 123 must not match a foreign writer 9123).
-_PID_NAME = re.compile(r'(?:^|[.])([0-9]+)-[0-9a-fA-F]+(?:[.]|$)')
+# tokens (hex state IDs or tempfile cache suffixes), never substrings (e.g. 123 must not match a foreign writer 9123).
+_PID_NAME = re.compile(r'(?:^|[.])([0-9]+)-[A-Za-z0-9_]+(?:[.]|$)')
 
 
 def _named_pids(relative):
@@ -136,7 +136,7 @@ def _assert_no_real_writes(home, before, started, pids):
                 continue
             path = home / name / relative
             try:
-                if not path.is_file() or path.stat().st_mtime < started:
+                if not path.is_file() or path.stat().st_mtime <= started:
                     continue
             except FileNotFoundError:  # A live foreign writer may remove it.
                 continue
