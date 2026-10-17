@@ -1,6 +1,6 @@
 [project]
 name = "claude-delegate-local"
-version = "0.7.0"
+version = "0.7.1"
 description = "MCP server that delegates Claude Code subagents to alternative backends (local llama.cpp, LiteLLM, DeepSeek, Bedrock, etc.) with full tool calling."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,3 +15,13 @@ dependencies = [
 # (they were written to run standalone: `python tests/test_streaming.py`).
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+[project.scripts]
+delegate-wait = "delegate_wait:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["delegate_wait", "delegate_state", "server", "gemini_jobs", "dsh_jobs"]

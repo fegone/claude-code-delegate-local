@@ -191,8 +191,8 @@ wheels = [
 
 [[package]]
 name = "claude-delegate-local"
-version = "0.7.0"
-source = { virtual = "." }
+version = "0.7.1"
+source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
     { name = "httpx" },

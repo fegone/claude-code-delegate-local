@@ -4,6 +4,17 @@ All notable changes to `delegate-local` are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.1] - 2026-10-17
+
+### Added
+- `delegate-wait`: stdlib read-only completion watcher with streaming, `--all`, `--json`, timeout and dead-owner detection. Submit tools return a ready-to-run `watch` command for Monitor/background Bash notifications.
+- Gemini atomic per-server snapshots and owner locks in `~/.gemini-jobs`, cross-server polling, and dead-session `killed_on_restart` recovery.
+
+### Fixed
+- All job pollers expose persistence errors (also stderr), truncation flags/full character lengths and `very_short_run` warnings; empty Codex completions warn `empty_response`.
+- Codex jobs queued over 120 seconds under account auth failure terminate with `failure_kind=auth`.
+- DSH rejects `status=ok` with a nonzero result rc; Gemini jail git-config refusals carry `failure_kind=jail_git_config` and a remediation hint without weakening the jail.
+
 ## [Unreleased]
 
 ### Added (2026-10-15)

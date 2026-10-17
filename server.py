@@ -14,6 +14,8 @@ License: MIT
 """
 from __future__ import annotations
 
+from delegate_state import METADATA_FIELDS, metadata as job_metadata, persist_failed, owner_alive, watch_fields, sanitize_metadata
+
 import asyncio
 import atexit
 import fcntl
@@ -3318,7 +3320,7 @@ async def _codex_wait_locks(workdir_abs: str) -> list | None:
 def _codex_denied_dirs(home: str) -> set:
     names = (".ssh", ".codex", ".claude", ".aws", ".config", ".gnupg", "Library", ".codex-jobs")
     out = {os.path.realpath(os.path.join(home, n)) for n in names}
-    out.add(os.path.realpath(CODEX_STATE_DIR))
+    out.add(os.path.realpath(_codex_state_base()))
     return out
 
 
@@ -3666,7 +3668,8 @@ CODEX_POLL_CHARS = 4000
 CODEX_WATCHDOG_GRACE_S = 15.0
 CODEX_LOCK_WAIT_S = float(os.getenv("DELEGATE_CODEX_LOCK_WAIT_S", "600"))  # delegate_to_codex only
 # Private state dir (0700): per-server job files, slot locks, workdir locks.
-CODEX_STATE_DIR = os.getenv("DELEGATE_CODEX_STATE_DIR") or os.path.expanduser("~/.codex-jobs")
+# Optional explicit override; otherwise resolve the environment on each call.
+CODEX_STATE_DIR: str | None = None
 CODEX_SESSIONS_DIR = os.getenv("DELEGATE_CODEX_SESSIONS_DIR") or os.path.expanduser("~/.codex/sessions")
 CODEX_QUOTA_WARN = float(os.getenv("DELEGATE_CODEX_QUOTA_WARN", "85"))
 CODEX_MAX_PER_PROJECT = int(os.getenv("DELEGATE_CODEX_MAX_PER_PROJECT", "6"))  # project = git common dir
@@ -3689,7 +3692,7 @@ _CODEX_SECRET_FREE_FIELDS = (
     "submitted_at", "started_at", "finished_at", "pid", "error", "final_response",
     "out_file", "pstart", "project", "root", "queue_reason", "retry_count", "retry_at",
     "not_before", "last_activity", "exit_code", "session_id", "failure_kind",
-)
+) + METADATA_FIELDS
 
 _codex_jobs: dict[str, dict] = {}
 _codex_queue: deque = deque()
@@ -3702,8 +3705,13 @@ _codex_ticker: "asyncio.Task | None" = None
 _codex_hooks_installed = False
 
 
+def _codex_state_base() -> pathlib.Path:
+    return pathlib.Path(CODEX_STATE_DIR or os.getenv("DELEGATE_CODEX_STATE_DIR")
+                        or os.path.expanduser("~/.codex-jobs"))
+
+
 def _codex_state_dir() -> pathlib.Path:
-    d = pathlib.Path(CODEX_STATE_DIR)
+    d = _codex_state_base()
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
     st = os.lstat(d)
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
@@ -3823,7 +3831,7 @@ def _codex_state_dir_safe() -> pathlib.Path:
     try:
         return _codex_state_dir()
     except OSError as e:
-        raise CodexLockError(f"almacén de estado de Codex no disponible ({CODEX_STATE_DIR}): {e}") from e
+        raise CodexLockError(f"almacén de estado de Codex no disponible ({_codex_state_base()}): {e}") from e
 
 
 def _codex_identity_fs(real: str) -> tuple[str, str]:
@@ -3947,6 +3955,7 @@ def _codex_sanitize_job(jid, j) -> dict | None:
     out["retry_count"] = rc if isinstance(rc, int) and not isinstance(rc, bool) and rc >= 0 else 0
     fr = j.get("final_response")
     out["final_response"] = fr if isinstance(fr, str) else None
+    out.update(sanitize_metadata(j))
     return out
 
 
@@ -4265,6 +4274,8 @@ def _codex_save() -> None:
         for j in finished[:-CODEX_JOBS_KEEP]:
             _codex_jobs.pop(j["id"], None)
             _codex_rt.pop(j["id"], None)
+        for j in _codex_jobs.values():
+            j.update(job_metadata(j, _truncate_words))
         data = {
             "v": 2,
             "server": {"sid": _codex_sid, "pid": os.getpid(), "saved_at": time.time(),
@@ -4277,7 +4288,7 @@ def _codex_save() -> None:
         }
         _write_json_atomic(_codex_state_file(), data)
     except OSError as e:
-        logging.getLogger(__name__).warning("codex jobs file not written: %s", e)
+        persist_failed(_codex_jobs, "codex", e)
 
 
 def _codex_recover(j: dict) -> None:
@@ -4460,6 +4471,11 @@ def _codex_pump(from_ticker: bool = False) -> None:
             continue
         if gate["state"] == "auth_failed":
             j["queue_reason"] = "auth_failed"
+            if now - (j.get("submitted_at") or now) > 120:
+                j.update(status="failed", failure_kind="auth", error=CODEX_AUTH_MESSAGE, finished_at=now)
+                _codex_queue.remove(jid)
+                if jid in _codex_rt:
+                    _codex_rt[jid]["task"] = ""
             continue
         if gate["state"] == "cooldown" or (j.get("not_before") or 0) > now:
             j["queue_reason"] = "throttle_cooldown"
@@ -4604,14 +4620,7 @@ async def _codex_runner(jid: str) -> None:
 
 
 def _codex_owner_alive(base: pathlib.Path, sid: str) -> bool:
-    try:
-        lk = _flock_try(base / f"owner.{sid}.lock")
-    except OSError:
-        return False
-    if lk is None:
-        return True
-    lk.close()
-    return False
+    return owner_alive(base, sid)
 
 
 def _codex_remote_views(ids: list) -> dict:
@@ -4689,12 +4698,16 @@ def _codex_job_view(j: dict, owner: dict | None = None) -> dict:
         view["error"] = j["error"]
     if status in ("done", "failed", "timeout") and j.get("final_response"):
         view["final_response"] = _truncate_words(j["final_response"])
+    view.update(job_metadata(j, _truncate_words))
     return view
 
 
 @mcp.tool()
 async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dict:
     """
+    Start the returned `watch` command with Monitor (or Bash run_in_background) right now:
+    it is the only way you get notified when jobs end. Never rely on remembering to poll.
+
     Lanza una o varias tareas de Codex SIN esperar y devuelve los ids de inmediato; el
     orquestador sigue trabajando y consulta con `poll_codex(ids)`. Pensado para lanzar
     muchas tarjetas en paralelo (ver `delegate_to_codex` para una sola y bloqueante).
@@ -4811,7 +4824,8 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
     _codex_pump()
     for entry in jobs_out:
         entry["status"] = _codex_jobs[entry["id"]]["status"]
-    out = {"jobs": jobs_out, "max_concurrent": CODEX_MAX_CONCURRENT, "account": _codex_account_view()}
+    out = {"jobs": jobs_out, "max_concurrent": CODEX_MAX_CONCURRENT, "account": _codex_account_view(),
+           **watch_fields(e["id"] for e in jobs_out)}
     if warning:
         out["warning"] = warning
     return out
@@ -4945,6 +4959,9 @@ async def delegate_to_gemini(
 @mcp.tool()
 async def submit_gemini(tasks: list[dict]) -> dict:
     """
+    Start the returned `watch` command with Monitor (or Bash run_in_background) right now:
+    it is the only way you get notified when jobs end. Never rely on remembering to poll.
+
     Lanza una o varias tareas de Gemini (agy) SIN esperar; devuelve ids de inmediato y se
     consultan con `poll_gemini(ids)`. Cada elemento: {task, workdir='.', effort='medium',
     timeout_s=900, family='gemini'}. family admite "gemini" (default, gemini-3.8-flash-*),
@@ -4982,6 +4999,9 @@ import dsh_jobs as _dsh_jobs
 @mcp.tool()
 async def submit_dsh(tasks: list[dict]) -> dict:
     """
+    Start the returned `watch` command with Monitor (or Bash run_in_background) right now:
+    it is the only way you get notified when jobs end. Never rely on remembering to poll.
+
     Lanza tareas de dsh (DeepSeek Harness en jaula, visible en Herdr) SIN esperar y devuelve
     ids; consulta con `poll_dsh(ids)`. Mismas reglas que `submit_codex`, con estado y topes
     PROPIOS (~/.dsh-jobs): modelos locales comparten una sola Mac Studio.

@@ -26,6 +26,7 @@ import time
 import uuid
 from collections import deque
 
+from delegate_state import METADATA_FIELDS, metadata, persist_failed, owner_alive, watch_fields
 from gemini_jobs import redact
 
 MAX_TIMEOUT_S = 7200
@@ -45,7 +46,7 @@ REFUSED_AUTOMATED = ("mimo", "xiaomi")
 DENIED_DIRS = (".ssh", ".gnupg", ".aws", ".config", ".claude", "Library")
 PUBLIC_FIELDS = ("id", "status", "model", "workdir", "timeout_s", "task_preview", "submitted_at",
                  "started_at", "finished_at", "pid", "error", "final_response", "project", "root",
-                 "queue_reason", "exit_code", "diff_stat", "tokens", "wall_s", "out_dir")
+                 "queue_reason", "exit_code", "diff_stat", "tokens", "wall_s", "out_dir") + METADATA_FIELDS
 
 
 def _env_int(name: str, default: int) -> int:
@@ -332,12 +333,14 @@ class DshJobs:
             for j in fin[:-JOBS_KEEP]:
                 self.jobs.pop(j["id"], None)
                 self.rt.pop(j["id"], None)
+            for j in self.jobs.values():
+                j.update(metadata(j, truncate_words))
             data = {"v": 1, "server": {"sid": self.sid, "pid": os.getpid(), "saved_at": time.time()},
                     "jobs": {jid: {k: (truncate_words(j.get(k)) if k == "final_response" else j.get(k))
                                    for k in PUBLIC_FIELDS} for jid, j in self.jobs.items()}}
             write_json_atomic(self.state_file(), data)
-        except OSError:
-            pass
+        except OSError as e:
+            persist_failed(self.jobs, "dsh", e)
 
     def ensure_loaded(self) -> None:
         """Take our liveness lock; adopt job files of DEAD sessions (owner lock free) marking
@@ -419,10 +422,7 @@ class DshJobs:
                 rj = raw.get(jid) if isinstance(raw, dict) else None
                 if isinstance(rj, dict):
                     if alive is None:
-                        lk = _flock_try(base / f"owner.{sid}.lock")
-                        alive = lk is None
-                        if lk is not None:
-                            lk.close()
+                        alive = owner_alive(base, sid)
                     v = self.view({k: rj.get(k) for k in PUBLIC_FIELDS} | {"id": jid})
                     v["owner"] = {"sid": sid, "alive": alive}
                     if not alive and v["status"] in ("queued", "running"):
@@ -443,6 +443,7 @@ class DshJobs:
             v["queue_reason"] = j.get("queue_reason")
         if j.get("final_response"):
             v["final_response"] = truncate_words(j["final_response"])
+        v.update(metadata(j, truncate_words))
         v["summary_untrusted"] = True
         v["owner"] = {"sid": self.sid, "pid": os.getpid(), "alive": True}
         return v
@@ -527,7 +528,7 @@ class DshJobs:
             e["status"] = self.jobs[e["id"]]["status"]
         self.save()
         return {"jobs": out, "max_concurrent": CFG.max_concurrent,
-                "max_per_project": CFG.max_per_project}
+                "max_per_project": CFG.max_per_project, **watch_fields(e["id"] for e in out)}
 
     # ── scheduling ─────────────────────────────────────────────────────────────────
     def start(self, jid: str, locks: list) -> None:
@@ -869,7 +870,9 @@ class DshJobs:
         # result.json is written last and atomically: "ok" is the source of truth. The launcher's own rc
         # only vetoes it when dsh-herdr.sh exited by itself with an error; a waiter we had to kill
         # (negative rc) after the result was already on disk does not.
-        if st == "ok" and (rc == 0 or waiter_killed):
+        if st == "ok" and isinstance(res.get("rc"), int) and res["rc"] != 0:
+            j.update(status="failed", failure_kind="nonzero_rc", error=f"dsh status=ok but dsh rc={res['rc']}")
+        elif st == "ok" and (rc == 0 or waiter_killed):
             j["status"] = "done"
         elif st == "cancelled":
             j["status"], j["error"] = "cancelled", "dsh reportó cancelled"

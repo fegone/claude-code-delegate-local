@@ -237,3 +237,28 @@ Tareas de validación: revisión de SQL injection (agente security-engineer), ca
 ## Licencia
 
 MIT. Ver [LICENSE](LICENSE).
+
+## Avisos al terminar
+
+`submit_codex`, `submit_gemini` y `submit_dsh` devuelven `watch` y `watch_hint`. **Ejecuta inmediatamente el comando exacto de `watch` con Monitor (o Bash `run_in_background`).** Es la única vía de aviso al terminar: nunca dependas de acordarte de consultar `poll_*`. El servidor MCP no despierta por sí solo a Claude Code.
+
+```bash
+delegate-wait cx-aaa gm-bbb dsh-ccc
+delegate-wait --all --timeout 1800 --json cx-aaa gm-bbb
+```
+
+Por defecto imprime y vacía una línea por job terminado; `--all` espera a todos; `--json` emite un objeto JSON por línea. Códigos de salida: 0 todos done, 1 algún fallo/cancelación/lost/reinicio, 2 id que nunca aparece en 30 s, 3 timeout del watcher. Se aplica el primer plazo alcanzado. Un dueño muerto se informa como LOST inmediatamente. Intervalo: 5 s (`DELEGATE_WAIT_INTERVAL`). Estado en `~/.codex-jobs`, `~/.gemini-jobs` y `~/.dsh-jobs`; si cambias `DELEGATE_{CODEX,GEMINI,DSH}_STATE_DIR`, usa el mismo valor en servidor y watcher.
+
+Los pollers muestran `persist_error` (también en stderr), `warnings` (`very_short_run`, y `empty_response` en Codex) y `truncated: true` con `final_response_length` (caracteres completos). Si no se puede escribir el estado, el watcher no recibe snapshots nuevos: revisa stderr/poll. Gemini conserva el jail; si rechaza la configuración git devuelve `failure_kind: jail_git_config` y la pista `run: git branch --unset-upstream`. Al reiniciar recupera los jobs interrumpidos como `killed_on_restart`: no se reanudan; este estado no prueba que todos los procesos hijos murieran. Revisa el workdir antes de reenviar.
+
+Instalación global desde este checkout:
+
+```bash
+uv sync --locked
+uv tool install --force .
+uv tool update-shell
+# Abre otra terminal para actualizar PATH.
+delegate-wait --help
+```
+
+Reinicia Claude Code: el servidor MCP se carga una sola vez por sesión. Mantén su comando MCP apuntando a este checkout.
