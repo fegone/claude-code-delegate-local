@@ -351,3 +351,52 @@ Además (T09):
 - **`DELEGATE_RESEND_REASONING`** (hallazgo 15): `auto` (default) = reenviar el
   `reasoning_content` del assistant previo **solo** a `deepseek-*` (que lo exige); `1` =
   a todos; `0` = a nadie. A los providers que lo rechazan nunca se le manda.
+
+## Avisos al terminar
+
+Every successful `submit_codex`, `submit_gemini` and `submit_dsh` returns `watch` and `watch_hint`. **Start the exact `watch` command with the Monitor tool (or Bash `run_in_background`) immediately.** This is the only completion notification path; never rely on remembering to poll. The MCP server does not wake Claude Code on its own.
+
+```bash
+delegate-wait cx-aaa gm-bbb dsh-ccc
+delegate-wait --all --timeout 1800 --json cx-aaa gm-bbb
+```
+
+The default emits and flushes one line per terminal job; `--all` waits for every job before printing. `--json` emits one JSON object per line. Exit codes: 0 all done, 1 any unsuccessful terminal job (including lost/restarted), 2 an id never appeared within 30 seconds, 3 watcher timeout. The first applicable timeout/grace deadline wins. Dead owners become `LOST` immediately. Poll interval defaults to 5 seconds (`DELEGATE_WAIT_INTERVAL`). All three providers use per-server snapshots under `~/.codex-jobs`, `~/.gemini-jobs`, `~/.dsh-jobs`; use matching `DELEGATE_CODEX_STATE_DIR`, `DELEGATE_GEMINI_STATE_DIR`, `DELEGATE_DSH_STATE_DIR` overrides in the server and watcher if needed.
+
+Poll results expose `persist_error`, `warnings`, and, for shortened responses, `truncated: true` with `final_response_length` (full character count). Persistence errors also go to server stderr; an unwritable state directory cannot deliver fresh snapshots to a watcher, so inspect MCP stderr/poll errors if updates stop. `very_short_run` means under 45 seconds; Codex `empty_response` still preserves the existing exit-zero `done` status. Gemini refuses unsafe git config with `failure_kind: jail_git_config` and hint `run: git branch --unset-upstream`; the jail stays enabled. Dead Gemini jobs are recorded as `killed_on_restart` on first use after restart; this means interrupted and unresumable, not proof that every child process was killed. Review the workdir before resubmitting.
+
+Completion output replaces control/format/bidi characters and line separators with spaces, collapses whitespace, and caps text fields at 256 characters (preview 110); JSON string values, including nested values, are sanitized and capped at 4,000 characters. Persistence and runner exceptions expose only a bounded exception class, errno and canonical OS description, never exception paths or arguments.
+
+All providers reject workdirs overlapping any provider's default or overridden job-state directory, including ancestors, descendants and symlink targets, with `failure_kind: workdir_forbidden`. Gemini's sandbox explicitly denies writes to these directories even beneath writable temporary roots.
+
+Offline verification: `.venv/bin/python -m pytest tests -q -p no:cacheprovider` and `.venv/bin/python scripts/check-completion-mutations.py` (41 guard-removal mutations). `tests/conftest.py` isolates HOME, provider state, locks, sessions and caches at import time, before collection imports providers; private agy homes under `Library/Caches/delegate-agy` therefore stay in the temporary HOME. Per-test resets remain enabled. A collection-only subprocess starts with the real HOME and checks for new provider/cache entries attributed to pytest or its descendants, ignoring concurrent foreign writers. PIDs are retained at each subprocess spawn and sampled from `ps -axo pid,ppid` at spawn and session end; unavailable process-tree inspection warns and limits tracking to direct children. PID-less entries require a new path, a modification time after session start, and an open file owned by a test PID (`lsof`); closed PID-less writes cannot be attributed. No production sweep bypass is needed.
+
+Install the watcher globally from this checkout:
+
+```bash
+uv sync --locked
+uv tool install --force .
+uv tool update-shell
+# Open a new terminal so delegate-wait is on PATH.
+delegate-wait --help
+```
+
+Restart Claude Code: each session loads its MCP server once. Keep the existing MCP command pointing to this checkout.
+
+
+### Test storage safety net
+
+`DELEGATE_TEST_ISOLATION` (presence, even empty) enables a safety net against
+accidental test writes to the real HOME. `DELEGATE_TEST_ISOLATION_ROOT` must be an
+absolute path; storage resolvers validate containment and use canonical absolute
+paths, including for relative overrides. Final lock components reject symlinks,
+atomic snapshot writes replace rather than follow destination symlinks, and
+production temporary files/directories use explicitly validated destinations.
+Children inherit the guard through provider environment allowlists.
+
+This is **not a security boundary against a hostile process**. Whoever controls
+the startup environment or filesystem can disable it by removing
+`DELEGATE_TEST_ISOLATION` or setting `DELEGATE_TEST_ISOLATION_ROOT=/`; this is
+accepted by design. Closing the TOCTOU race where a concurrent attacker replaces
+an intermediate directory is out of scope, as is preventing environment-based
+disabling. The tests use disposable storage; they do not probe writes to real HOME.

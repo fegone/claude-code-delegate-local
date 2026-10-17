@@ -9,8 +9,8 @@ agy prints ONE JSON object on stdout: {conversation_id, status, response, durati
 num_turns, usage}. Without -p and without a TTY it opens a TUI and hangs, so -p and a closed
 stdin are always set.
 
-Scope: jobs live in memory of this server (no cross-process state, unlike Codex); they die
-with the server. Caps: DELEGATE_GEMINI_MAX_CONCURRENT (default 4), DELEGATE_GEMINI_MAX_QUEUE
+Scope: jobs have an in-memory fast path and per-server snapshots in ~/.gemini-jobs.
+Dead sessions are recovered on first use; remote polls are read-only. Caps: DELEGATE_GEMINI_MAX_CONCURRENT (default 4), DELEGATE_GEMINI_MAX_QUEUE
 (default 32); one job per workdir at a time.
 
 Privacy: Google consumer plan, no BAA. Never send PHI / patient data to it.
@@ -20,6 +20,8 @@ No import of server.py: the MCP tools in server.py are thin wrappers over this m
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import pathlib
 import json
 import math
 import os
@@ -32,6 +34,8 @@ import tempfile
 import time
 import uuid
 from collections import deque
+
+from delegate_state import enforce_isolation, isolation_environment, redacted_exception, workdir_forbidden, state_directories, METADATA_FIELDS, TERMINAL, metadata, persist_failed, remote_jobs, read_json, watch_fields, sanitize_snapshot
 
 EFFORTS = ("low", "medium", "high")
 DEFAULT_EFFORT = "medium"
@@ -54,13 +58,12 @@ STDERR_TAIL = 600
 POLL_WORDS = 300
 POLL_CHARS = 4000
 JOBS_KEEP = 200
-TERMINAL = frozenset({"done", "failed", "timeout", "cancelled"})
 DENIED_DIRS = (".ssh", ".gnupg", ".aws", ".config", ".claude", ".codex", ".gemini", ".docker", ".kube", "Library")
 _ENV_ALLOW = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TZ", "LANG"})
 PUBLIC_FIELDS = ("id", "status", "model", "effort", "family", "workdir", "timeout_s", "task_preview",
                  "submitted_at", "started_at", "finished_at", "pid", "error", "final_response",
                  "conversation_id", "usage", "duration_s", "exit_code", "queue_reason",
-                 "quota_exhausted", "failover")
+                 "quota_exhausted", "failover", "root") + METADATA_FIELDS
 
 _SECRET_PATS = (
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{8,}"),
@@ -143,6 +146,8 @@ def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ..
     L.append(f'(deny file-write* (literal "{_sb_path(os.path.join(wd, ".git"))}") '
              f'(subpath "{_sb_path(os.path.join(wd, ".git"))}")')
     L.append(f'  (regex #"^{re.escape(wd)}/(.*/)?\\.git(/.*)?$"))')
+    for protected in state_directories(home=home):
+        L.append(f'(deny file-write* (subpath "{_sb_path(protected)}"))')
     L += [
           "; reads: deny the WHOLE filesystem, then allow back a short list (round 3: /Volumes held a",
           "; Time Machine copy of HOME). stat() works everywhere except HOME, /Users and /Volumes.",
@@ -281,7 +286,7 @@ SEED_DIRS = ("builtin", "bin")
 def _agy_homes_parent(real_home: str) -> str:
     """~/Library/Caches/delegate-agy: 0700, ours, never a symlink. The jail gets only ITS OWN child, so one
     job cannot list, read or replace another job's private HOME (Security PR61 H3)."""
-    parent = os.path.join(real_home, "Library", "Caches", "delegate-agy")
+    parent = enforce_isolation(os.path.join(real_home, "Library", "Caches", "delegate-agy"))
     os.makedirs(os.path.dirname(parent), exist_ok=True)
     try:
         os.mkdir(parent, 0o700)
@@ -357,13 +362,13 @@ def make_agy_home(real_home: str | None = None) -> str:
         if os.path.isfile(kc):
             os.makedirs(os.path.join(root, "Library", "Preferences"), mode=0o700)
             subprocess.run(["/usr/bin/security", "list-keychains", "-d", "user", "-s", kc],
-                           env={"HOME": root, "PATH": "/usr/bin:/bin"}, capture_output=True, timeout=10)
+                           env={"HOME": root, "PATH": "/usr/bin:/bin", **isolation_environment()}, capture_output=True, timeout=10)
             # Also the DEFAULT keychain (2026-10-15): with only the search list, agy's OAuth refresh (about
             # every 30 min) found no default keychain to store into and macOS raised the GUI dialog
             # "Keychain Not Found ... to store antigravity" with "Reset To Defaults" on Felix's screen.
             # With a default set, the store hits the jail's read-only rule and fails quietly instead.
             subprocess.run(["/usr/bin/security", "default-keychain", "-d", "user", "-s", kc],
-                           env={"HOME": root, "PATH": "/usr/bin:/bin"}, capture_output=True, timeout=10)
+                           env={"HOME": root, "PATH": "/usr/bin:/bin", **isolation_environment()}, capture_output=True, timeout=10)
     except OSError:
         shutil.rmtree(root, ignore_errors=True)
         raise
@@ -473,7 +478,7 @@ def model_for(effort: str, family: str = DEFAULT_FAMILY) -> str:
 
 
 def child_env() -> dict[str, str]:
-    return {k: v for k, v in os.environ.items() if k in _ENV_ALLOW or k.startswith("LC_")}
+    return {k: v for k, v in os.environ.items() if k in _ENV_ALLOW or k.startswith("LC_")} | isolation_environment()
 
 
 def kill_group(proc) -> None:
@@ -534,6 +539,9 @@ def validate(task, workdir, effort, timeout_s, family: str = DEFAULT_FAMILY) -> 
     if not os.path.isdir(wd):
         return {"success": False, "error": f"workdir no existe: {wd}"}, {}
     real = os.path.realpath(wd)
+    if workdir_forbidden(real):
+        return {"success": False, "failure_kind": "workdir_forbidden",
+                "error": "workdir overlaps a protected job-state directory"}, {}
     home = os.path.realpath(os.path.expanduser("~"))
     denied = {os.path.join(home, d) for d in DENIED_DIRS}
     if real in ("/", home) or any(real == p or real.startswith(p + os.sep) for p in denied):
@@ -644,19 +652,21 @@ async def run_agy(task: str, norm: dict, on_proc=None) -> dict:
         return {"success": False, "error": "sandbox-exec no disponible: agy no corre sin aislamiento."}
     git_dirs, git_err = resolve_git_dirs(norm["workdir"])
     if git_err:
-        return {"success": False, "error": git_err}
+        return {"success": False, "failure_kind": "jail_git_config",
+                "error": git_err + " Hint: run: git branch --unset-upstream"}
     try:
         agy_home = make_agy_home()
     except OSError as e:
         return {"success": False, "error": f"no se pudo crear el HOME privado de agy: {e.__class__.__name__}"}
     norm = {**norm, "agy_home": agy_home}
     try:
-        fd, profile_path = tempfile.mkstemp(prefix="gemini-jail-", suffix=".sb")
+        fd, profile_path = tempfile.mkstemp(prefix="gemini-jail-", suffix=".sb",
+                                            dir=enforce_isolation(tempfile.gettempdir()))
         with os.fdopen(fd, "w") as f:
             f.write(build_profile(norm["workdir"], git_dirs=git_dirs, agy_home=agy_home))
     except (OSError, ValueError) as e:
         shutil.rmtree(agy_home, ignore_errors=True)
-        return {"success": False, "error": f"no se pudo generar el perfil de sandbox: {e}"}
+        return {"success": False, "error": f"no se pudo generar el perfil de sandbox: {redacted_exception(e)}"}
     try:
         pre = await preflight(profile_path, norm["workdir"], git_dirs)
         if pre:
@@ -697,8 +707,9 @@ async def _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc) 
     try:
         out_t = asyncio.ensure_future(_drain(proc.stdout, STDOUT_CAP))
         err_t = asyncio.ensure_future(_drain(proc.stderr, STDOUT_CAP))
+        drains = asyncio.gather(out_t, err_t)
         try:
-            stdout, stderr = await asyncio.wait_for(asyncio.gather(out_t, err_t),
+            stdout, stderr = await asyncio.wait_for(drains,
                                                     timeout=timeout_s + KILL_GRACE_S)
             await asyncio.wait_for(proc.wait(), timeout=10)
         except asyncio.TimeoutError:
@@ -713,6 +724,13 @@ async def _run_agy_jailed(binary, task, norm, timeout_s, profile_path, on_proc) 
                     "elapsed_s": round(time.time() - t0, 1), **base}
     except BaseException:
         kill_group(proc)  # client cancel or any failure: never leave the tree alive
+        for t in (out_t, err_t):
+            t.cancel()
+        await asyncio.gather(drains, out_t, err_t, return_exceptions=True)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
         raise
     reap_group(proc)  # L3: children agy left in its session die with it
     res = parse_output(stdout, stderr, proc.returncode)
@@ -737,12 +755,118 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def state_dir() -> pathlib.Path:
+    base = pathlib.Path(enforce_isolation(os.getenv("DELEGATE_GEMINI_STATE_DIR") or os.path.expanduser("~/.gemini-jobs")))
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.lstat(base)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise OSError(f"state dir {base} is not a private directory owned by us")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(base, 0o700)
+    return base
+
+
+def write_json_atomic(path, data) -> None:
+    path = pathlib.Path(path)
+    fd, tmp = tempfile.mkstemp(prefix=".jobs-", dir=enforce_isolation(path.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def _owner_lock(base, sid):
+    fd = os.open(base / f"owner.{sid}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fh = os.fdopen(fd, "r+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return None
+    return fh
+
+
 class GeminiJobs:
     def __init__(self) -> None:
+        if getattr(self, "owner_fh", None):
+            self.owner_fh.close()
+        self.loaded = False
+        self.sid = f"{os.getpid()}-{uuid.uuid4().hex[:6]}"
+        self.owner_fh = None
         self.jobs: dict[str, dict] = {}
         self.queue: deque[str] = deque()
         self.rt: dict[str, dict] = {}  # id -> {"task", "proc", "atask"}
         sweep_stale_agy_homes()
+
+    def state_file(self) -> str:
+        return str(state_dir() / f"jobs.{self.sid}.json")
+
+    def save(self) -> bool:
+        try:
+            for j in self.jobs.values():
+                j.update(metadata(j, _words))
+            data = {"v": 1, "server": {"sid": self.sid, "pid": os.getpid(), "saved_at": time.time()},
+                    "jobs": {jid: {k: (_words(j.get(k)) if k == "final_response" else j.get(k))
+                                   for k in PUBLIC_FIELDS} for jid, j in self.jobs.items()}}
+            write_json_atomic(self.state_file(), data)
+            return True
+        except OSError as e:
+            persist_failed(self.jobs, "gemini", e)
+            return False
+
+    def ensure_loaded(self) -> None:
+        if self.loaded:
+            return
+        try:
+            base = state_dir()
+            self.owner_fh = _owner_lock(base, self.sid)
+            if self.owner_fh is None:
+                raise OSError("gemini owner lock unavailable")
+        except OSError as e:
+            persist_failed(self.jobs, "gemini", e)
+            return
+        self.loaded = True
+        for path in sorted(base.glob("jobs.*.json")):
+            sid = path.name[5:-5]
+            if sid == self.sid:
+                continue
+            try:
+                lk = _owner_lock(base, sid)
+            except OSError:
+                continue
+            if lk is None:
+                continue
+            try:
+                try:
+                    data = read_json(path)
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(data, dict) or not isinstance(data.get("jobs"), dict):
+                    continue
+                for jid, raw in data["jobs"].items():
+                    clean = sanitize_snapshot(jid, raw)
+                    if clean is None:
+                        continue
+                    j = {k: clean[k] for k in PUBLIC_FIELDS if k in clean}
+                    j["id"] = jid
+                    if j["status"] not in TERMINAL:
+                        j.update(status="killed_on_restart", finished_at=time.time(),
+                                 error="owner server restarted; previous job cannot be resumed; check the workdir")
+                    self.jobs.setdefault(jid, j)
+                # Save the adopted snapshot BEFORE removing the dead session's file.
+                if self.save():
+                    path.unlink()
+            except OSError as e:
+                persist_failed(self.jobs, "gemini", e)
+            finally:
+                lk.close()
 
     def _max_concurrent(self) -> int:
         return _env_int("DELEGATE_GEMINI_MAX_CONCURRENT", 4)
@@ -761,6 +885,8 @@ class GeminiJobs:
             v["elapsed_s"] = round((j.get("finished_at") or now) - j["started_at"], 1)
         elif j["status"] == "queued":
             v["queued_s"] = round(now - j["submitted_at"], 1)
+        v.update(metadata(j, _words))
+        v["owner"] = {"sid": self.sid, "pid": os.getpid(), "alive": True}
         return v
 
     # ── submit ──
@@ -775,7 +901,7 @@ class GeminiJobs:
             err, norm = validate(t.get("task"), t.get("workdir", "."), t.get("effort", DEFAULT_EFFORT),
                                  t.get("timeout_s", DEFAULT_TIMEOUT_S), t.get("family", DEFAULT_FAMILY))
             if err:
-                errors.append({"index": i, "error": err["error"]})
+                errors.append({"index": i, **err})
             else:
                 planned.append((i, t["task"], norm))
         if errors:
@@ -784,6 +910,7 @@ class GeminiJobs:
             return {"success": False, "error": "agy binary no encontrado (brew install --cask antigravity-cli)"}
         if len(self.queue) + len(planned) > self._max_queue():
             return {"success": False, "error": f"cola llena (máx {self._max_queue()} en espera)"}
+        self.ensure_loaded()
         out = []
         for i, task, norm in planned:
             jid = f"gm-{uuid.uuid4().hex[:10]}"
@@ -799,8 +926,9 @@ class GeminiJobs:
             out.append({"index": i, "id": jid, "status": "queued"})
         self._pump()
         self._trim()
+        self.save()
         return {"jobs": [{**o, "status": self.jobs[o["id"]]["status"]} for o in out],
-                "max_concurrent": self._max_concurrent()}
+                "max_concurrent": self._max_concurrent(), **watch_fields(o["id"] for o in out)}
 
     def _running(self) -> list[dict]:
         return [j for j in self.jobs.values() if j["status"] == "running"]
@@ -825,6 +953,7 @@ class GeminiJobs:
             n += 1
             rt = self.rt[jid]
             rt["atask"] = asyncio.ensure_future(self._run(jid))
+        self.save()
 
     async def _run(self, jid: str) -> None:
         j, rt = self.jobs[jid], self.rt[jid]
@@ -835,10 +964,12 @@ class GeminiJobs:
         def on_proc(proc):
             rt["proc"] = proc
             j["pid"] = proc.pid
+            self.save()
         try:
             res = await run_agy(rt["task"], norm, on_proc)
             rt["result"] = res
             if j["status"] == "running":
+                j["failure_kind"] = res.get("failure_kind")
                 j["exit_code"] = res.get("exit_code")
                 j["conversation_id"] = res.get("conversation_id")
                 j["usage"] = res.get("usage")
@@ -854,7 +985,7 @@ class GeminiJobs:
             if j["status"] == "running":
                 j["status"], j["error"] = "cancelled", "cancelled"
         except Exception as e:  # noqa: BLE001
-            j["status"], j["error"] = "failed", f"{e.__class__.__name__}: {redact(str(e))[:200]}"
+            j["status"], j["error"] = "failed", redacted_exception(e)
         finally:
             j["finished_at"] = time.time()
             rt["task"] = ""
@@ -873,7 +1004,7 @@ class GeminiJobs:
         sub = await self.submit([{"task": task, "workdir": workdir, "effort": effort,
                                   "timeout_s": timeout_s, "family": family}])
         if "jobs" not in sub or "id" not in (sub["jobs"][0] if sub["jobs"] else {}):
-            return sub if not sub.get("jobs") else {"success": False, "error": sub["jobs"][0].get("error", sub.get("error"))}
+            return sub if not sub.get("jobs") else {"success": False, **sub["jobs"][0]}
         jid = sub["jobs"][0]["id"]
         rt = self.rt[jid]
         try:
@@ -891,8 +1022,17 @@ class GeminiJobs:
     async def poll(self, ids: list[str]) -> dict:
         if not isinstance(ids, list):
             return {"success": False, "error": "ids debe ser una lista"}
-        return {"jobs": [self.view(self.jobs[i]) if isinstance(i, str) and i in self.jobs
-                         else {"id": i, "status": "unknown"} for i in ids]}
+        self.ensure_loaded()
+        base = pathlib.Path(enforce_isolation(os.getenv("DELEGATE_GEMINI_STATE_DIR") or os.path.expanduser("~/.gemini-jobs")))
+        remote = remote_jobs(base, [i for i in ids if isinstance(i, str) and i not in self.jobs], self.sid)
+        out = []
+        for jid in ids:
+            if isinstance(jid, str) and jid in self.jobs:
+                out.append(self.view(self.jobs[jid]))
+            else:
+                out.append(remote.get(jid, {"id": jid, "status": "unknown"}) if isinstance(jid, str)
+                           else {"id": jid, "status": "unknown"})
+        return {"jobs": out}
 
     async def cancel(self, jid: str) -> dict:
         j = self.jobs.get(jid) if isinstance(jid, str) else None
@@ -918,6 +1058,7 @@ class GeminiJobs:
                 atask.cancel()
                 await asyncio.wait({atask}, timeout=15)
             j.setdefault("finished_at", time.time())
+        self.save()
         return self.view(j)
 
     def kill_all(self) -> None:

@@ -26,6 +26,7 @@ import time
 import uuid
 from collections import deque
 
+from delegate_state import enforce_isolation, isolation_environment, redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata, persist_failed, owner_alive, watch_fields
 from gemini_jobs import redact
 
 MAX_TIMEOUT_S = 7200
@@ -45,7 +46,7 @@ REFUSED_AUTOMATED = ("mimo", "xiaomi")
 DENIED_DIRS = (".ssh", ".gnupg", ".aws", ".config", ".claude", "Library")
 PUBLIC_FIELDS = ("id", "status", "model", "workdir", "timeout_s", "task_preview", "submitted_at",
                  "started_at", "finished_at", "pid", "error", "final_response", "project", "root",
-                 "queue_reason", "exit_code", "diff_stat", "tokens", "wall_s", "out_dir")
+                 "queue_reason", "exit_code", "diff_stat", "tokens", "wall_s", "out_dir") + METADATA_FIELDS
 
 
 def _env_int(name: str, default: int) -> int:
@@ -60,7 +61,7 @@ class Config:
 
     @property
     def state_dir(self) -> str:
-        return os.getenv("DELEGATE_DSH_STATE_DIR") or os.path.expanduser("~/.dsh-jobs")
+        return enforce_isolation(os.getenv("DELEGATE_DSH_STATE_DIR") or os.path.expanduser("~/.dsh-jobs"))
 
     @property
     def max_concurrent(self) -> int:
@@ -141,6 +142,14 @@ def _release(locks) -> None:
             fh.close()
         except OSError:
             pass
+
+
+def child_env() -> dict[str, str]:
+    env = {k: os.environ[k] for k in ("PATH", "HOME", "USER", "LANG", "TMPDIR") if k in os.environ}
+    for k in ("NEOLA_DSH_PHI_URL", "NEOLA_DSH_PHI_KEY_FILE", "DELEGATE_BIFROST_URL"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    return env | isolation_environment()
 
 
 def state_dir() -> pathlib.Path:
@@ -277,10 +286,10 @@ class DshJobs:
         held: list = []
         try:
             base = state_dir()
-            slots = base / "slots"
+            slots = enforce_isolation(base / "slots")
             slots.mkdir(mode=0o700, exist_ok=True)
-            (base / "wd").mkdir(mode=0o700, exist_ok=True)
-            proj = slots / f"proj-{hashlib.sha1(project.encode()).hexdigest()}"
+            enforce_isolation(base / "wd").mkdir(mode=0o700, exist_ok=True)
+            proj = enforce_isolation(slots / f"proj-{hashlib.sha1(project.encode()).hexdigest()}")
             proj.mkdir(mode=0o700, exist_ok=True)
             wd = _flock_try(base / "wd" / f"{hashlib.sha1(root.encode()).hexdigest()}.lock")
             if wd is None:
@@ -297,7 +306,7 @@ class DshJobs:
                     return None
         except OSError as e:
             _release(held)
-            raise DshLockError(f"almacén de locks dsh no disponible: {e}") from e
+            raise DshLockError(f"almacén de locks dsh no disponible: {redacted_exception(e)}") from e
         return held
 
     async def stagger(self) -> None:
@@ -332,12 +341,14 @@ class DshJobs:
             for j in fin[:-JOBS_KEEP]:
                 self.jobs.pop(j["id"], None)
                 self.rt.pop(j["id"], None)
+            for j in self.jobs.values():
+                j.update(metadata(j, truncate_words))
             data = {"v": 1, "server": {"sid": self.sid, "pid": os.getpid(), "saved_at": time.time()},
                     "jobs": {jid: {k: (truncate_words(j.get(k)) if k == "final_response" else j.get(k))
                                    for k in PUBLIC_FIELDS} for jid, j in self.jobs.items()}}
             write_json_atomic(self.state_file(), data)
-        except OSError:
-            pass
+        except OSError as e:
+            persist_failed(self.jobs, "dsh", e)
 
     def ensure_loaded(self) -> None:
         """Take our liveness lock; adopt job files of DEAD sessions (owner lock free) marking
@@ -419,10 +430,7 @@ class DshJobs:
                 rj = raw.get(jid) if isinstance(raw, dict) else None
                 if isinstance(rj, dict):
                     if alive is None:
-                        lk = _flock_try(base / f"owner.{sid}.lock")
-                        alive = lk is None
-                        if lk is not None:
-                            lk.close()
+                        alive = owner_alive(base, sid)
                     v = self.view({k: rj.get(k) for k in PUBLIC_FIELDS} | {"id": jid})
                     v["owner"] = {"sid": sid, "alive": alive}
                     if not alive and v["status"] in ("queued", "running"):
@@ -443,6 +451,7 @@ class DshJobs:
             v["queue_reason"] = j.get("queue_reason")
         if j.get("final_response"):
             v["final_response"] = truncate_words(j["final_response"])
+        v.update(metadata(j, truncate_words))
         v["summary_untrusted"] = True
         v["owner"] = {"sid": self.sid, "pid": os.getpid(), "alive": True}
         return v
@@ -465,6 +474,8 @@ class DshJobs:
         if not isinstance(wd, str) or not os.path.isdir(os.path.expanduser(wd)):
             return None, f"workdir no es un directorio existente: {wd!r}"
         real = os.path.realpath(os.path.expanduser(wd))
+        if workdir_forbidden(real):
+            return None, "workdir_forbidden: workdir overlaps a protected job-state directory"
         home = os.path.expanduser("~")
         for d in DENIED_DIRS:
             p = os.path.join(home, d)
@@ -482,7 +493,9 @@ class DshJobs:
         for i, t in enumerate(tasks):
             p, err = self.validate(t)
             if err:
-                errors.append({"index": i, "error": err})
+                errors.append({"index": i, "error": err,
+                               **({"failure_kind": "workdir_forbidden"}
+                                  if err.startswith("workdir_forbidden:") else {})})
             else:
                 p["index"] = i
                 p["ident"] = identity(p["workdir"])
@@ -500,7 +513,7 @@ class DshJobs:
                 for i, p in enumerate(planned):
                     reserved[i] = self.try_locks(*p["ident"])
         except DshLockError as e:
-            return {"success": False, "error": f"admisión cerrada (fail closed): {e}"}
+            return {"success": False, "error": f"admisión cerrada (fail closed): {redacted_exception(e)}"}
         waiting = len(self.queue) + sum(1 for r in reserved if r is None)
         if waiting > CFG.max_queue:
             for r in reserved:
@@ -527,7 +540,7 @@ class DshJobs:
             e["status"] = self.jobs[e["id"]]["status"]
         self.save()
         return {"jobs": out, "max_concurrent": CFG.max_concurrent,
-                "max_per_project": CFG.max_per_project}
+                "max_per_project": CFG.max_per_project, **watch_fields(e["id"] for e in out)}
 
     # ── scheduling ─────────────────────────────────────────────────────────────────
     def start(self, jid: str, locks: list) -> None:
@@ -563,7 +576,7 @@ class DshJobs:
         except DshLockError as e:
             while self.queue:
                 jid = self.queue.popleft()
-                self.jobs[jid].update(status="failed", error=f"admisión cerrada: {e}", finished_at=time.time())
+                self.jobs[jid].update(status="failed", error=f"admisión cerrada: {redacted_exception(e)}", finished_at=time.time())
             return
         started = False
         for jid in list(self.queue):
@@ -572,7 +585,7 @@ class DshJobs:
                 locks = self.try_locks(j["project"], j["root"])
             except DshLockError as e:
                 self.queue.remove(jid)
-                j.update(status="failed", error=f"admisión cerrada: {e}", finished_at=time.time())
+                j.update(status="failed", error=f"admisión cerrada: {redacted_exception(e)}", finished_at=time.time())
                 continue
             if locks is None:
                 j["queue_reason"] = "waiting_for_slot"
@@ -596,7 +609,7 @@ class DshJobs:
     # ── running one job ──────────────────────────────────────────────────────────
     async def runner(self, jid: str) -> None:
         j, rt = self.jobs[jid], self.rt[jid]
-        run_dir = state_dir() / "runs" / jid
+        run_dir = enforce_isolation(state_dir() / "runs" / jid)
         run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         task_file = run_dir / "task.md"
         fd = os.open(task_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -611,10 +624,7 @@ class DshJobs:
         try:
             await self.stagger()
             j["started_at"] = time.time()  # timeout counts from the real launch
-            env = {k: os.environ[k] for k in ("PATH", "HOME", "USER", "LANG", "TMPDIR") if k in os.environ}
-            for k in ("NEOLA_DSH_PHI_URL", "NEOLA_DSH_PHI_KEY_FILE", "DELEGATE_BIFROST_URL"):
-                if k in os.environ:
-                    env[k] = os.environ[k]
+            env = child_env()
             lock_fds = tuple(fh.fileno() for fh in rt["locks"] or [])
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
@@ -668,10 +678,10 @@ class DshJobs:
                     await proc.wait()
             j["status"], j["error"] = "cancelled", "cancelled"
             raise
-        except FileNotFoundError:
-            j.update(status="failed", error=f"launcher no encontrado: {CFG.launcher}")
+        except FileNotFoundError as e:
+            j.update(status="failed", error=f"launcher no encontrado: {redacted_exception(e)}")
         except Exception as e:  # noqa: BLE001 - a job error must never kill the server
-            j.update(status="failed", error=f"{type(e).__name__}: {e}")
+            j.update(status="failed", error=redacted_exception(e))
         finally:
             if proc is not None and not rt.get("teardown_confirmed"):
                 await self.teardown_processes(j, rt)
@@ -828,7 +838,7 @@ class DshJobs:
 
     async def stop_run(self, j: dict, rt: dict) -> None:
         rt["teardown_pending"] = True
-        out = pathlib.Path(j["out_dir"])
+        out = pathlib.Path(enforce_isolation(j["out_dir"]))
         out.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(out / "cancel", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         os.close(fd)
@@ -869,7 +879,9 @@ class DshJobs:
         # result.json is written last and atomically: "ok" is the source of truth. The launcher's own rc
         # only vetoes it when dsh-herdr.sh exited by itself with an error; a waiter we had to kill
         # (negative rc) after the result was already on disk does not.
-        if st == "ok" and (rc == 0 or waiter_killed):
+        if st == "ok" and isinstance(res.get("rc"), int) and res["rc"] != 0:
+            j.update(status="failed", failure_kind="nonzero_rc", error=f"dsh status=ok but dsh rc={res['rc']}")
+        elif st == "ok" and (rc == 0 or waiter_killed):
             j["status"] = "done"
         elif st == "cancelled":
             j["status"], j["error"] = "cancelled", "dsh reportó cancelled"

@@ -771,7 +771,9 @@ def test_h3_job_cannot_list_read_or_replace_another_jobs_home(tmp_path, request)
     assert run(f"echo ok > '{a}/.gemini/own.txt' && cat '{a}/.gemini/own.txt'").stdout.strip() == "ok"
 
 
-def test_agy_homes_parent_refuses_symlink_and_foreign(tmp_path):
+def test_agy_homes_parent_refuses_symlink_and_foreign(tmp_path, monkeypatch):
+    # Exercise production path semantics; the test guard canonicalizes safe aliases.
+    monkeypatch.delenv('DELEGATE_TEST_ISOLATION')
     home = tmp_path / "h"
     (home / "Library" / "Caches").mkdir(parents=True)
     target = tmp_path / "elsewhere"

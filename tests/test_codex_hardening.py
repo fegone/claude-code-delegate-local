@@ -147,6 +147,8 @@ async def test_orphan_codex_killed_on_restart(env):
     p, out = _spawn_fake_job(env, wd)
     try:
         pstart = server._ps_field(p.pid, "lstart")
+        if not pstart:
+            pytest.skip("process inspection unavailable: sandbox denies ps; orphan identity cannot be verified")
         _dead_session_file(env, {"cx-orphan": _job(p.pid, wd, out_file=out, pstart=pstart)})
         r = (await server.poll_codex(["cx-orphan"]))["jobs"][0]
         assert r["status"] == "killed_on_restart"

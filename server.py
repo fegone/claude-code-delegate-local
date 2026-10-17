@@ -14,6 +14,8 @@ License: MIT
 """
 from __future__ import annotations
 
+from delegate_state import enforce_isolation, isolation_environment, IsolationViolation, redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata as job_metadata, persist_failed, owner_alive, watch_fields, sanitize_metadata
+
 import asyncio
 import atexit
 import fcntl
@@ -1115,7 +1117,7 @@ def _child_env(extra: tuple[str, ...] = ()) -> dict[str, str]:
     return {
         k: v for k, v in os.environ.items()
         if k in allowed or k.startswith(_ENV_ALLOWLIST_PREFIXES)
-    }
+    } | isolation_environment()
 
 
 # ── Semáforo CROSS-PROCESS ───────────────────────────────────────────────────
@@ -1141,10 +1143,10 @@ CROSS_PROCESS_SLOTS = os.getenv("DELEGATE_CROSS_PROCESS_SLOTS", "1").lower() not
 # 🔒 Lo que se escribe es METADATO Y NADA MAS: ni la tarea, ni la respuesta, ni rutas
 # del proyecto. Este fichero vive en el disco del que despacha y no debe poder
 # reconstruir el trabajo — menos aun en los proyectos con PHI.
-_LOG_PATH = pathlib.Path(
+_LOG_PATH = pathlib.Path(enforce_isolation(
     os.getenv("DELEGATE_LOG_PATH",
               os.path.expanduser("~/.cache/claude-delegate-local/dispatches.jsonl"))
-)
+))
 _LOG_MAX_BYTES = int(os.getenv("DELEGATE_LOG_MAX_BYTES", str(8 * 1024 * 1024)))
 _LOG_FIELDS = (
     "success", "model", "response_model", "fallback_note", "terminal_text", "agent_name", "agent_source",
@@ -1179,24 +1181,27 @@ def _log_dispatch(result: dict, requested: str, bucket: str, queued_s: float) ->
         # Lo que la auditoria queria contar: exito certificado por un turno anterior.
         if result.get("success") and result.get("terminal_text") is False:
             rec["hollow_success"] = True
-        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        log_path = pathlib.Path(enforce_isolation(_LOG_PATH))
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         # Rotacion de un solo archivo: al pasar el tope se renombra a .1 (se pisa el
         # anterior). Sin hilos ni dependencias; si se pierde una linea en la carrera,
         # se pierde una linea de telemetria, no trabajo.
         try:
-            if _LOG_PATH.exists() and _LOG_PATH.stat().st_size > _LOG_MAX_BYTES:
-                _LOG_PATH.replace(_LOG_PATH.with_suffix(".jsonl.1"))
+            if log_path.exists() and log_path.stat().st_size > _LOG_MAX_BYTES:
+                log_path.replace(log_path.with_suffix(".jsonl.1"))
         except OSError:
             pass
-        with _LOG_PATH.open("a", encoding="utf-8") as fh:
+        with log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    except IsolationViolation:
+        raise
     except Exception:  # noqa: BLE001 — telemetria jamas rompe un despacho
         pass
 
 
-_SLOT_DIR = pathlib.Path(
+_SLOT_DIR = pathlib.Path(enforce_isolation(
     os.getenv("DELEGATE_SLOT_DIR", os.path.expanduser("~/.cache/claude-delegate-local/slots"))
-)
+))
 _SLOT_POLL = float(os.getenv("DELEGATE_SLOT_POLL", "0.5"))
 
 
@@ -1216,7 +1221,7 @@ async def _cross_process_slot(bucket: str, limit: int, wait_max: float):
         yield
         return
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", bucket) or "_default"
-    d = _SLOT_DIR / safe
+    d = enforce_isolation(_SLOT_DIR / safe)
     try:
         d.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -1227,7 +1232,8 @@ async def _cross_process_slot(bucket: str, limit: int, wait_max: float):
     fh = None
     while fh is None:
         for i in range(limit):
-            f = open(d / f"slot-{i}", "a+")
+            fd = os.open(d / f"slot-{i}", os.O_RDWR | os.O_NOFOLLOW | os.O_CREAT | os.O_APPEND, 0o600)
+            f = os.fdopen(fd, "a+")
             try:
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fh = f
@@ -3267,7 +3273,7 @@ async def delegate_to_codex(
     try:
         locks = await _codex_wait_locks(workdir_abs)
     except CodexLockError as e:
-        return {"success": False, "error": f"admisión cerrada (fail closed): {e}"}
+        return {"success": False, "error": f"admisión cerrada (fail closed): {redacted_exception(e)}"}
     if locks is None:
         return {"success": False,
                 "error": f"sin slot de Codex libre tras {CODEX_LOCK_WAIT_S:.0f}s (límite compartido entre sesiones)"}
@@ -3283,7 +3289,7 @@ async def delegate_to_codex(
             pass_fds=tuple(h.fileno() for h in locks),
         )
     except CodexLockError as e:
-        return {"success": False, "error": f"admisión cerrada (fail closed): {e}"}
+        return {"success": False, "error": f"admisión cerrada (fail closed): {redacted_exception(e)}"}
     finally:
         _codex_release(locks)
     # Share what this run learned with every other server (no automatic retry here: the
@@ -3294,7 +3300,7 @@ async def delegate_to_codex(
         elif res.get("failure_kind") == "auth":
             _codex_mark_auth_failed()
     except CodexLockError as e:
-        logging.getLogger(__name__).warning("codex shared state not updated: %s", e)
+        logging.getLogger(__name__).warning("codex shared state not updated: %s", redacted_exception(e))
     if warning:
         res["warning"] = warning
     return res
@@ -3318,7 +3324,7 @@ async def _codex_wait_locks(workdir_abs: str) -> list | None:
 def _codex_denied_dirs(home: str) -> set:
     names = (".ssh", ".codex", ".claude", ".aws", ".config", ".gnupg", "Library", ".codex-jobs")
     out = {os.path.realpath(os.path.join(home, n)) for n in names}
-    out.add(os.path.realpath(CODEX_STATE_DIR))
+    out.add(os.path.realpath(_codex_state_base()))
     return out
 
 
@@ -3344,6 +3350,9 @@ async def _validate_codex_request(
     if not os.path.isdir(workdir_abs):
         return {"success": False, "error": f"workdir no existe: {workdir_abs}"}, norm
     real = os.path.realpath(workdir_abs)
+    if workdir_forbidden(real, (CODEX_STATE_DIR,)):
+        return {"success": False, "failure_kind": "workdir_forbidden",
+                "error": "workdir sensible: overlaps a protected job-state directory"}, norm
     home = os.path.realpath(os.path.expanduser("~"))
     if real in ("/", home) or any(
         real == p or real.startswith(p + os.sep)
@@ -3473,10 +3482,10 @@ async def _run_codex_job(
     CODEX_HOME) to avoid SQLite contention between parallel agents."""
     sqlite_home = ""
     try:
-        sqlite_home = str(_codex_state_dir() / "sqlite" / (job_id or f"run-{uuid.uuid4().hex[:12]}"))
+        sqlite_home = str(enforce_isolation(_codex_state_dir() / "sqlite" / (job_id or f"run-{uuid.uuid4().hex[:12]}")))
         os.makedirs(sqlite_home, mode=0o700, exist_ok=True)
     except OSError as e:
-        return {"success": False, "error": f"no se pudo crear el CODEX_SQLITE_HOME del job: {e}",
+        return {"success": False, "error": f"no se pudo crear el CODEX_SQLITE_HOME del job: {redacted_exception(e)}",
                 "failure_kind": "infra"}
     try:
         return await _run_codex_core(task, model, effort, workdir_abs, sandbox, timeout_s,
@@ -3546,6 +3555,10 @@ async def _run_codex_core(
         # the drain, etc. — must still kill the codex process tree and remove the temp file.
         # Listing only Timeout/Cancelled left orphaned processes on an unexpected exception.
         _kill_process_group(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
         _cleanup_file(out_file)
         raise
 
@@ -3666,8 +3679,9 @@ CODEX_POLL_CHARS = 4000
 CODEX_WATCHDOG_GRACE_S = 15.0
 CODEX_LOCK_WAIT_S = float(os.getenv("DELEGATE_CODEX_LOCK_WAIT_S", "600"))  # delegate_to_codex only
 # Private state dir (0700): per-server job files, slot locks, workdir locks.
-CODEX_STATE_DIR = os.getenv("DELEGATE_CODEX_STATE_DIR") or os.path.expanduser("~/.codex-jobs")
-CODEX_SESSIONS_DIR = os.getenv("DELEGATE_CODEX_SESSIONS_DIR") or os.path.expanduser("~/.codex/sessions")
+# Optional explicit override; otherwise resolve the environment on each call.
+CODEX_STATE_DIR: str | None = None
+CODEX_SESSIONS_DIR = enforce_isolation(os.getenv("DELEGATE_CODEX_SESSIONS_DIR") or os.path.expanduser("~/.codex/sessions"))
 CODEX_QUOTA_WARN = float(os.getenv("DELEGATE_CODEX_QUOTA_WARN", "85"))
 CODEX_MAX_PER_PROJECT = int(os.getenv("DELEGATE_CODEX_MAX_PER_PROJECT", "6"))  # project = git common dir
 CODEX_STAGGER_S = float(os.getenv("DELEGATE_CODEX_STAGGER_S", "2.5"))  # min gap between launches, account-wide
@@ -3689,7 +3703,7 @@ _CODEX_SECRET_FREE_FIELDS = (
     "submitted_at", "started_at", "finished_at", "pid", "error", "final_response",
     "out_file", "pstart", "project", "root", "queue_reason", "retry_count", "retry_at",
     "not_before", "last_activity", "exit_code", "session_id", "failure_kind",
-)
+) + METADATA_FIELDS
 
 _codex_jobs: dict[str, dict] = {}
 _codex_queue: deque = deque()
@@ -3702,8 +3716,13 @@ _codex_ticker: "asyncio.Task | None" = None
 _codex_hooks_installed = False
 
 
+def _codex_state_base() -> pathlib.Path:
+    return pathlib.Path(enforce_isolation(CODEX_STATE_DIR or os.getenv("DELEGATE_CODEX_STATE_DIR")
+                        or os.path.expanduser("~/.codex-jobs")))
+
+
 def _codex_state_dir() -> pathlib.Path:
-    d = pathlib.Path(CODEX_STATE_DIR)
+    d = _codex_state_base()
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
     st = os.lstat(d)
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
@@ -3823,7 +3842,7 @@ def _codex_state_dir_safe() -> pathlib.Path:
     try:
         return _codex_state_dir()
     except OSError as e:
-        raise CodexLockError(f"almacén de estado de Codex no disponible ({CODEX_STATE_DIR}): {e}") from e
+        raise CodexLockError(f"almacén de estado de Codex no disponible: {redacted_exception(e)}") from e
 
 
 def _codex_identity_fs(real: str) -> tuple[str, str]:
@@ -3947,6 +3966,7 @@ def _codex_sanitize_job(jid, j) -> dict | None:
     out["retry_count"] = rc if isinstance(rc, int) and not isinstance(rc, bool) and rc >= 0 else 0
     fr = j.get("final_response")
     out["final_response"] = fr if isinstance(fr, str) else None
+    out.update(sanitize_metadata(j))
     return out
 
 
@@ -4004,7 +4024,7 @@ def _codex_shared_read() -> dict:
     except FileNotFoundError:
         return {}
     except OSError as e:
-        raise CodexLockError(f"estado compartido de Codex ilegible: {e}") from e
+        raise CodexLockError(f"estado compartido de Codex ilegible: {redacted_exception(e)}") from e
     try:
         d = json.loads(raw)
     except ValueError:
@@ -4030,7 +4050,7 @@ def _codex_shared_update(fn):
     try:
         fh = _flock_open(base / "shared.lock")
     except OSError as e:
-        raise CodexLockError(f"lock del estado compartido no disponible: {e}") from e
+        raise CodexLockError(f"lock del estado compartido no disponible: {redacted_exception(e)}") from e
     try:
         deadline = time.time() + 5
         while True:
@@ -4046,7 +4066,7 @@ def _codex_shared_update(fn):
         _write_json_atomic(base / "shared.json", st)
         return res
     except OSError as e:
-        raise CodexLockError(f"no se pudo escribir el estado compartido de Codex: {e}") from e
+        raise CodexLockError(f"no se pudo escribir el estado compartido de Codex: {redacted_exception(e)}") from e
     finally:
         fh.close()
 
@@ -4136,7 +4156,7 @@ def _codex_account_view() -> dict:
     try:
         g = _codex_gate()
     except CodexLockError as e:
-        return {"state": "storage_error", "error": str(e)}
+        return {"state": "storage_error", "error": redacted_exception(e)}
     out = {"state": g["state"], "effective_max_concurrent": g["eff_global"],
            "effective_max_per_project": g["eff_project"]}
     if g["message"]:
@@ -4163,10 +4183,10 @@ def _codex_try_locks(workdir: str, ident: tuple[str, str] | None = None,
     held: list = []
     try:
         base = _codex_state_dir()
-        slots = base / "slots"
+        slots = enforce_isolation(base / "slots")
         slots.mkdir(mode=0o700, exist_ok=True)
-        (base / "wd").mkdir(mode=0o700, exist_ok=True)
-        proj_dir = slots / f"proj-{hashlib.sha1(project.encode()).hexdigest()}"
+        enforce_isolation(base / "wd").mkdir(mode=0o700, exist_ok=True)
+        proj_dir = enforce_isolation(slots / f"proj-{hashlib.sha1(project.encode()).hexdigest()}")
         proj_dir.mkdir(mode=0o700, exist_ok=True)
         wd = _flock_try(base / "wd" / f"{hashlib.sha1(root.encode()).hexdigest()}.lock")
         if wd is None:
@@ -4183,7 +4203,7 @@ def _codex_try_locks(workdir: str, ident: tuple[str, str] | None = None,
                 return None
     except OSError as e:
         _codex_release(held)
-        raise CodexLockError(f"almacén de locks de Codex no disponible: {e}") from e
+        raise CodexLockError(f"almacén de locks de Codex no disponible: {redacted_exception(e)}") from e
     return held
 
 
@@ -4199,7 +4219,7 @@ def _codex_release(locks: list | None) -> None:
 # ── weekly quota (reads the rate_limits Codex itself logs in ~/.codex/sessions) ───────
 def _codex_weekly_used_percent() -> float | None:
     """Latest weekly (>= 7 days window) used_percent still inside its window, or None."""
-    root = pathlib.Path(CODEX_SESSIONS_DIR)
+    root = pathlib.Path(enforce_isolation(CODEX_SESSIONS_DIR))
     now = time.time()
     seen = 0
     try:
@@ -4265,6 +4285,8 @@ def _codex_save() -> None:
         for j in finished[:-CODEX_JOBS_KEEP]:
             _codex_jobs.pop(j["id"], None)
             _codex_rt.pop(j["id"], None)
+        for j in _codex_jobs.values():
+            j.update(job_metadata(j, _truncate_words))
         data = {
             "v": 2,
             "server": {"sid": _codex_sid, "pid": os.getpid(), "saved_at": time.time(),
@@ -4277,7 +4299,7 @@ def _codex_save() -> None:
         }
         _write_json_atomic(_codex_state_file(), data)
     except OSError as e:
-        logging.getLogger(__name__).warning("codex jobs file not written: %s", e)
+        persist_failed(_codex_jobs, "codex", e)
 
 
 def _codex_recover(j: dict) -> None:
@@ -4332,7 +4354,7 @@ def _codex_ensure_loaded() -> None:
     try:
         _codex_owner_fh = _flock_try(base / f"owner.{_codex_sid}.lock")
     except OSError as e:
-        logging.getLogger(__name__).warning("codex owner lock unavailable: %s", e)
+        logging.getLogger(__name__).warning("codex owner lock unavailable: %s", redacted_exception(e))
         _codex_owner_fh = None
     changed = False
     for f in sorted(base.glob("jobs.*.json")):
@@ -4367,7 +4389,7 @@ def _codex_ensure_loaded() -> None:
                         _codex_jobs[jid] = j
                         changed = True
             except Exception as e:  # noqa: BLE001 - a bad file must never break this server
-                logging.getLogger(__name__).warning("codex state file %s unusable: %s", f.name, e)
+                logging.getLogger(__name__).warning("codex state file %s unusable: %s", f.name, redacted_exception(e))
                 bad = True
             if bad:
                 _quarantine(f)  # keep the evidence, take it out of the way
@@ -4398,7 +4420,7 @@ def _codex_fail_queued(err: Exception) -> None:
         j = _codex_jobs.get(jid)
         _codex_queue.remove(jid)
         if j is not None and j["status"] == "queued":
-            j["status"], j["error"], j["failure_kind"] = "failed", str(err), "infra"
+            j["status"], j["error"], j["failure_kind"] = "failed", redacted_exception(err), "infra"
             j["finished_at"] = time.time()
             if jid in _codex_rt:
                 _codex_rt[jid]["task"] = ""
@@ -4445,7 +4467,7 @@ def _codex_pump(from_ticker: bool = False) -> None:
     try:
         gate = _codex_gate()
     except CodexLockError as e:
-        logging.getLogger(__name__).warning("codex admission closed: %s", e)
+        logging.getLogger(__name__).warning("codex admission closed: %s", redacted_exception(e))
         _codex_fail_queued(e)
         _codex_save()
         return
@@ -4460,6 +4482,11 @@ def _codex_pump(from_ticker: bool = False) -> None:
             continue
         if gate["state"] == "auth_failed":
             j["queue_reason"] = "auth_failed"
+            if now - (j.get("submitted_at") or now) > 120:
+                j.update(status="failed", failure_kind="auth", error=CODEX_AUTH_MESSAGE, finished_at=now)
+                _codex_queue.remove(jid)
+                if jid in _codex_rt:
+                    _codex_rt[jid]["task"] = ""
             continue
         if gate["state"] == "cooldown" or (j.get("not_before") or 0) > now:
             j["queue_reason"] = "throttle_cooldown"
@@ -4531,12 +4558,12 @@ def _codex_apply_result(jid: str, j: dict, rt: dict, res: dict) -> None:
         try:
             _codex_mark_auth_failed()
         except CodexLockError as e:
-            logging.getLogger(__name__).warning("auth_failed not recorded: %s", e)
+            logging.getLogger(__name__).warning("auth_failed not recorded: %s", redacted_exception(e))
     elif kind == "throttle":
         try:
             delay = _codex_note_throttle(res, j)
         except CodexLockError as e:
-            j["status"], j["error"] = "failed", f"{err}; {e}"
+            j["status"], j["error"] = "failed", f"{err}; {redacted_exception(e)}"
             return
         if delay is None:
             j["status"] = "failed"
@@ -4589,10 +4616,10 @@ async def _codex_runner(jid: str) -> None:
             j["error"] = "cancelled"
             raise
     except CodexLockError as e:  # shared state unusable: fail closed
-        j["status"], j["error"], j["failure_kind"] = "failed", str(e), "infra"
+        j["status"], j["error"], j["failure_kind"] = "failed", redacted_exception(e), "infra"
     except Exception as e:  # noqa: BLE001 - a job must always reach a terminal state
         j["status"] = "failed"
-        j["error"] = f"{type(e).__name__}: {e}"
+        j["error"] = redacted_exception(e)
     finally:
         wd.cancel()
         if j["status"] != "queued":  # `queued` = put back for a throttle retry: keep its prompt
@@ -4604,14 +4631,7 @@ async def _codex_runner(jid: str) -> None:
 
 
 def _codex_owner_alive(base: pathlib.Path, sid: str) -> bool:
-    try:
-        lk = _flock_try(base / f"owner.{sid}.lock")
-    except OSError:
-        return False
-    if lk is None:
-        return True
-    lk.close()
-    return False
+    return owner_alive(base, sid)
 
 
 def _codex_remote_views(ids: list) -> dict:
@@ -4689,12 +4709,16 @@ def _codex_job_view(j: dict, owner: dict | None = None) -> dict:
         view["error"] = j["error"]
     if status in ("done", "failed", "timeout") and j.get("final_response"):
         view["final_response"] = _truncate_words(j["final_response"])
+    view.update(job_metadata(j, _truncate_words))
     return view
 
 
 @mcp.tool()
 async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dict:
     """
+    Start the returned `watch` command with Monitor (or Bash run_in_background) right now:
+    it is the only way you get notified when jobs end. Never rely on remembering to poll.
+
     Lanza una o varias tareas de Codex SIN esperar y devuelve los ids de inmediato; el
     orquestador sigue trabajando y consulta con `poll_codex(ids)`. Pensado para lanzar
     muchas tarjetas en paralelo (ver `delegate_to_codex` para una sola y bloqueante).
@@ -4751,7 +4775,7 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
             t.get("effort", CODEX_DEFAULT_EFFORT), sandbox,
         )
         if err:
-            errors.append({"index": i, "error": err["error"]})
+            errors.append({"index": i, **err})
             continue
         planned.append({"index": i, "task": task, "timeout_s": timeout_s, "sandbox": sandbox,
                         "model": model, "effort": effort, "workdir_abs": workdir_abs,
@@ -4777,7 +4801,7 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
                     reserved[i] = _codex_try_locks(p["workdir_abs"], p["ident"], gate)
         except CodexLockError as e:
             _drop_reservations()
-            return {"success": False, "error": f"admisión cerrada (fail closed): {e}"}
+            return {"success": False, "error": f"admisión cerrada (fail closed): {redacted_exception(e)}"}
         waiting = len(_codex_queue) + sum(1 for r in reserved if r is None)
         if waiting > CODEX_MAX_QUEUE:
             _drop_reservations()
@@ -4811,7 +4835,8 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
     _codex_pump()
     for entry in jobs_out:
         entry["status"] = _codex_jobs[entry["id"]]["status"]
-    out = {"jobs": jobs_out, "max_concurrent": CODEX_MAX_CONCURRENT, "account": _codex_account_view()}
+    out = {"jobs": jobs_out, "max_concurrent": CODEX_MAX_CONCURRENT, "account": _codex_account_view(),
+           **watch_fields(e["id"] for e in jobs_out)}
     if warning:
         out["warning"] = warning
     return out
@@ -4945,6 +4970,9 @@ async def delegate_to_gemini(
 @mcp.tool()
 async def submit_gemini(tasks: list[dict]) -> dict:
     """
+    Start the returned `watch` command with Monitor (or Bash run_in_background) right now:
+    it is the only way you get notified when jobs end. Never rely on remembering to poll.
+
     Lanza una o varias tareas de Gemini (agy) SIN esperar; devuelve ids de inmediato y se
     consultan con `poll_gemini(ids)`. Cada elemento: {task, workdir='.', effort='medium',
     timeout_s=900, family='gemini'}. family admite "gemini" (default, gemini-3.8-flash-*),
@@ -4982,6 +5010,9 @@ import dsh_jobs as _dsh_jobs
 @mcp.tool()
 async def submit_dsh(tasks: list[dict]) -> dict:
     """
+    Start the returned `watch` command with Monitor (or Bash run_in_background) right now:
+    it is the only way you get notified when jobs end. Never rely on remembering to poll.
+
     Lanza tareas de dsh (DeepSeek Harness en jaula, visible en Herdr) SIN esperar y devuelve
     ids; consulta con `poll_dsh(ids)`. Mismas reglas que `submit_codex`, con estado y topes
     PROPIOS (~/.dsh-jobs): modelos locales comparten una sola Mac Studio.

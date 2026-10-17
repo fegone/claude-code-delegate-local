@@ -606,6 +606,9 @@ async def test_sensitive_home_dirs_refused_as_workdir(env, monkeypatch, sub):
 
 
 def test_state_dir_symlink_refused(env, monkeypatch):
+    # Production preserves the original path and rejects directory symlinks.
+    # The enabled test guard instead returns a validated canonical destination.
+    monkeypatch.delenv('DELEGATE_TEST_ISOLATION')
     real = env / "realstate"
     real.mkdir()
     link = env / "linkstate"
