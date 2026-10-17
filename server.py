@@ -14,7 +14,7 @@ License: MIT
 """
 from __future__ import annotations
 
-from delegate_state import METADATA_FIELDS, metadata as job_metadata, persist_failed, owner_alive, watch_fields, sanitize_metadata
+from delegate_state import redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata as job_metadata, persist_failed, owner_alive, watch_fields, sanitize_metadata
 
 import asyncio
 import atexit
@@ -3269,7 +3269,7 @@ async def delegate_to_codex(
     try:
         locks = await _codex_wait_locks(workdir_abs)
     except CodexLockError as e:
-        return {"success": False, "error": f"admisión cerrada (fail closed): {e}"}
+        return {"success": False, "error": f"admisión cerrada (fail closed): {redacted_exception(e)}"}
     if locks is None:
         return {"success": False,
                 "error": f"sin slot de Codex libre tras {CODEX_LOCK_WAIT_S:.0f}s (límite compartido entre sesiones)"}
@@ -3285,7 +3285,7 @@ async def delegate_to_codex(
             pass_fds=tuple(h.fileno() for h in locks),
         )
     except CodexLockError as e:
-        return {"success": False, "error": f"admisión cerrada (fail closed): {e}"}
+        return {"success": False, "error": f"admisión cerrada (fail closed): {redacted_exception(e)}"}
     finally:
         _codex_release(locks)
     # Share what this run learned with every other server (no automatic retry here: the
@@ -3296,7 +3296,7 @@ async def delegate_to_codex(
         elif res.get("failure_kind") == "auth":
             _codex_mark_auth_failed()
     except CodexLockError as e:
-        logging.getLogger(__name__).warning("codex shared state not updated: %s", e)
+        logging.getLogger(__name__).warning("codex shared state not updated: %s", redacted_exception(e))
     if warning:
         res["warning"] = warning
     return res
@@ -3346,6 +3346,9 @@ async def _validate_codex_request(
     if not os.path.isdir(workdir_abs):
         return {"success": False, "error": f"workdir no existe: {workdir_abs}"}, norm
     real = os.path.realpath(workdir_abs)
+    if workdir_forbidden(real, (CODEX_STATE_DIR,)):
+        return {"success": False, "failure_kind": "workdir_forbidden",
+                "error": "workdir sensible: overlaps a protected job-state directory"}, norm
     home = os.path.realpath(os.path.expanduser("~"))
     if real in ("/", home) or any(
         real == p or real.startswith(p + os.sep)
@@ -3478,7 +3481,7 @@ async def _run_codex_job(
         sqlite_home = str(_codex_state_dir() / "sqlite" / (job_id or f"run-{uuid.uuid4().hex[:12]}"))
         os.makedirs(sqlite_home, mode=0o700, exist_ok=True)
     except OSError as e:
-        return {"success": False, "error": f"no se pudo crear el CODEX_SQLITE_HOME del job: {e}",
+        return {"success": False, "error": f"no se pudo crear el CODEX_SQLITE_HOME del job: {redacted_exception(e)}",
                 "failure_kind": "infra"}
     try:
         return await _run_codex_core(task, model, effort, workdir_abs, sandbox, timeout_s,
@@ -3831,7 +3834,7 @@ def _codex_state_dir_safe() -> pathlib.Path:
     try:
         return _codex_state_dir()
     except OSError as e:
-        raise CodexLockError(f"almacén de estado de Codex no disponible ({_codex_state_base()}): {e}") from e
+        raise CodexLockError(f"almacén de estado de Codex no disponible: {redacted_exception(e)}") from e
 
 
 def _codex_identity_fs(real: str) -> tuple[str, str]:
@@ -4013,7 +4016,7 @@ def _codex_shared_read() -> dict:
     except FileNotFoundError:
         return {}
     except OSError as e:
-        raise CodexLockError(f"estado compartido de Codex ilegible: {e}") from e
+        raise CodexLockError(f"estado compartido de Codex ilegible: {redacted_exception(e)}") from e
     try:
         d = json.loads(raw)
     except ValueError:
@@ -4039,7 +4042,7 @@ def _codex_shared_update(fn):
     try:
         fh = _flock_open(base / "shared.lock")
     except OSError as e:
-        raise CodexLockError(f"lock del estado compartido no disponible: {e}") from e
+        raise CodexLockError(f"lock del estado compartido no disponible: {redacted_exception(e)}") from e
     try:
         deadline = time.time() + 5
         while True:
@@ -4055,7 +4058,7 @@ def _codex_shared_update(fn):
         _write_json_atomic(base / "shared.json", st)
         return res
     except OSError as e:
-        raise CodexLockError(f"no se pudo escribir el estado compartido de Codex: {e}") from e
+        raise CodexLockError(f"no se pudo escribir el estado compartido de Codex: {redacted_exception(e)}") from e
     finally:
         fh.close()
 
@@ -4145,7 +4148,7 @@ def _codex_account_view() -> dict:
     try:
         g = _codex_gate()
     except CodexLockError as e:
-        return {"state": "storage_error", "error": str(e)}
+        return {"state": "storage_error", "error": redacted_exception(e)}
     out = {"state": g["state"], "effective_max_concurrent": g["eff_global"],
            "effective_max_per_project": g["eff_project"]}
     if g["message"]:
@@ -4192,7 +4195,7 @@ def _codex_try_locks(workdir: str, ident: tuple[str, str] | None = None,
                 return None
     except OSError as e:
         _codex_release(held)
-        raise CodexLockError(f"almacén de locks de Codex no disponible: {e}") from e
+        raise CodexLockError(f"almacén de locks de Codex no disponible: {redacted_exception(e)}") from e
     return held
 
 
@@ -4343,7 +4346,7 @@ def _codex_ensure_loaded() -> None:
     try:
         _codex_owner_fh = _flock_try(base / f"owner.{_codex_sid}.lock")
     except OSError as e:
-        logging.getLogger(__name__).warning("codex owner lock unavailable: %s", e)
+        logging.getLogger(__name__).warning("codex owner lock unavailable: %s", redacted_exception(e))
         _codex_owner_fh = None
     changed = False
     for f in sorted(base.glob("jobs.*.json")):
@@ -4378,7 +4381,7 @@ def _codex_ensure_loaded() -> None:
                         _codex_jobs[jid] = j
                         changed = True
             except Exception as e:  # noqa: BLE001 - a bad file must never break this server
-                logging.getLogger(__name__).warning("codex state file %s unusable: %s", f.name, e)
+                logging.getLogger(__name__).warning("codex state file %s unusable: %s", f.name, redacted_exception(e))
                 bad = True
             if bad:
                 _quarantine(f)  # keep the evidence, take it out of the way
@@ -4409,7 +4412,7 @@ def _codex_fail_queued(err: Exception) -> None:
         j = _codex_jobs.get(jid)
         _codex_queue.remove(jid)
         if j is not None and j["status"] == "queued":
-            j["status"], j["error"], j["failure_kind"] = "failed", str(err), "infra"
+            j["status"], j["error"], j["failure_kind"] = "failed", redacted_exception(err), "infra"
             j["finished_at"] = time.time()
             if jid in _codex_rt:
                 _codex_rt[jid]["task"] = ""
@@ -4456,7 +4459,7 @@ def _codex_pump(from_ticker: bool = False) -> None:
     try:
         gate = _codex_gate()
     except CodexLockError as e:
-        logging.getLogger(__name__).warning("codex admission closed: %s", e)
+        logging.getLogger(__name__).warning("codex admission closed: %s", redacted_exception(e))
         _codex_fail_queued(e)
         _codex_save()
         return
@@ -4547,12 +4550,12 @@ def _codex_apply_result(jid: str, j: dict, rt: dict, res: dict) -> None:
         try:
             _codex_mark_auth_failed()
         except CodexLockError as e:
-            logging.getLogger(__name__).warning("auth_failed not recorded: %s", e)
+            logging.getLogger(__name__).warning("auth_failed not recorded: %s", redacted_exception(e))
     elif kind == "throttle":
         try:
             delay = _codex_note_throttle(res, j)
         except CodexLockError as e:
-            j["status"], j["error"] = "failed", f"{err}; {e}"
+            j["status"], j["error"] = "failed", f"{err}; {redacted_exception(e)}"
             return
         if delay is None:
             j["status"] = "failed"
@@ -4605,10 +4608,10 @@ async def _codex_runner(jid: str) -> None:
             j["error"] = "cancelled"
             raise
     except CodexLockError as e:  # shared state unusable: fail closed
-        j["status"], j["error"], j["failure_kind"] = "failed", str(e), "infra"
+        j["status"], j["error"], j["failure_kind"] = "failed", redacted_exception(e), "infra"
     except Exception as e:  # noqa: BLE001 - a job must always reach a terminal state
         j["status"] = "failed"
-        j["error"] = f"{type(e).__name__}: {e}"
+        j["error"] = redacted_exception(e)
     finally:
         wd.cancel()
         if j["status"] != "queued":  # `queued` = put back for a throttle retry: keep its prompt
@@ -4764,7 +4767,7 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
             t.get("effort", CODEX_DEFAULT_EFFORT), sandbox,
         )
         if err:
-            errors.append({"index": i, "error": err["error"]})
+            errors.append({"index": i, **err})
             continue
         planned.append({"index": i, "task": task, "timeout_s": timeout_s, "sandbox": sandbox,
                         "model": model, "effort": effort, "workdir_abs": workdir_abs,
@@ -4790,7 +4793,7 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
                     reserved[i] = _codex_try_locks(p["workdir_abs"], p["ident"], gate)
         except CodexLockError as e:
             _drop_reservations()
-            return {"success": False, "error": f"admisión cerrada (fail closed): {e}"}
+            return {"success": False, "error": f"admisión cerrada (fail closed): {redacted_exception(e)}"}
         waiting = len(_codex_queue) + sum(1 for r in reserved if r is None)
         if waiting > CODEX_MAX_QUEUE:
             _drop_reservations()

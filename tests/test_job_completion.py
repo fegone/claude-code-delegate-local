@@ -57,7 +57,7 @@ async def test_gemini_roundtrip_cross_server_lost_restart(gm):
 @pytest.mark.parametrize('backend', ['codex', 'dsh', 'gemini'])
 async def test_persist_error_and_truncation(backend, gm, fake, env, monkeypatch, capsys):
     def broken(*args):
-        raise OSError('disk full')
+        raise OSError(28, 'disk full', '/private/secret-token')
     jid = {'codex': 'cx-one', 'dsh': 'dsh-one', 'gemini': 'gm-one'}[backend]
     j = job(jid)
     if backend == 'codex':
@@ -76,8 +76,9 @@ async def test_persist_error_and_truncation(backend, gm, fake, env, monkeypatch,
         monkeypatch.setattr(g, 'write_json_atomic', broken)
         gm.save()
         view = gm.view(j)
-    assert 'disk full' in view['persist_error']
-    assert 'disk full' in capsys.readouterr().err
+    assert 'No space left on device' in view['persist_error']
+    assert 'secret-token' not in view['persist_error']
+    assert 'No space left on device' in capsys.readouterr().err
     assert view['truncated'] is True
     assert view['final_response_length'] == len(j['final_response'])
     assert 'very_short_run' in view['warnings']

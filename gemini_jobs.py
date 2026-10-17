@@ -35,7 +35,7 @@ import time
 import uuid
 from collections import deque
 
-from delegate_state import METADATA_FIELDS, TERMINAL, metadata, persist_failed, remote_jobs, read_json, watch_fields, sanitize_snapshot
+from delegate_state import redacted_exception, workdir_forbidden, state_directories, METADATA_FIELDS, TERMINAL, metadata, persist_failed, remote_jobs, read_json, watch_fields, sanitize_snapshot
 
 EFFORTS = ("low", "medium", "high")
 DEFAULT_EFFORT = "medium"
@@ -146,6 +146,8 @@ def build_profile(workdir: str, home: str | None = None, tmp_dirs: tuple[str, ..
     L.append(f'(deny file-write* (literal "{_sb_path(os.path.join(wd, ".git"))}") '
              f'(subpath "{_sb_path(os.path.join(wd, ".git"))}")')
     L.append(f'  (regex #"^{re.escape(wd)}/(.*/)?\\.git(/.*)?$"))')
+    for protected in state_directories(home=home):
+        L.append(f'(deny file-write* (subpath "{_sb_path(protected)}"))')
     L += [
           "; reads: deny the WHOLE filesystem, then allow back a short list (round 3: /Volumes held a",
           "; Time Machine copy of HOME). stat() works everywhere except HOME, /Users and /Volumes.",
@@ -537,6 +539,9 @@ def validate(task, workdir, effort, timeout_s, family: str = DEFAULT_FAMILY) -> 
     if not os.path.isdir(wd):
         return {"success": False, "error": f"workdir no existe: {wd}"}, {}
     real = os.path.realpath(wd)
+    if workdir_forbidden(real):
+        return {"success": False, "failure_kind": "workdir_forbidden",
+                "error": "workdir overlaps a protected job-state directory"}, {}
     home = os.path.realpath(os.path.expanduser("~"))
     denied = {os.path.join(home, d) for d in DENIED_DIRS}
     if real in ("/", home) or any(real == p or real.startswith(p + os.sep) for p in denied):
@@ -660,7 +665,7 @@ async def run_agy(task: str, norm: dict, on_proc=None) -> dict:
             f.write(build_profile(norm["workdir"], git_dirs=git_dirs, agy_home=agy_home))
     except (OSError, ValueError) as e:
         shutil.rmtree(agy_home, ignore_errors=True)
-        return {"success": False, "error": f"no se pudo generar el perfil de sandbox: {e}"}
+        return {"success": False, "error": f"no se pudo generar el perfil de sandbox: {redacted_exception(e)}"}
     try:
         pre = await preflight(profile_path, norm["workdir"], git_dirs)
         if pre:
@@ -887,7 +892,7 @@ class GeminiJobs:
             err, norm = validate(t.get("task"), t.get("workdir", "."), t.get("effort", DEFAULT_EFFORT),
                                  t.get("timeout_s", DEFAULT_TIMEOUT_S), t.get("family", DEFAULT_FAMILY))
             if err:
-                errors.append({"index": i, "error": err["error"]})
+                errors.append({"index": i, **err})
             else:
                 planned.append((i, t["task"], norm))
         if errors:
@@ -971,7 +976,7 @@ class GeminiJobs:
             if j["status"] == "running":
                 j["status"], j["error"] = "cancelled", "cancelled"
         except Exception as e:  # noqa: BLE001
-            j["status"], j["error"] = "failed", f"{e.__class__.__name__}: {redact(str(e))[:200]}"
+            j["status"], j["error"] = "failed", redacted_exception(e)
         finally:
             j["finished_at"] = time.time()
             rt["task"] = ""
@@ -990,7 +995,7 @@ class GeminiJobs:
         sub = await self.submit([{"task": task, "workdir": workdir, "effort": effort,
                                   "timeout_s": timeout_s, "family": family}])
         if "jobs" not in sub or "id" not in (sub["jobs"][0] if sub["jobs"] else {}):
-            return sub if not sub.get("jobs") else {"success": False, "error": sub["jobs"][0].get("error", sub.get("error"))}
+            return sub if not sub.get("jobs") else {"success": False, **sub["jobs"][0]}
         jid = sub["jobs"][0]["id"]
         rt = self.rt[jid]
         try:

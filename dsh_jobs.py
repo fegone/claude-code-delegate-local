@@ -26,7 +26,7 @@ import time
 import uuid
 from collections import deque
 
-from delegate_state import METADATA_FIELDS, metadata, persist_failed, owner_alive, watch_fields
+from delegate_state import redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata, persist_failed, owner_alive, watch_fields
 from gemini_jobs import redact
 
 MAX_TIMEOUT_S = 7200
@@ -298,7 +298,7 @@ class DshJobs:
                     return None
         except OSError as e:
             _release(held)
-            raise DshLockError(f"almacén de locks dsh no disponible: {e}") from e
+            raise DshLockError(f"almacén de locks dsh no disponible: {redacted_exception(e)}") from e
         return held
 
     async def stagger(self) -> None:
@@ -466,6 +466,8 @@ class DshJobs:
         if not isinstance(wd, str) or not os.path.isdir(os.path.expanduser(wd)):
             return None, f"workdir no es un directorio existente: {wd!r}"
         real = os.path.realpath(os.path.expanduser(wd))
+        if workdir_forbidden(real):
+            return None, "workdir_forbidden: workdir overlaps a protected job-state directory"
         home = os.path.expanduser("~")
         for d in DENIED_DIRS:
             p = os.path.join(home, d)
@@ -483,7 +485,9 @@ class DshJobs:
         for i, t in enumerate(tasks):
             p, err = self.validate(t)
             if err:
-                errors.append({"index": i, "error": err})
+                errors.append({"index": i, "error": err,
+                               **({"failure_kind": "workdir_forbidden"}
+                                  if err.startswith("workdir_forbidden:") else {})})
             else:
                 p["index"] = i
                 p["ident"] = identity(p["workdir"])
@@ -501,7 +505,7 @@ class DshJobs:
                 for i, p in enumerate(planned):
                     reserved[i] = self.try_locks(*p["ident"])
         except DshLockError as e:
-            return {"success": False, "error": f"admisión cerrada (fail closed): {e}"}
+            return {"success": False, "error": f"admisión cerrada (fail closed): {redacted_exception(e)}"}
         waiting = len(self.queue) + sum(1 for r in reserved if r is None)
         if waiting > CFG.max_queue:
             for r in reserved:
@@ -564,7 +568,7 @@ class DshJobs:
         except DshLockError as e:
             while self.queue:
                 jid = self.queue.popleft()
-                self.jobs[jid].update(status="failed", error=f"admisión cerrada: {e}", finished_at=time.time())
+                self.jobs[jid].update(status="failed", error=f"admisión cerrada: {redacted_exception(e)}", finished_at=time.time())
             return
         started = False
         for jid in list(self.queue):
@@ -573,7 +577,7 @@ class DshJobs:
                 locks = self.try_locks(j["project"], j["root"])
             except DshLockError as e:
                 self.queue.remove(jid)
-                j.update(status="failed", error=f"admisión cerrada: {e}", finished_at=time.time())
+                j.update(status="failed", error=f"admisión cerrada: {redacted_exception(e)}", finished_at=time.time())
                 continue
             if locks is None:
                 j["queue_reason"] = "waiting_for_slot"
@@ -669,10 +673,10 @@ class DshJobs:
                     await proc.wait()
             j["status"], j["error"] = "cancelled", "cancelled"
             raise
-        except FileNotFoundError:
-            j.update(status="failed", error=f"launcher no encontrado: {CFG.launcher}")
+        except FileNotFoundError as e:
+            j.update(status="failed", error=f"launcher no encontrado: {redacted_exception(e)}")
         except Exception as e:  # noqa: BLE001 - a job error must never kill the server
-            j.update(status="failed", error=f"{type(e).__name__}: {e}")
+            j.update(status="failed", error=redacted_exception(e))
         finally:
             if proc is not None and not rt.get("teardown_confirmed"):
                 await self.teardown_processes(j, rt)

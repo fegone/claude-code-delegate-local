@@ -10,6 +10,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `delegate-wait`: stdlib read-only completion watcher with streaming, `--all`, `--json`, timeout and dead-owner detection. Submit tools return a ready-to-run `watch` command for Monitor/background Bash notifications.
 - Gemini atomic per-server snapshots and owner locks in `~/.gemini-jobs`, cross-server polling, and dead-session `killed_on_restart` recovery.
 
+### Security
+- Sanitize and bound every watcher text field and nested JSON string; strip terminal controls, bidi/format controls and line separators.
+- Reject workdirs overlapping any provider's default/overridden state directory after realpath resolution (`workdir_forbidden`); explicitly deny state-directory writes in Gemini profiles.
+- Make the real-HOME guard attribute new state/cache entries to pytest and descendant PIDs, ignoring live foreign delegate writers; retain child PIDs at spawn and check the process tree at session end. PID-less entries require recent mtime and a test-process open-file owner. Add foreign/self/child PID regressions and two guard mutations.
+- Isolate test HOME/state/locks/sessions/caches before collection imports providers, with a real-HOME collection-only regression covering `Library/Caches/delegate-agy`.
+- Redact persistence and job-runner exceptions to class, errno and canonical OS description, omitting filenames and arguments. Offline guard-removal coverage: **41 mutations**.
+
 ### Fixed
 - All job pollers expose persistence errors (also stderr), truncation flags/full character lengths and `very_short_run` warnings; empty Codex completions warn `empty_response`.
 - Codex jobs queued over 120 seconds under account auth failure terminate with `failure_kind=auth`.

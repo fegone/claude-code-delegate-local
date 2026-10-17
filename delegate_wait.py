@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import time
 
-from delegate_state import TERMINAL, remote_jobs
+from delegate_state import TERMINAL, remote_jobs, safe_text, safe_output
 
 UNKNOWN_GRACE_S = 30
 
@@ -26,10 +26,11 @@ def read_jobs(ids) -> dict:
 
 
 def format_job(job: dict) -> str:
-    preview = ' '.join(str(job.get('final_response') or job.get('error') or '').split())[:110]
-    return (f"{job['id']} {job['status'].upper()} ({job.get('model') or '-'}, "
-            f"{job.get('elapsed_s', 0):.1f}s) kind={job.get('failure_kind') or '-'} "
-            f"warnings={','.join(job.get('warnings') or []) or '-'} {preview}").rstrip()
+    field = lambda value: safe_text(value, 256)
+    preview = safe_text(job.get('final_response') or job.get('error') or '', 110)
+    return (f"{field(job['id'])} {field(str(job['status']).upper())} ({field(job.get('model') or '-')}, "
+            f"{field(format(job.get('elapsed_s', 0), '.1f'))}s) kind={field(job.get('failure_kind') or '-')} "
+            f"warnings={field(','.join(job.get('warnings') or []) or '-')} {preview}").rstrip()
 
 
 def _seconds(value):
@@ -59,7 +60,7 @@ def main(argv=None) -> int:
     seen, done = set(), {}
 
     def emit(job):
-        print(json.dumps(job, ensure_ascii=False) if args.as_json else format_job(job), flush=True)
+        print(json.dumps(safe_output(job), ensure_ascii=False) if args.as_json else format_job(job), flush=True)
 
     while True:
         jobs = read_jobs([j for j in ids if j not in done])

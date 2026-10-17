@@ -9,11 +9,58 @@ from pathlib import Path
 import shlex
 import sys
 import time
+import unicodedata
 
 TERMINAL = frozenset({'done', 'failed', 'cancelled', 'timeout', 'auth_failed', 'lost', 'killed_on_restart'})
 METADATA_FIELDS = ('persist_error', 'warnings', 'truncated', 'final_response_length', 'failure_kind')
 WATCH_HINT = ('Start this with the Monitor tool (or Bash run_in_background) right now: '
               'it is the only way you get notified when the jobs end. Never rely on remembering to poll.')
+
+
+def safe_text(value, limit: int = 4000) -> str:
+    """Bounded single-line text: no terminal, bidi, format or line controls."""
+    text = ''.join(' ' if unicodedata.category(c) in ('Cc', 'Cf', 'Zl', 'Zp') else c
+                   for c in str(value))
+    return ' '.join(text.split())[:limit]
+
+
+def safe_output(value):
+    """Sanitize nested JSON strings as well as text before emitting untrusted state."""
+    if isinstance(value, str):
+        return safe_text(value)
+    if isinstance(value, dict):
+        return {safe_text(k): safe_output(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [safe_output(v) for v in value]
+    return value
+
+
+def redacted_exception(error: Exception) -> str:
+    """Never format exception args/filename/strerror: even strerror may contain secrets.
+
+    Use the OS's canonical errno description, not caller-supplied exception text.
+    Exceptions without an errno expose only their class.
+    """
+    number = error.errno if isinstance(error, OSError) and isinstance(error.errno, int) else None
+    detail = os.strerror(number) if number is not None else 'details redacted'
+    return safe_text(f'{type(error).__name__} errno={number} {detail}', 256)
+
+
+def state_directories(extra=(), home=None) -> tuple[str, ...]:
+    """Protect defaults AND overrides, including symlink targets, across providers."""
+    home = home or os.path.expanduser('~')
+    paths = list(extra)
+    for backend in ('CODEX', 'DSH', 'GEMINI'):
+        paths.append(os.path.join(home, '.' + backend.lower() + '-jobs'))
+        if override := os.getenv(f'DELEGATE_{backend}_STATE_DIR'):
+            paths.append(override)
+    return tuple(sorted({os.path.realpath(str(p)) for p in paths if p}))
+
+
+def workdir_forbidden(workdir, extra=()) -> bool:
+    real = Path(os.path.realpath(workdir))
+    return any(real == state or real in state.parents or state in real.parents
+               for state in map(Path, state_directories(extra)))
 
 
 def watch_fields(ids) -> dict:
@@ -96,7 +143,7 @@ def metadata(job: dict, truncate=None) -> dict:
 
 
 def persist_failed(jobs: dict, backend: str, error: OSError) -> None:
-    message = f'{backend} jobs file not written: {error}'
+    message = safe_text(f'{safe_text(backend, 32)} jobs file not written: {redacted_exception(error)}', 320)
     for job in jobs.values():
         job['persist_error'] = message
     print(message, file=sys.stderr, flush=True)

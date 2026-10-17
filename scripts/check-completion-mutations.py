@@ -35,6 +35,20 @@ CASES = [
     ('codex-watch', 'server.py', '**watch_fields(e["id"] for e in jobs_out)', '**{}', 'test_job_completion.py::test_codex_watch_empty_and_short'),
     ('dsh-watch', 'dsh_jobs.py', '**watch_fields(e["id"] for e in out)', '**{}', 'test_job_completion.py::test_dsh_watch_nonzero_rc'),
     ('gemini-watch', 'gemini_jobs.py', '**watch_fields(o["id"] for o in out)', '**{}', 'test_job_completion.py::test_gemini_submit_watch_and_persist'),
+    ('text-field-sanitizer', 'delegate_wait.py', 'field = lambda value: safe_text(value, 256)', 'field = lambda value: str(value)', 'test_completion_security.py::test_watcher_sanitizes_every_field[False]'),
+    ('json-string-sanitizer', 'delegate_wait.py', 'json.dumps(safe_output(job), ensure_ascii=False)', 'json.dumps(job, ensure_ascii=False)', 'test_completion_security.py::test_watcher_sanitizes_every_field[True]'),
+    ('terminal-controls', 'delegate_state.py', "unicodedata.category(c) in ('Cc', 'Cf', 'Zl', 'Zp')", 'False', 'test_completion_security.py::test_sanitizer_all_control_ranges_and_bounds'),
+    ('field-cap', 'delegate_state.py', "return ' '.join(text.split())[:limit]", "return ' '.join(text.split())", 'test_completion_security.py::test_sanitizer_all_control_ranges_and_bounds'),
+    ('codex-state-workdir', 'server.py', 'if workdir_forbidden(real, (CODEX_STATE_DIR,)):', 'if False:', 'test_completion_security.py::test_state_workdir_forbidden[state-GEMINI-codex]'),
+    ('dsh-state-workdir', 'dsh_jobs.py', 'if workdir_forbidden(real):', 'if False:', 'test_completion_security.py::test_state_workdir_forbidden[state-CODEX-dsh]'),
+    ('gemini-state-workdir', 'gemini_jobs.py', 'if workdir_forbidden(real):', 'if False:', 'test_completion_security.py::test_state_workdir_forbidden[symlink-DSH-gemini]'),
+    ('state-parent-workdir', 'delegate_state.py', 'real == state or real in state.parents or state in real.parents', 'real == state or state in real.parents', 'test_completion_security.py::test_state_workdir_forbidden[parent-GEMINI-codex]'),
+    ('profile-state-deny', 'gemini_jobs.py', 'for protected in state_directories(home=home):', 'for protected in ():', 'test_completion_security.py::test_profile_denies_state_writes'),
+    ('import-time-home', 'tests/conftest.py', "os.environ['HOME'] = str(SESSION_HOME)", 'pass', 'test_completion_security.py::test_import_isolation'),
+    ('real-home-foreign-pid-filter', 'tests/conftest.py', 'if named_pids & pids:', 'if True:', 'test_completion_security.py::test_real_home_guard_ignores_foreign_pid'),
+    ('real-home-test-pid-detection', 'tests/conftest.py', 'if named_pids & pids:', 'if False:', 'test_completion_security.py::test_real_home_guard_rejects_test_pid'),
+    ('exception-path-redaction', 'delegate_state.py', '{redacted_exception(error)}', '{error}', 'test_completion_security.py::test_exception_redacts_paths_and_controls'),
+    ('queued-exception-redaction', 'server.py', '"failed", redacted_exception(err), "infra"', '"failed", str(err), "infra"', 'test_completion_security.py::test_queued_exception_redacts_path'),
 ]
 
 
@@ -46,10 +60,10 @@ def main():
         sources = ['server.py', 'gemini_jobs.py', 'dsh_jobs.py', 'delegate_state.py', 'delegate_wait.py', 'pyproject.toml']
         for name in sources:
             shutil.copy2(ROOT / name, dest / name)
-        for name in ['conftest.py', 'test_delegate_wait.py', 'test_job_completion.py', 'test_codex_jobs.py', 'test_dsh_jobs.py']:
+        for name in ['conftest.py', 'test_delegate_wait.py', 'test_job_completion.py', 'test_codex_jobs.py', 'test_dsh_jobs.py', 'test_completion_security.py']:
             shutil.copy2(ROOT / 'tests' / name, dest / 'tests' / name)
-        env = dict(os.environ, PYTHONPATH=str(dest), UV_OFFLINE='1', DELEGATE_GEMINI_STATE_DIR=str(dest / 'gm-state'))
-        baseline = subprocess.run([sys.executable, '-m', 'pytest', 'tests/test_delegate_wait.py', 'tests/test_job_completion.py', '-q'], cwd=dest, env=env, capture_output=True, text=True, timeout=30)
+        env = dict(os.environ, HOME=str(dest / 'outer-home'), PYTHONPATH=str(dest), UV_OFFLINE='1', DELEGATE_GEMINI_STATE_DIR=str(dest / 'gm-state'))
+        baseline = subprocess.run([sys.executable, '-m', 'pytest', 'tests/test_delegate_wait.py', 'tests/test_job_completion.py', 'tests/test_completion_security.py', '-q', '-p', 'no:cacheprovider'], cwd=dest, env=env, capture_output=True, text=True, timeout=30)
         if baseline.returncode:
             print(baseline.stdout + baseline.stderr)
             return 1
@@ -61,7 +75,7 @@ def main():
             # Avoid same-second bytecode reuse across mutations.
             shutil.rmtree(dest / '__pycache__', ignore_errors=True)
             try:
-                result = subprocess.run([sys.executable, '-m', 'pytest', 'tests/' + test, '-q'], cwd=dest, env=env, capture_output=True, text=True, timeout=20)
+                result = subprocess.run([sys.executable, '-m', 'pytest', 'tests/' + test, '-q', '-p', 'no:cacheprovider'], cwd=dest, env=env, capture_output=True, text=True, timeout=20)
                 caught = result.returncode == 1 and 'failed' in result.stdout
                 print(f'{name}: {"KILLED" if caught else "SURVIVED/ERROR"}', flush=True)
                 if not caught:
