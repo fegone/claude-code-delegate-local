@@ -184,6 +184,12 @@ async def test_submit_with_broken_lock_storage_runs_nothing(env, monkeypatch):
     async def boom(*a, **k):
         raise AssertionError("codex spawned with no lock storage")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
+
+    # The default model is gpt-6.1-terra, so validation probes `codex --version` before the
+    # lock step. Stub the probe so only a real codex job spawn can trip `boom`.
+    async def new_cli():
+        return (0, 159, 2)
+    monkeypatch.setattr(server, "_codex_installed_version", new_cli)
     r = await server.submit_codex([{"task": "x", "workdir": _wd(env, "w")}])
     assert r["success"] is False
     assert not any(j["status"] == "running" for j in server._codex_jobs.values())
