@@ -63,6 +63,13 @@ job; `returncode=None` is never success; failures are classified (auth / quota /
 servers' jobs read-only; each job gets its own `sqlite_home`, `forced_login_method="chatgpt"` and
 staggered launches. Defaults are now 8 global / 6 per project.
 
+### Changed (2026-10-26 — Codex default is `gpt-6.1-terra` at effort `low`, #68)
+
+Bench of 24 runs (same four hidden-test tasks, 3 reps, both at low): Terra 6.1 matched Sol 6.1
+(17/17, 25/25, 33/34, 58/59 median) in 244 s against 785 s and with 31 % fewer output tokens.
+`gpt-6.1-terra` joins the plan models and the `terra` alias points to it. Escalation by hand:
+terra low, then sol low, then sol medium. Luna is no longer the default.
+
 ### Changed (2026-09-30 — Codex default is `gpt-6-luna` at effort `low`)
 
 Bench of 48 runs (4 coding tasks with hidden tests, from a one-file bugfix to a DST-aware cron
