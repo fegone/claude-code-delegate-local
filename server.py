@@ -3051,12 +3051,13 @@ async def local_backend_status() -> dict:
 ## Privacy: cloud model → never use for projects with sensitive/regulated data (PHI/PII).
 ## ────────────────────────────────────────────────────────────────────────────────
 CODEX_BIN = os.environ.get("DELEGATE_CODEX_BIN", "codex")
-# Default = gpt-6-luna at effort low (bench 2026-09-30, 48 runs, 4 coding tasks x 3 reps:
-# luna-low scored the same as sol-low/medium (94-100% of hidden tests), 3.2-5.6x faster,
-# fewest tokens, zero reasoning tokens; "medium" never beat "low" for either model).
-# Escalate by hand, visibly: luna low -> sol low -> sol medium. Report:
-# fegone/neola-n8n .claude/reports/banco-codex-sol-luna-2026-09-30.md
-CODEX_DEFAULT_MODEL = os.environ.get("DELEGATE_CODEX_MODEL", "gpt-6-luna")
+# Default = gpt-6.1-terra at effort low. Bench 2026-10-26: 24 runs, 4 tasks with hidden
+# tests x 3 reps, both low: Terra 6.1 17/17, 25/25, 33/34 (median), 58/59, in 244 s and
+# 27.0k output tokens; Sol 6.1 16/17, 25/25, 33/34, 58/59, in 785 s and 39.4k. Same
+# quality, 3.2x faster, 31% fewer tokens. Luna is no longer the default.
+# Escalate by hand, visibly: terra low -> sol low (multi-file refactor in a real repo, or
+# terra fails) -> sol medium (ambiguous design or diagnosis without reproduction).
+CODEX_DEFAULT_MODEL = os.environ.get("DELEGATE_CODEX_MODEL", "gpt-6.1-terra")
 CODEX_DEFAULT_EFFORT = os.environ.get("DELEGATE_CODEX_EFFORT", "low")
 # 'danger-full-access' lets Codex run with no sandbox — gated behind an explicit env flag
 # so a routine dispatch can't request it.
@@ -3100,20 +3101,22 @@ async def _drain_capped(stream: asyncio.StreamReader, cap_bytes: int, on_chunk=N
 # (codex-cli 0.159.2). gpt-6.1-sol es el caballo de batalla actual y el default.
 # ⚠️ Los ids gpt-6.1-* EXIGEN codex-cli >= 0.159: una CLI anterior no los conoce y
 # falla. Se comprueba antes de lanzar (ver _codex_version_error); no se auto-actualiza.
-# Generaciones: 6.1-sol (actual) · 6-astra (frontier) · 6-sol (anterior) · 6-luna
-# (rápido y barato) · 5.6-* (viejos) · 5.5/5.4 (legacy). Los ids ocultos del catálogo
-# (reservas internas y el revisor automático) no se exponen a propósito.
+# Generaciones: 6.1-terra (default, banco 2026-10-26) · 6.1-sol (escalada) · 6-astra
+# (frontier) · 6-sol (anterior) · 6-luna (rápido y barato, ya no default) · 5.6-* (viejos)
+# · 5.5/5.4 (legacy). Los ids ocultos del catálogo (reservas internas y el revisor
+# automático) no se exponen a propósito.
 CODEX_PLAN_MODELS = {
-    "gpt-6.1-sol",
+    "gpt-6.1-terra", "gpt-6.1-sol",
     "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
 }
-# Alias cortos → id real del modelo. Permite delegar diciendo solo "sol"/"astra"/"luna".
-# 'terra' se retira (2026-09-30): GPT-6 no trae terra y gpt-5.6-terra va de salida.
-# El alias corto se queda por compatibilidad y apunta a gpt-6-sol, el sabor
-# intermedio vigente. Quien necesite el viejo lo pide por id completo o '5.6-terra'.
+# Alias cortos → id real del modelo. Permite delegar diciendo solo "terra"/"sol"/"astra"/"luna".
+# 'terra' vuelve (2026-10-26) y apunta a gpt-6.1-terra, el default. El viejo gpt-5.6-terra
+# se pide por id completo o '5.6-terra'.
 CODEX_MODEL_ALIASES = {
+    "terra": "gpt-6.1-terra",
+    "6.1-terra": "gpt-6.1-terra",
     "sol": "gpt-6.1-sol",
     "6.1-sol": "gpt-6.1-sol",
     "6-sol": "gpt-6-sol",
@@ -3122,7 +3125,6 @@ CODEX_MODEL_ALIASES = {
     "6-astra": "gpt-6-astra",
     "luna": "gpt-6-luna",
     "6-luna": "gpt-6-luna",
-    "terra": "gpt-6-sol",
     "5.6-sol": "gpt-5.6-sol",
     "5.6-terra": "gpt-5.6-terra",
     "5.6-luna": "gpt-5.6-luna",
@@ -3136,7 +3138,7 @@ _codex_version_cache: tuple | None = None
 
 
 def _resolve_codex_model(model: str) -> str:
-    """Acepta el id completo ('gpt-5.6-terra') o el alias corto ('terra')."""
+    """Acepta el id completo ('gpt-6.1-terra') o el alias corto ('terra')."""
     if not isinstance(model, str):
         return model
     return CODEX_MODEL_ALIASES.get(model.strip().lower(), model)
@@ -3232,12 +3234,13 @@ async def delegate_to_codex(
     lo devuelve. Para lanzar varios sin bloquear: submit_codex / poll_codex / cancel_codex. Ideal para coding agéntico con GPT-6.x usando el plan del usuario.
 
     Se pueden pedir por nombre corto (alias) o id completo:
-      - 'luna'  → gpt-6-luna    (DEFAULT, con effort 'low')
-      - 'sol'   → gpt-6.1-sol   (escalada; exige codex-cli >= 0.159)
-      - 'astra' → gpt-6-astra   (frontier)
-      - '6-sol' → gpt-6-sol     (generación anterior)
-      - 'terra' → gpt-6-sol    (compatibilidad)
-    También '5.6-sol', '5.6-luna', '5.5', '5.4', '5.4-mini'.
+      - 'terra'   → gpt-6.1-terra (DEFAULT, con effort 'low'; exige codex-cli >= 0.159)
+      - '6.1-terra' → gpt-6.1-terra (mismo modelo, id corto)
+      - 'sol'     → gpt-6.1-sol   (escalada; exige codex-cli >= 0.159)
+      - 'astra'   → gpt-6-astra   (frontier)
+      - 'luna'    → gpt-6-luna    (rápido y barato; ya no es default)
+      - '6-sol'   → gpt-6-sol     (generación anterior)
+    También '5.6-sol', '5.6-terra', '5.6-luna', '5.5', '5.4', '5.4-mini'.
 
     ⚠️ Privacy: modelo cloud de OpenAI → NUNCA usar en proyectos con datos sensibles/
     regulados (PHI/PII). Solo proyectos sin datos sensibles.
@@ -3248,7 +3251,7 @@ async def delegate_to_codex(
     Args:
         task: La instrucción para Codex (autónoma — incluye contexto y archivos objetivo).
         workdir: Directorio de trabajo (Codex opera aquí). Default: cwd del server.
-        model: Modelo o alias. Default 'luna' (gpt-6-luna). Acepta 'astra'/'luna'/'terra'/'sol'
+        model: Modelo o alias. Default 'terra' (gpt-6.1-terra). Acepta 'terra'/'sol'/'astra'/'luna'
                o el id completo. Debe resolver a uno permitido por el plan.
         effort: Esfuerzo de razonamiento (model_reasoning_effort). Default 'low'
                (DELEGATE_CODEX_EFFORT); '' = el de ~/.codex/config.toml. Valores:
@@ -4723,7 +4726,7 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
     orquestador sigue trabajando y consulta con `poll_codex(ids)`. Pensado para lanzar
     muchas tarjetas en paralelo (ver `delegate_to_codex` para una sola y bloqueante).
 
-    Cada elemento de `tasks`: {task (obligatorio), workdir='.', model='luna',
+    Cada elemento de `tasks`: {task (obligatorio), workdir='.', model='terra',
     effort='low', sandbox='workspace-write', timeout_s=1800}. Mismas reglas y alias que
     `delegate_to_codex`. ATÓMICO: se validan TODAS antes de lanzar ninguna; si una falla,
     no arranca nada y la respuesta trae el error de cada elemento inválido.
