@@ -3010,27 +3010,27 @@ async def list_local_agents() -> dict:
 
 @mcp.tool()
 async def local_backend_status() -> dict:
-    """
-    Health check del backend configurado (LiteLLM proxy por default). Devuelve
-    estado, modelos disponibles y latencia básica. Útil antes de delegar para validar
-    que el backend está alcanzable.
-    """
-    base = _derive_base(LITELLM_URL)
+    """Comprueba el gateway del modelo por defecto y lista sus modelos disponibles."""
+    endpoint, key = _gateway_for(DEFAULT_MODEL)
+    base = _derive_base(endpoint)
+    health_base = base.removesuffix("/litellm") if GATEWAY == GATEWAY_BIFROST else base
     out: dict[str, Any] = {
-        "configured_url": LITELLM_URL,
+        "gateway": GATEWAY,
+        "configured_url": endpoint,
         "default_model": DEFAULT_MODEL,
         "agents_dir": str(AGENTS_DIR),
     }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             t0 = time.time()
-            r = await client.get(f"{base}/health/liveliness")
+            health_path = "/health" if GATEWAY == GATEWAY_BIFROST else "/health/liveliness"
+            r = await client.get(f"{health_base}{health_path}")
             out["liveness"] = r.text.strip()[:100]
             out["liveness_status"] = r.status_code
             out["liveness_ms"] = int((time.time() - t0) * 1000)
             headers = {}
-            if LITELLM_KEY:
-                headers["Authorization"] = f"Bearer {LITELLM_KEY}"
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
             r2 = await client.get(f"{base}/v1/models", headers=headers)
             if r2.status_code == 200:
                 data = r2.json()
@@ -3039,6 +3039,14 @@ async def local_backend_status() -> dict:
                 out["models_error"] = f"HTTP {r2.status_code}"
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
+    # Responses and exception messages can echo credentials.
+    def redact(value):
+        if isinstance(value, str):
+            return value.replace(key, "[redacted]") if key else value
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        return value
+    out = {name: redact(value) for name, value in out.items()}
     return out
 
 
