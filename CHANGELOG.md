@@ -24,6 +24,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (2026-11-16)
+- **Gemini (agy) `family="hydrogen"`.** Alongside gemini, sonnet, and argon, `delegate_to_gemini` and `submit_gemini` accept hydrogen with `gemini-4-hydrogen-{low|medium|high}`. The `xhigh` effort remains unexposed; unknown-family errors list hydrogen.
+
 ### Added (2026-10-15)
 - **Gemini (agy) `family="argon"`.** `delegate_to_gemini` and `submit_gemini` accept `family="argon"`, which maps to `gemini-4-argon-{low|medium|high}` (agy 1.3.5). Same sandbox-exec jail, same quota/failover marker as the other families. Google AI Pro consumer plan: no BAA, never PHI or secrets. Unknown families are still rejected.
 

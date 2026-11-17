@@ -164,11 +164,41 @@ def test_argon_bad_effort_rejected(wd):
     assert err and "effort inválido" in err["error"] and "gemini-4-argon-*" in err["error"]
 
 
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+@pytest.mark.parametrize("family", ["hydrogen", "Hydrogen"])
+def test_hydrogen_maps_to_model(wd, effort, family):
+    assert gemini_jobs.model_for(effort, "hydrogen") == f"gemini-4-hydrogen-{effort}"
+    err, norm = gemini_jobs.validate("t", wd, effort, 30, family=family)
+    assert err is None
+    assert norm["family"] == "hydrogen"
+    assert norm["model"] == f"gemini-4-hydrogen-{effort}"
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+async def test_hydrogen_effort_runs_with_model_in_argv(fake_agy, wd, effort):
+    norm = gemini_jobs.validate("OK x", wd, effort, 30, family="hydrogen")[1]
+    r = await gemini_jobs.run_agy("OK x", norm)
+    assert r["model"] == f"gemini-4-hydrogen-{effort}"
+    a = open(os.path.join(wd, "argv.txt")).read().split("\n")
+    assert a[a.index("--model") + 1] == f"gemini-4-hydrogen-{effort}"
+
+
+def test_hydrogen_bad_effort_rejected(wd):
+    err, _ = gemini_jobs.validate("t", wd, "xhigh", 30, family="hydrogen")
+    assert err and "effort inválido" in err["error"] and "gemini-4-hydrogen-*" in err["error"]
+
+
+def test_only_hydrogen_models_exposed():
+    assert set(gemini_jobs.HYDROGEN_MODELS) == {
+        f"gemini-4-hydrogen-{effort}" for effort in ("low", "medium", "high")
+    }
+
+
 @pytest.mark.parametrize("bad", ["opus", "claude-opus", "gpt-oss", "gpt-oss-120b", "other", "claude-sonnet", "argon-4", "gemini-4"])
 def test_invalid_family_rejected(wd, bad):
     err, _ = gemini_jobs.validate("t", wd, "medium", 30, family=bad)
     assert err and "family inválido" in err["error"]
-    assert "Solo se admiten 'gemini', 'sonnet' y 'argon'" in err["error"]
+    assert "Solo se admiten 'gemini', 'sonnet', 'argon' y 'hydrogen'" in err["error"]
 
 
 def test_opus_and_gpt_oss_rejected(wd):
