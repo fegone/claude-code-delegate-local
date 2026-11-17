@@ -6,7 +6,9 @@ import server
 
 def test_short_aliases_resolve_to_current_catalog():
     r = server._resolve_codex_model
-    assert r("sol") == "gpt-6.1-sol"
+    assert r("sol") == "gpt-6.2-sol"
+    assert r("6.2-sol") == "gpt-6.2-sol"
+    assert r("6.2-astra") == "gpt-6.2-astra"
     assert r("6.1-sol") == "gpt-6.1-sol"
     assert r("6-sol") == "gpt-6-sol"
     assert r("astra") == "gpt-6-astra"

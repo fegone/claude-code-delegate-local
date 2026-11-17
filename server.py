@@ -3109,11 +3109,14 @@ async def _drain_capped(stream: asyncio.StreamReader, cap_bytes: int, on_chunk=N
 # (codex-cli 0.159.2). gpt-6.1-sol es el caballo de batalla actual y el default.
 # ⚠️ Los ids gpt-6.1-* EXIGEN codex-cli >= 0.159: una CLI anterior no los conoce y
 # falla. Se comprueba antes de lanzar (ver _codex_version_error); no se auto-actualiza.
+# 2026-11-17 (Felix): 'sol' pasa a gpt-6.2-sol (probado por el plan de ChatGPT con
+# codex-cli 0.169.0). gpt-6.2-astra entra al catálogo; el alias 'astra' sigue en gpt-6-astra.
 # Generaciones: 6.1-terra (default, banco 2026-10-26) · 6.1-sol (escalada) · 6-astra
 # (frontier) · 6-sol (anterior) · 6-luna (rápido y barato, ya no default) · 5.6-* (viejos)
 # · 5.5/5.4 (legacy). Los ids ocultos del catálogo (reservas internas y el revisor
 # automático) no se exponen a propósito.
 CODEX_PLAN_MODELS = {
+    "gpt-6.2-sol", "gpt-6.2-astra",
     "gpt-6.1-terra", "gpt-6.1-sol",
     "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
@@ -3125,7 +3128,9 @@ CODEX_PLAN_MODELS = {
 CODEX_MODEL_ALIASES = {
     "terra": "gpt-6.1-terra",
     "6.1-terra": "gpt-6.1-terra",
-    "sol": "gpt-6.1-sol",
+    "sol": "gpt-6.2-sol",
+    "6.2-sol": "gpt-6.2-sol",
+    "6.2-astra": "gpt-6.2-astra",
     "6.1-sol": "gpt-6.1-sol",
     "6-sol": "gpt-6-sol",
     "astra": "gpt-6-astra",
@@ -3141,7 +3146,7 @@ CODEX_MODEL_ALIASES = {
     "5.4-mini": "gpt-5.4-mini",
 }
 # Versión mínima de codex-cli por prefijo de modelo.
-CODEX_MIN_VERSION = {"gpt-6.1-": (0, 159)}
+CODEX_MIN_VERSION = {"gpt-6.1-": (0, 159), "gpt-6.2-": (0, 169)}
 _codex_version_cache: tuple | None = None
 
 
@@ -3244,7 +3249,7 @@ async def delegate_to_codex(
     Se pueden pedir por nombre corto (alias) o id completo:
       - 'terra'   → gpt-6.1-terra (DEFAULT, con effort 'low'; exige codex-cli >= 0.159)
       - '6.1-terra' → gpt-6.1-terra (mismo modelo, id corto)
-      - 'sol'     → gpt-6.1-sol   (escalada; exige codex-cli >= 0.159)
+      - 'sol'     → gpt-6.2-sol   (escalada desde 2026-11-17; exige codex-cli >= 0.169)
       - 'astra'   → gpt-6-astra   (frontier)
       - 'luna'    → gpt-6-luna    (rápido y barato; ya no es default)
       - '6-sol'   → gpt-6-sol     (generación anterior)
