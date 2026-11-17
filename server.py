@@ -3110,7 +3110,7 @@ async def _drain_capped(stream: asyncio.StreamReader, cap_bytes: int, on_chunk=N
 # ⚠️ Los ids gpt-6.1-* EXIGEN codex-cli >= 0.159: una CLI anterior no los conoce y
 # falla. Se comprueba antes de lanzar (ver _codex_version_error); no se auto-actualiza.
 # 2026-11-17 (Felix): 'sol' pasa a gpt-6.2-sol (probado por el plan de ChatGPT con
-# codex-cli 0.169.0). gpt-6.2-astra entra al catálogo; el alias 'astra' sigue en gpt-6-astra.
+# codex-cli 0.169.0). gpt-6.2-astra entra al catálogo y el alias 'astra' apunta a él (Felix, mismo día).
 # Generaciones: 6.1-terra (default, banco 2026-10-26) · 6.1-sol (escalada) · 6-astra
 # (frontier) · 6-sol (anterior) · 6-luna (rápido y barato, ya no default) · 5.6-* (viejos)
 # · 5.5/5.4 (legacy). Los ids ocultos del catálogo (reservas internas y el revisor
@@ -3133,7 +3133,7 @@ CODEX_MODEL_ALIASES = {
     "6.2-astra": "gpt-6.2-astra",
     "6.1-sol": "gpt-6.1-sol",
     "6-sol": "gpt-6-sol",
-    "astra": "gpt-6-astra",
+    "astra": "gpt-6.2-astra",
     "gpt-6-astra": "gpt-6-astra",
     "6-astra": "gpt-6-astra",
     "luna": "gpt-6-luna",
@@ -3250,7 +3250,7 @@ async def delegate_to_codex(
       - 'terra'   → gpt-6.1-terra (DEFAULT, con effort 'low'; exige codex-cli >= 0.159)
       - '6.1-terra' → gpt-6.1-terra (mismo modelo, id corto)
       - 'sol'     → gpt-6.2-sol   (escalada desde 2026-11-17; exige codex-cli >= 0.169)
-      - 'astra'   → gpt-6-astra   (frontier)
+      - 'astra'   → gpt-6.2-astra (frontier, desde 2026-11-17)
       - 'luna'    → gpt-6-luna    (rápido y barato; ya no es default)
       - '6-sol'   → gpt-6-sol     (generación anterior)
     También '5.6-sol', '5.6-terra', '5.6-luna', '5.5', '5.4', '5.4-mini'.
