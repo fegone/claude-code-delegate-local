@@ -4,6 +4,11 @@ All notable changes to `delegate-local` are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+- Codex alias `sol` now resolves to `gpt-6.2-sol` (Felix 2026-11-17). Added `gpt-6.2-sol` and `gpt-6.2-astra` to the plan catalog with aliases `6.2-sol` and `6.2-astra`; `gpt-6.2-*` requires codex-cli >= 0.169. `astra` still resolves to `gpt-6-astra`.
+
 ## [0.7.1] - 2026-10-17
 
 ### Added
