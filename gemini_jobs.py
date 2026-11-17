@@ -39,16 +39,18 @@ from delegate_state import enforce_isolation, isolation_environment, redacted_ex
 
 EFFORTS = ("low", "medium", "high")
 DEFAULT_EFFORT = "medium"
-FAMILIES = ("gemini", "sonnet", "argon")
+FAMILIES = ("gemini", "sonnet", "argon", "hydrogen")
 DEFAULT_FAMILY = "gemini"
 # Allowlist of exposed models. `agy models` also lists claude-opus-* and gpt-oss-* models: not exposed.
 GEMINI_MODELS = {f"gemini-3.8-flash-{e}": e for e in EFFORTS}
 SONNET_MODELS = {f"claude-sonnet-5-5-{e}": e for e in EFFORTS}
 ARGON_MODELS = {f"gemini-4-argon-{e}": e for e in EFFORTS}
+HYDROGEN_MODELS = {f"gemini-4-hydrogen-{e}": e for e in EFFORTS}
 FAMILY_MODELS = {
     "gemini": GEMINI_MODELS,
     "sonnet": SONNET_MODELS,
     "argon": ARGON_MODELS,
+    "hydrogen": HYDROGEN_MODELS,
 }
 DEFAULT_TIMEOUT_S = 900
 MAX_TIMEOUT_S = 7200
@@ -472,6 +474,8 @@ def model_for(effort: str, family: str = DEFAULT_FAMILY) -> str:
         return f"claude-sonnet-5-5-{effort}"
     if fam == "argon":
         return f"gemini-4-argon-{effort}"
+    if fam == "hydrogen":
+        return f"gemini-4-hydrogen-{effort}"
     if fam == "gemini":
         return f"gemini-3.8-flash-{effort}"
     raise ValueError(f"family inválido: {family!r} (válidos: {', '.join(FAMILIES)})")
@@ -519,11 +523,11 @@ def validate(task, workdir, effort, timeout_s, family: str = DEFAULT_FAMILY) -> 
     if fam not in FAMILIES:
         return {"success": False,
                 "error": f"family inválido: {family!r} (válidos: {', '.join(FAMILIES)}). "
-                         "Solo se admiten 'gemini', 'sonnet' y 'argon'."}, {}
+                         "Solo se admiten 'gemini', 'sonnet', 'argon' y 'hydrogen'."}, {}
     eff = effort.strip().lower() or DEFAULT_EFFORT
     if eff not in EFFORTS:
         allowed = {"gemini": "gemini-3.8-flash-*", "sonnet": "claude-sonnet-5-5-*",
-                   "argon": "gemini-4-argon-*"}[fam]
+                   "argon": "gemini-4-argon-*", "hydrogen": "gemini-4-hydrogen-*"}[fam]
         return {"success": False,
                 "error": f"effort inválido: {effort!r} (válidos: {', '.join(EFFORTS)}). "
                          f"Solo se exponen los modelos {allowed}."}, {}
