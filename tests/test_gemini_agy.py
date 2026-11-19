@@ -194,11 +194,40 @@ def test_only_hydrogen_models_exposed():
     }
 
 
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_neon_maps_to_model(wd, effort):
+    assert gemini_jobs.model_for(effort, "neon") == f"gemini-4-neon-{effort}"
+    err, norm = gemini_jobs.validate("t", wd, effort, 30, family="Neon")
+    assert err is None
+    assert norm["family"] == "neon"
+    assert norm["model"] == f"gemini-4-neon-{effort}"
+
+
+def test_neon_only_exposes_supported_efforts(wd):
+    assert set(gemini_jobs.NEON_MODELS) == {
+        f"gemini-4-neon-{effort}" for effort in ("low", "medium", "high")
+    }
+    err, _ = gemini_jobs.validate("t", wd, "xhigh", 30, family="neon")
+    assert err and "effort inválido" in err["error"] and "gemini-4-neon-*" in err["error"]
+
+
+async def test_submit_neon_defaults_to_medium(wd, monkeypatch):
+    jobs = gemini_jobs.GeminiJobs()
+    monkeypatch.setattr(gemini_jobs, "agy_bin", lambda: "/fake/agy")
+    monkeypatch.setattr(jobs, "ensure_loaded", lambda: None)
+    monkeypatch.setattr(jobs, "_pump", lambda: None)
+    monkeypatch.setattr(jobs, "save", lambda: None)
+    result = await jobs.submit([{"task": "t", "workdir": wd, "family": "neon"}])
+    job = jobs.jobs[result["jobs"][0]["id"]]
+    assert job["effort"] == "medium"
+    assert job["model"] == "gemini-4-neon-medium"
+
+
 @pytest.mark.parametrize("bad", ["opus", "claude-opus", "gpt-oss", "gpt-oss-120b", "other", "claude-sonnet", "argon-4", "gemini-4"])
 def test_invalid_family_rejected(wd, bad):
     err, _ = gemini_jobs.validate("t", wd, "medium", 30, family=bad)
     assert err and "family inválido" in err["error"]
-    assert "Solo se admiten 'gemini', 'sonnet', 'argon' y 'hydrogen'" in err["error"]
+    assert "Solo se admiten 'gemini', 'sonnet', 'argon', 'hydrogen' y 'neon'" in err["error"]
 
 
 def test_opus_and_gpt_oss_rejected(wd):
