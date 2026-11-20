@@ -15,6 +15,7 @@ License: MIT
 from __future__ import annotations
 
 from delegate_state import enforce_isolation, isolation_environment, IsolationViolation, redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata as job_metadata, persist_failed, owner_alive, watch_fields, sanitize_metadata
+import delegate_state
 
 import asyncio
 import atexit
@@ -3394,6 +3395,8 @@ def _codex_context_text(workdir: str, relative: str) -> str:
                 info = os.fstat(file.fileno())
                 if not stat.S_ISREG(info.st_mode):
                     raise ValueError("context_file debe ser un archivo regular")
+                if info.st_nlink > 1:
+                    raise ValueError("context_file no puede ser un hardlink")
                 if info.st_size > _CODEX_CONTEXT_BYTES:
                     raise ValueError("context_file supera 64 KiB")
                 data = file.read(_CODEX_CONTEXT_BYTES + 1)
@@ -3849,10 +3852,22 @@ def _truncate_words(text: str | None, limit: int = CODEX_POLL_WORDS,
     return text
 
 
+def _codex_failure_text(text: str | None) -> str | None:
+    suffix = " [trunc]"
+    if text and len(text) > _CODEX_POLL_FULL_CHARS:
+        return text[:_CODEX_POLL_FULL_CHARS - len(suffix)] + suffix
+    return text
+
+
+def _codex_error(j: dict) -> str | None:
+    error = j.get("error")
+    return _codex_failure_text(error) if j["status"] in _CODEX_FULL_ERROR_STATUSES else error
+
+
 def _codex_response(j: dict, full: bool = False) -> str | None:
     text = j.get("final_response")
     if j["status"] in _CODEX_FULL_ERROR_STATUSES:
-        return text
+        return _codex_failure_text(text)
     if full:
         if j.get("_loaded_snapshot"):
             return text  # snapshots already use the full poll limits
@@ -4405,6 +4420,9 @@ def _codex_save() -> None:
             _codex_rt.pop(j["id"], None)
         for j in _codex_jobs.values():
             j.update(job_metadata(j, lambda text: _codex_response(j)))
+            if j["status"] in _CODEX_FULL_ERROR_STATUSES:
+                j["error"] = _codex_error(j)
+                j["final_response"] = _codex_response(j, full=True)
         data = {
             "v": 2,
             "server": {"sid": _codex_sid, "pid": os.getpid(), "saved_at": time.time(),
@@ -4823,8 +4841,8 @@ def _codex_job_view(j: dict, owner: dict | None = None, *, full: bool = False) -
     if owner is None:
         owner = {"pid": os.getpid(), "sid": _codex_sid, "alive": True}
     view["owner"] = owner
-    if j.get("error"):
-        view["error"] = j["error"]
+    if error := _codex_error(j):
+        view["error"] = error
     response = _codex_response(j, full=full)
     if status in _CODEX_FULL_ERROR_STATUSES | {"done"} and response:
         view["final_response"] = response
@@ -4894,6 +4912,14 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
                         "timeout_s": timeout_s, "sandbox": sandbox, "model": model,
                         "effort": effort, "workdir_abs": workdir_abs,
                         "ident": _codex_identity(workdir_abs)})
+    # Check each distinct tag after async validation, before publishing any jobs.
+    recent_tags = {tag for tag in {p["tag"] for p in planned} if tag
+                   and delegate_state.tag_recently_used(tag)}
+    for p in planned:
+        tag = p["tag"]
+        if tag in recent_tags:
+            errors.append({"index": p["index"],
+                           "error": f"tag '{tag}' was used in the last 10 minutes; pick a unique tag"})
     # Admission (fail closed): caps/storage must be sound and the account must not be in
     # auth_failure. Then RESERVE real slots for the new jobs; whatever cannot get one waits
     # in the queue, and the queue bound is checked against that real count (a slot taken by
@@ -4955,8 +4981,8 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
     for entry in jobs_out:
         job = _codex_jobs[entry["id"]]
         entry["status"] = job["status"]
-        if job.get("error"):
-            entry["error"] = job["error"]
+        if error := _codex_error(job):
+            entry["error"] = error
     ids = [e["id"] for e in jobs_out]
     tag = planned[0]["tag"]
     watch = watch_fields(ids, tag=tag) if tag and all(p["tag"] == tag for p in planned) else watch_fields(ids)
@@ -4971,7 +4997,7 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
 async def poll_codex(ids: list[str], full: bool = False) -> dict:
     """Report Codex job status, including jobs owned by other servers.
 
-    Pass full=True for the previous response limits. Failures keep the full error text.
+    Pass full=True for the previous response limits. Failure text is capped at 4000 characters.
     Done is not verification. Check the work independently. Never send PHI/PII.
     See README for environment variables and limits.
     """
