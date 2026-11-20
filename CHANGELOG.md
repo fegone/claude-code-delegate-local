@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed (2026-11-20, token audit by Fable 5.2 and Neon)
+- **Codex defaults to `gpt-6.2-sol` low.** Any effort above low needs a `why` (1-300 chars), checked after every workdir guard. Above `DELEGATE_CODEX_QUOTA_DOWNGRADE_PCT` (default 70) medium and higher run as low unless `allow_over_quota`; the quota warning starts at 65 %.
+- **Shorter results.** `poll_codex` 120 words / 900 chars (`full=True` for 300 / 4000); failed jobs keep their error up to 4000 chars; `delegate_batch` items capped at 900 (`full=True`). `submit_*` no longer return `watch_hint`.
+- **delegate-wait.** Completion lines carry a 450-char preview with `[trunc]`; `--fail-fast` with `--all`; `--tag T --expect N` finds jobs by tag so the watcher starts in the same turn as `submit_*` (10-minute lookback, `DELEGATE_WAIT_TAG_LOOKBACK_S`).
+
+### Added (2026-11-20)
+- Per-task `tag` in `submit_codex`, `submit_gemini` and `submit_dsh`, unique within the lookback window.
+- Codex `context_file` (relative to the workdir, regular file, no symlinks or hardlinks, 64 KiB, UTF-8) and a fixed sockets line on every card (`preset='none'` to skip).
+- Security review: `.claude/reports/security-lote-76-77-2026-11-20.md` (both approved after fixes).
+
 ### Added (2026-11-19)
 - **Gemini (agy) `family="neon"`.** `delegate_to_gemini` and `submit_gemini` accept `gemini-4-neon-{low|medium|high}`, defaulting to medium. The `xhigh` effort remains unexposed.
 
