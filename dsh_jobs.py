@@ -26,7 +26,7 @@ import time
 import uuid
 from collections import deque
 
-from delegate_state import enforce_isolation, isolation_environment, redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata, persist_failed, owner_alive, valid_tag, watch_fields
+from delegate_state import enforce_isolation, isolation_environment, redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata, persist_failed, owner_alive, tag_recently_used, valid_tag, watch_fields
 from gemini_jobs import redact
 
 MAX_TIMEOUT_S = 7200
@@ -497,6 +497,8 @@ class DshJobs:
         planned, errors = [], []
         for i, t in enumerate(tasks):
             p, err = self.validate(t)
+            if not err and (tag := p.get("tag")) and tag_recently_used(tag):
+                err = f"tag '{tag}' was used in the last 10 minutes; pick a unique tag"
             if err:
                 errors.append({"index": i, "error": err,
                                **({"failure_kind": "workdir_forbidden"}

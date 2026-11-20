@@ -5,24 +5,19 @@ import argparse
 import json
 import math
 import os
-from pathlib import Path
 import time
 
-from delegate_state import enforce_isolation, TERMINAL, remote_jobs, safe_text, safe_output
+from delegate_state import TERMINAL, provider_state_dir, remote_jobs, safe_text, safe_output, tag_lookback_seconds
 
 UNKNOWN_GRACE_S = 30
-TAG_LOOKBACK_S = 600
 
 
 def read_jobs(ids=None, since=None) -> dict:
     out = {}
-    for prefix, backend, default in [('cx-', 'CODEX', '.codex-jobs'),
-                                      ('gm-', 'GEMINI', '.gemini-jobs'),
-                                      ('dsh-', 'DSH', '.dsh-jobs')]:
+    for prefix, backend in [('cx-', 'CODEX'), ('gm-', 'GEMINI'), ('dsh-', 'DSH')]:
         wanted = None if ids is None else {j for j in ids if j.startswith(prefix)}
         if wanted is None or wanted:
-            base = Path(enforce_isolation(os.getenv(f'DELEGATE_{backend}_STATE_DIR') or Path.home() / default))
-            out.update(remote_jobs(base, wanted, since=since))
+            out.update(remote_jobs(provider_state_dir(backend), wanted, since=since))
     return out
 
 
@@ -79,11 +74,7 @@ def main(argv=None) -> int:
     started = time.monotonic()
     since = None
     if args.tag is not None:
-        try:
-            lookback = _seconds(os.getenv('DELEGATE_WAIT_TAG_LOOKBACK_S', TAG_LOOKBACK_S))
-        except (ValueError, argparse.ArgumentTypeError):
-            lookback = TAG_LOOKBACK_S
-        since = time.time() - lookback
+        since = time.time() - tag_lookback_seconds()
     seen, done = set(), {}
 
     def emit(job):

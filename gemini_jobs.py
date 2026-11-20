@@ -35,7 +35,7 @@ import time
 import uuid
 from collections import deque
 
-from delegate_state import enforce_isolation, isolation_environment, redacted_exception, workdir_forbidden, state_directories, METADATA_FIELDS, TERMINAL, metadata, persist_failed, remote_jobs, read_json, valid_tag, watch_fields, sanitize_snapshot
+from delegate_state import enforce_isolation, isolation_environment, redacted_exception, workdir_forbidden, state_directories, METADATA_FIELDS, TERMINAL, metadata, persist_failed, remote_jobs, read_json, tag_recently_used, valid_tag, watch_fields, sanitize_snapshot
 
 EFFORTS = ("low", "medium", "high")
 DEFAULT_EFFORT = "medium"
@@ -909,6 +909,9 @@ class GeminiJobs:
                 continue
             if "tag" in t and not valid_tag(t["tag"]):
                 errors.append({"index": i, "error": "tag inválido"})
+                continue
+            if (tag := t.get("tag")) and tag_recently_used(tag):
+                errors.append({"index": i, "error": f"tag '{tag}' was used in the last 10 minutes; pick a unique tag"})
                 continue
             err, norm = validate(t.get("task"), t.get("workdir", "."), t.get("effort", DEFAULT_EFFORT),
                                  t.get("timeout_s", DEFAULT_TIMEOUT_S), t.get("family", DEFAULT_FAMILY))

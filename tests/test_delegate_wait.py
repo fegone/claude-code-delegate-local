@@ -259,3 +259,21 @@ def test_watch_fields():
     assert watch_fields(['cx-a'], tag='batch name', expect=3) == {
         'watch': "delegate-wait --tag 'batch name' --expect 3"
     }
+
+
+@pytest.mark.parametrize('prefix', ['cx', 'gm', 'dsh'])
+def test_tag_recently_used_matches_watcher_state_and_lookback(tmp_path, monkeypatch, prefix):
+    import time
+
+    from delegate_state import tag_recently_used
+
+    monkeypatch.delenv('DELEGATE_WAIT_TAG_LOOKBACK_S', raising=False)
+    state(tmp_path, monkeypatch, prefix=prefix, tag='batch', submitted_at=time.time() - 30)
+    assert tag_recently_used('batch')
+    assert not tag_recently_used('other')
+    assert not tag_recently_used('batch', lookback_s=10)
+    monkeypatch.setenv('DELEGATE_WAIT_TAG_LOOKBACK_S', '10.5')
+    assert not tag_recently_used('batch')
+    for invalid in ('', '-1', 'nan', 'inf', 'invalid'):
+        monkeypatch.setenv('DELEGATE_WAIT_TAG_LOOKBACK_S', invalid)
+        assert tag_recently_used('batch')

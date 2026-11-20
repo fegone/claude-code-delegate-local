@@ -15,6 +15,23 @@ import unicodedata
 TERMINAL = frozenset({'done', 'failed', 'cancelled', 'timeout', 'auth_failed', 'lost', 'killed_on_restart'})
 METADATA_FIELDS = ('persist_error', 'warnings', 'truncated', 'final_response_length', 'failure_kind', 'tag')
 TAG_PATTERN = re.compile(r'[a-z0-9][a-z0-9-]{0,39}')
+TAG_LOOKBACK_S = 600
+
+
+def tag_lookback_seconds(default=TAG_LOOKBACK_S) -> float:
+    try:
+        seconds = float(os.getenv('DELEGATE_WAIT_TAG_LOOKBACK_S', default))
+    except ValueError:
+        return default
+    return seconds if math.isfinite(seconds) and seconds >= 0 else default
+
+
+def provider_state_dir(backend, home=None) -> Path:
+    override = os.getenv(f'DELEGATE_{backend}_STATE_DIR')
+    if override:
+        return Path(enforce_isolation(override))
+    home = Path.home() if home is None else Path(home)
+    return Path(enforce_isolation(home / f'.{backend.lower()}-jobs'))
 
 
 def valid_tag(tag) -> bool:
@@ -233,3 +250,14 @@ def remote_jobs(base: Path, ids=None, exclude_sid=None, since=None) -> dict:
             if jid not in found or found[jid]['status'] == 'lost':
                 found[jid] = job
     return found
+
+
+def tag_recently_used(tag, lookback_s=TAG_LOOKBACK_S, home=None) -> bool:
+    """Check persisted submissions in the same provider directories as delegate-wait."""
+    since = time.time() - tag_lookback_seconds(lookback_s)
+    bases = [provider_state_dir(backend, home) for backend in ('CODEX', 'GEMINI', 'DSH')]
+    return any(
+        job.get('tag') == tag and job.get('submitted_at', -math.inf) >= since
+        for base in bases
+        for job in remote_jobs(base, since=since).values()
+    )
