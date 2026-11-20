@@ -18,8 +18,11 @@ ROOT = os.path.dirname(HERE)
 FAKE = '''#!{py}
 import sys, time
 a = sys.argv[1:]
+if a == ["--version"]:
+    print("codex-cli 0.169.0")
+    sys.exit(0)
 out = a[a.index("-o") + 1]
-kv = dict(p.split("=", 1) for p in a[-1].split(";") if "=" in p)
+kv = dict(p.split("=", 1) for p in a[-1].splitlines()[0].split(";") if "=" in p)
 log = kv.get("log")
 if log:
     open(log, "a").write("S %f\\n" % time.time())
@@ -377,7 +380,7 @@ async def test_job_file_modes(env):
 
 def test_truncation_by_characters():
     t = server._truncate_words("A" * 50000)
-    assert len(t) < 5000 and "truncated" in t
+    assert t.startswith("A" * 900 + " …") and "truncated" in t
 
 
 async def test_home_and_root_workdir_refused(env):
@@ -386,3 +389,35 @@ async def test_home_and_root_workdir_refused(env):
         assert r["success"] is False, bad
         d = await server.delegate_to_codex(task="x", workdir=bad)
         assert d["success"] is False, bad
+
+
+@pytest.mark.parametrize(("used", "override", "expected"), [
+    (66, False, "high"), (70, False, "high"), (71, False, "low"), (71, True, "high"),
+])
+async def test_codex_quota_downgrades_both_entry_points(env, monkeypatch, used, override, expected):
+    _write_session(server.CODEX_SESSIONS_DIR, used)
+    launched = []
+
+    async def run(task, model, effort, *args, **kwargs):
+        launched.append((task, effort))
+        return {"success": True, "final_response": "done"}
+
+    monkeypatch.setattr(server, "_run_codex_job", run)
+    result = await server.submit_codex(
+        [{"task": "queued", "workdir": _wd(env, "sub"), "effort": "high", "why": "Complex task"}],
+        allow_over_quota=override,
+    )
+    jid = result["jobs"][0]["id"]
+    assert server._codex_jobs[jid]["effort"] == expected
+    assert "warning" in result
+    if expected == "low":
+        assert jid in result["warning"] and "high" in result["warning"]
+
+    direct = await server.delegate_to_codex(
+        "direct", workdir=_wd(env, "direct"), effort="high", why="Complex task",
+        allow_over_quota=override,
+    )
+    assert direct["success"]
+    assert ("direct\n\nYour sandbox cannot open sockets: do not stop for that and do not return partial work.",
+            expected) in launched
+    assert ("high" in direct["warning"]) == (expected == "low")

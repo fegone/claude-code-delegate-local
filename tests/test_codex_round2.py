@@ -17,8 +17,11 @@ import server
 FAKE = '''#!{py}
 import sys, time, os, json
 a = sys.argv[1:]
+if a == ["--version"]:
+    print("codex-cli 0.169.0")
+    sys.exit(0)
 out = a[a.index("-o") + 1]
-kv = dict(p.split("=", 1) for p in a[-1].split(";") if "=" in p)
+kv = dict(p.split("=", 1) for p in a[-1].splitlines()[0].split(";") if "=" in p)
 log = kv.get("log")
 if log:
     open(log, "a").write("S %f\\n" % time.time())
@@ -185,10 +188,10 @@ async def test_submit_with_broken_lock_storage_runs_nothing(env, monkeypatch):
         raise AssertionError("codex spawned with no lock storage")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
 
-    # The default model is gpt-6.1-terra, so validation probes `codex --version` before the
+    # The default model is gpt-6.2-sol, so validation probes `codex --version` before the
     # lock step. Stub the probe so only a real codex job spawn can trip `boom`.
     async def new_cli():
-        return (0, 159, 2)
+        return (0, 169, 0)
     monkeypatch.setattr(server, "_codex_installed_version", new_cli)
     r = await server.submit_codex([{"task": "x", "workdir": _wd(env, "w")}])
     assert r["success"] is False
@@ -439,6 +442,24 @@ async def test_poll_reports_jobs_of_other_live_servers(env):
     q = (await server.poll_codex(["cx-q"]))["jobs"][0]
     assert q["status"] == "lost" and q["owner"]["alive"] is False
     assert (state / "jobs.othersid.json").exists(), "poll must stay read-only"
+
+
+async def test_full_poll_uses_legacy_limits_for_remote_jobs(env):
+    await server.poll_codex([])
+    job = {"id": "cx-done", "status": "done", "final_response": "x" * 5000,
+           "why": "Audit", "tag": "review"}
+    full = server._codex_job_view(job, full=True)["final_response"]
+    assert full.startswith("x" * 4000 + " …")
+    state = _remote_file(env, "othersid", {"cx-done": dict(job, final_response=full)})
+    owner = server._flock_try(state / "owner.othersid.lock")
+    try:
+        short_job = (await server.poll_codex(["cx-done"]))["jobs"][0]
+        full_job = (await server.poll_codex(["cx-done"], full=True))["jobs"][0]
+        assert short_job["final_response"].startswith("x" * 900 + " …")
+        assert full_job["final_response"] == full
+        assert full_job["why"] == "Audit" and full_job["tag"] == "review"
+    finally:
+        owner.close()
 
 
 async def test_poll_shows_own_job_details(env):

@@ -705,3 +705,18 @@ def test_nudge_that_resumes_work_still_updates_final_response():
     assert r["final_response"] == "Tests pass: 12/12.", r
     assert r["nudge_reply"] is None, r
     print("PASS nudge that resumes work still updates final_response")
+
+
+def test_delegate_batch_can_return_full_text(monkeypatch):
+    message = "x" * 1200
+
+    async def dispatch(**kwargs):
+        return {"success": True, "final_response": message}
+
+    monkeypatch.setattr(server, "_dispatch_bounded", dispatch)
+    tasks = [{"agent_name": "worker", "task": "write"}]
+    batch = getattr(server.delegate_batch, "fn", server.delegate_batch)
+    short = run_coro(batch(tasks))["results"][0]["final_response"]
+    assert len(short) == 900
+    assert short.endswith(" [trunc]")
+    assert run_coro(batch(tasks, full=True))["results"][0]["final_response"] == message
