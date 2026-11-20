@@ -35,7 +35,7 @@ import time
 import uuid
 from collections import deque
 
-from delegate_state import enforce_isolation, isolation_environment, redacted_exception, workdir_forbidden, state_directories, METADATA_FIELDS, TERMINAL, metadata, persist_failed, remote_jobs, read_json, watch_fields, sanitize_snapshot
+from delegate_state import enforce_isolation, isolation_environment, redacted_exception, workdir_forbidden, state_directories, METADATA_FIELDS, TERMINAL, metadata, persist_failed, remote_jobs, read_json, tag_recently_used, valid_tag, watch_fields, sanitize_snapshot
 
 EFFORTS = ("low", "medium", "high")
 DEFAULT_EFFORT = "medium"
@@ -907,11 +907,19 @@ class GeminiJobs:
             if not isinstance(t, dict):
                 errors.append({"index": i, "error": "cada tarea debe ser un objeto"})
                 continue
+            if "tag" in t and not valid_tag(t["tag"]):
+                errors.append({"index": i, "error": "tag inválido"})
+                continue
+            if (tag := t.get("tag")) and tag_recently_used(tag):
+                errors.append({"index": i, "error": f"tag '{tag}' was used in the last 10 minutes; pick a unique tag"})
+                continue
             err, norm = validate(t.get("task"), t.get("workdir", "."), t.get("effort", DEFAULT_EFFORT),
                                  t.get("timeout_s", DEFAULT_TIMEOUT_S), t.get("family", DEFAULT_FAMILY))
             if err:
                 errors.append({"index": i, **err})
             else:
+                if "tag" in t:
+                    norm["tag"] = t["tag"]
                 planned.append((i, t["task"], norm))
         if errors:
             return {"success": False, "error": "tareas inválidas; no se lanzó ninguna", "jobs": errors}
@@ -930,14 +938,18 @@ class GeminiJobs:
                 "task_preview": task.strip()[:60], "submitted_at": time.time(),
                 "root": os.path.realpath(norm["workdir"]), "queue_reason": "waiting_for_slot",
             }
+            if "tag" in norm:
+                self.jobs[jid]["tag"] = norm["tag"]
             self.rt[jid] = {"task": task, "proc": None, "atask": None, "done": asyncio.Event(), "result": None}
             self.queue.append(jid)
             out.append({"index": i, "id": jid, "status": "queued"})
         self._pump()
         self._trim()
         self.save()
+        tags = {t.get("tag") for t in tasks}
+        tag = tags.pop() if len(tags) == 1 else None
         return {"jobs": [{**o, "status": self.jobs[o["id"]]["status"]} for o in out],
-                "max_concurrent": self._max_concurrent(), **watch_fields(o["id"] for o in out)}
+                "max_concurrent": self._max_concurrent(), **watch_fields((o["id"] for o in out), tag=tag)}
 
     def _running(self) -> list[dict]:
         return [j for j in self.jobs.values() if j["status"] == "running"]

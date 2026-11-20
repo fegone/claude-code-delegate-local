@@ -26,7 +26,7 @@ import time
 import uuid
 from collections import deque
 
-from delegate_state import enforce_isolation, isolation_environment, redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata, persist_failed, owner_alive, watch_fields
+from delegate_state import enforce_isolation, isolation_environment, redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata, persist_failed, owner_alive, tag_recently_used, valid_tag, watch_fields
 from gemini_jobs import redact
 
 MAX_TIMEOUT_S = 7200
@@ -460,6 +460,8 @@ class DshJobs:
     def validate(self, t) -> tuple[dict | None, str | None]:
         if not isinstance(t, dict):
             return None, "elemento no es un objeto"
+        if "tag" in t and not valid_tag(t["tag"]):
+            return None, "tag inválido"
         task = t.get("task")
         if not isinstance(task, str) or not task.strip():
             return None, "task vacío"
@@ -481,7 +483,10 @@ class DshJobs:
             p = os.path.join(home, d)
             if real == p or real.startswith(p + os.sep):
                 return None, f"workdir dentro de {p} no permitido"
-        return {"task": task, "model": t["model"], "timeout_s": timeout_s, "workdir": real}, None
+        plan = {"task": task, "model": t["model"], "timeout_s": timeout_s, "workdir": real}
+        if "tag" in t:
+            plan["tag"] = t["tag"]
+        return plan, None
 
     async def submit(self, tasks) -> dict:
         if (off := disabled()):
@@ -492,6 +497,8 @@ class DshJobs:
         planned, errors = [], []
         for i, t in enumerate(tasks):
             p, err = self.validate(t)
+            if not err and (tag := p.get("tag")) and tag_recently_used(tag):
+                err = f"tag '{tag}' was used in the last 10 minutes; pick a unique tag"
             if err:
                 errors.append({"index": i, "error": err,
                                **({"failure_kind": "workdir_forbidden"}
@@ -529,6 +536,8 @@ class DshJobs:
                 "pid": None, "error": None, "final_response": None,
                 "project": p["ident"][0], "root": p["ident"][1], "queue_reason": None,
             }
+            if "tag" in p:
+                self.jobs[jid]["tag"] = p["tag"]
             self.rt[jid] = {"task": p["task"], "proc": None, "atask": None, "locks": None}
             if locks is not None:
                 self.start(jid, locks)
@@ -539,8 +548,10 @@ class DshJobs:
         for e in out:
             e["status"] = self.jobs[e["id"]]["status"]
         self.save()
+        tags = {p.get("tag") for p in planned}
+        tag = tags.pop() if len(tags) == 1 else None
         return {"jobs": out, "max_concurrent": CFG.max_concurrent,
-                "max_per_project": CFG.max_per_project, **watch_fields(e["id"] for e in out)}
+                "max_per_project": CFG.max_per_project, **watch_fields((e["id"] for e in out), tag=tag)}
 
     # ── scheduling ─────────────────────────────────────────────────────────────────
     def start(self, jid: str, locks: list) -> None:

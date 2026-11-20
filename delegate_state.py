@@ -6,15 +6,36 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shlex
 import sys
 import time
 import unicodedata
 
 TERMINAL = frozenset({'done', 'failed', 'cancelled', 'timeout', 'auth_failed', 'lost', 'killed_on_restart'})
-METADATA_FIELDS = ('persist_error', 'warnings', 'truncated', 'final_response_length', 'failure_kind')
-WATCH_HINT = ('Start this with the Monitor tool (or Bash run_in_background) right now: '
-              'it is the only way you get notified when the jobs end. Never rely on remembering to poll.')
+METADATA_FIELDS = ('persist_error', 'warnings', 'truncated', 'final_response_length', 'failure_kind', 'tag')
+TAG_PATTERN = re.compile(r'[a-z0-9][a-z0-9-]{0,39}')
+TAG_LOOKBACK_S = 600
+
+
+def tag_lookback_seconds(default=TAG_LOOKBACK_S) -> float:
+    try:
+        seconds = float(os.getenv('DELEGATE_WAIT_TAG_LOOKBACK_S', default))
+    except ValueError:
+        return default
+    return seconds if math.isfinite(seconds) and seconds >= 0 else default
+
+
+def provider_state_dir(backend, home=None) -> Path:
+    override = os.getenv(f'DELEGATE_{backend}_STATE_DIR')
+    if override:
+        return Path(enforce_isolation(override))
+    home = Path.home() if home is None else Path(home)
+    return Path(enforce_isolation(home / f'.{backend.lower()}-jobs'))
+
+
+def valid_tag(tag) -> bool:
+    return isinstance(tag, str) and TAG_PATTERN.fullmatch(tag) is not None
 
 
 class IsolationViolation(RuntimeError):
@@ -100,8 +121,11 @@ def workdir_forbidden(workdir, extra=()) -> bool:
                for state in map(Path, state_directories(extra)))
 
 
-def watch_fields(ids) -> dict:
-    return {'watch': shlex.join(['delegate-wait', *ids]), 'watch_hint': WATCH_HINT}
+def watch_fields(ids, tag=None, expect=None) -> dict:
+    args = list(ids)
+    if tag is not None:
+        args = ['--tag', tag, '--expect', str(expect or len(args))]
+    return {'watch': shlex.join(['delegate-wait', *args])}
 
 
 def owner_alive(base: Path, sid: str) -> bool:
@@ -127,7 +151,7 @@ def read_json(path: Path):
 
 
 def sanitize_metadata(job: dict) -> dict:
-    out = {k: job[k] for k in ('persist_error', 'failure_kind') if isinstance(job.get(k), str)}
+    out = {k: job[k] for k in ('persist_error', 'failure_kind', 'tag') if isinstance(job.get(k), str)}
     if isinstance(job.get('warnings'), list):
         out['warnings'] = [w for w in job['warnings'] if isinstance(w, str)]
     if isinstance(job.get('truncated'), bool):
@@ -186,13 +210,15 @@ def persist_failed(jobs: dict, backend: str, error: OSError) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-def remote_jobs(base: Path, ids=None, exclude_sid=None) -> dict:
+def remote_jobs(base: Path, ids=None, exclude_sid=None, since=None) -> dict:
     found = {}
     for path in sorted(base.glob('jobs.*.json')):
         sid = path.name[5:-5]
         if sid == exclude_sid:
             continue
         try:
+            if since is not None and path.stat().st_mtime < since:
+                continue
             data = read_json(path)
         except (OSError, ValueError):
             continue
@@ -209,6 +235,10 @@ def remote_jobs(base: Path, ids=None, exclude_sid=None) -> dict:
             job = sanitize_snapshot(jid, raw)
             if job is None:
                 continue
+            if since is not None:
+                submitted = job.get('submitted_at', job.get('started_at'))
+                if submitted is None or submitted < since:
+                    continue
             job['owner'] = {'sid': sid, 'pid': server.get('pid'), 'alive': alive}
             if not alive and job['status'] not in TERMINAL:
                 job.update(status='lost', error='owner server is gone; the job can no longer progress')
@@ -220,3 +250,14 @@ def remote_jobs(base: Path, ids=None, exclude_sid=None) -> dict:
             if jid not in found or found[jid]['status'] == 'lost':
                 found[jid] = job
     return found
+
+
+def tag_recently_used(tag, lookback_s=TAG_LOOKBACK_S, home=None) -> bool:
+    """Check persisted submissions in the same provider directories as delegate-wait."""
+    since = time.time() - tag_lookback_seconds(lookback_s)
+    bases = [provider_state_dir(backend, home) for backend in ('CODEX', 'GEMINI', 'DSH')]
+    return any(
+        job.get('tag') == tag and job.get('submitted_at', -math.inf) >= since
+        for base in bases
+        for job in remote_jobs(base, since=since).values()
+    )

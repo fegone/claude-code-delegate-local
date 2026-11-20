@@ -1017,3 +1017,64 @@ def test_private_home_sets_default_keychain(tmp_path):
         assert d["DefaultKeychain"][0]["DbName"].endswith("/Library/Keychains/login.keychain")
     finally:
         __import__("shutil").rmtree(root, ignore_errors=True)
+
+
+@pytest.mark.parametrize('tag', ['', 'Upper', 'bad_tag', 'a\n', 'a' * 41, None])
+async def test_submit_rejects_invalid_tag_atomically(wd, tag):
+    result = await gemini_jobs.JOBS.submit([
+        {'task': 'OK', 'workdir': wd}, {'task': 'OK', 'workdir': wd, 'tag': tag},
+    ])
+    assert result['success'] is False
+    assert result['jobs'][0]['index'] == 1
+    assert 'tag' in result['jobs'][0]['error']
+    assert not gemini_jobs.JOBS.jobs
+
+
+@pytest.mark.parametrize('second_tag', ['batch', 'other', None])
+async def test_submit_tag_metadata_and_watch(wd, monkeypatch, second_tag):
+    from delegate_wait import read_jobs
+
+    monkeypatch.setattr(gemini_jobs, 'agy_bin', lambda: '/fake/agy')
+    monkeypatch.setattr(gemini_jobs.JOBS, '_pump', lambda: None)
+    tasks = [{'task': 'OK', 'workdir': wd, 'tag': 'batch'},
+             {'task': 'OK', 'workdir': wd}]
+    if second_tag is not None:
+        tasks[1]['tag'] = second_tag
+    result = await gemini_jobs.JOBS.submit(tasks)
+    ids = [job['id'] for job in result['jobs']]
+    expected = '--tag batch --expect 2' if second_tag == 'batch' else ' '.join(ids)
+    snapshot = read_jobs(ids)
+    assert [snapshot[jid].get('tag') for jid in ids] == ['batch', second_tag]
+    assert result['watch'] == 'delegate-wait ' + expected
+    assert 'watch_hint' not in result
+
+
+@pytest.mark.parametrize('age', [0, 601])
+async def test_submit_tag_reuse_across_calls(wd, monkeypatch, age):
+    import time
+
+    monkeypatch.delenv('DELEGATE_WAIT_TAG_LOOKBACK_S', raising=False)
+    monkeypatch.setattr(gemini_jobs, 'agy_bin', lambda: '/fake/agy')
+    jobs = gemini_jobs.JOBS
+    monkeypatch.setattr(jobs, '_pump', lambda: None)
+    tagged = {'task': 'OK', 'workdir': wd, 'tag': 'batch'}
+    untagged = {'task': 'OK', 'workdir': wd}
+    first = await jobs.submit([tagged, tagged])
+    assert first['watch'] == 'delegate-wait --tag batch --expect 2'
+    ids = {job['id'] for job in first['jobs']}
+    if age:
+        for jid in ids:
+            jobs.jobs[jid]['submitted_at'] = time.time() - age
+        jobs.save()
+
+    second = await jobs.submit([untagged, tagged])
+    if age:
+        assert len([job['id'] for job in second['jobs']]) == 2
+    else:
+        assert second['success'] is False
+        errors = [job for job in second['jobs'] if 'error' in job]
+        assert errors == [{
+            'index': 1,
+            'error': "tag 'batch' was used in the last 10 minutes; pick a unique tag",
+        }]
+        assert set(jobs.jobs) == ids

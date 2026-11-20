@@ -512,3 +512,64 @@ async def test_launcher_stderr_is_surfaced_when_pid_never_appears(env, monkeypat
     assert "launcher.pid" in v["error"]
     assert "herdr server not reachable" in v["error"], v["error"]
     assert "abc123secretvalue" not in v["error"]
+
+
+@pytest.mark.parametrize('tag', ['-bad', 'Upper', 123, 'a' * 41])
+async def test_submit_rejects_invalid_tag_atomically(env, tag):
+    wd = workdir(env / 'tag-reject')
+    result = await dsh_jobs.JOBS.submit([T(wd, 'ok'), T(wd, 'ok', tag=tag)])
+    assert result['success'] is False
+    assert result['jobs'][1]['index'] == 1
+    assert 'tag' in result['jobs'][1]['error']
+    assert not dsh_jobs.JOBS.jobs
+
+
+@pytest.mark.parametrize('second_tag', ['batch', 'other', None])
+async def test_submit_tag_metadata_and_watch(env, second_tag):
+    from delegate_wait import read_jobs
+
+    wd = workdir(env / 'tag-submit')
+    tasks = [T(wd, 'ok', tag='batch'), T(wd, 'ok')]
+    if second_tag is not None:
+        tasks[1]['tag'] = second_tag
+    result = await dsh_jobs.JOBS.submit(tasks)
+    ids = [job['id'] for job in result['jobs']]
+    expected = '--tag batch --expect 2' if second_tag == 'batch' else ' '.join(ids)
+    snapshot = read_jobs(ids)
+    assert [snapshot[jid].get('tag') for jid in ids] == ['batch', second_tag]
+    for jid in ids:
+        await wait_status(dsh_jobs.JOBS, jid, {'done', 'failed'})
+    assert result['watch'] == 'delegate-wait ' + expected
+    assert 'watch_hint' not in result
+
+
+@pytest.mark.parametrize('age', [0, 601])
+async def test_submit_tag_reuse_across_calls(env, monkeypatch, age):
+    import time
+
+    monkeypatch.delenv('DELEGATE_WAIT_TAG_LOOKBACK_S', raising=False)
+    jobs = dsh_jobs.JOBS
+    monkeypatch.setattr(jobs, 'pump', lambda: None)
+    monkeypatch.setattr(jobs, 'try_locks', lambda *_: None)
+    wd = workdir(env / 'tag-reuse')
+    tagged = T(wd, 'ok', tag='batch')
+    untagged = T(wd, 'ok')
+    first = await jobs.submit([tagged, tagged])
+    assert first['watch'] == 'delegate-wait --tag batch --expect 2'
+    ids = {job['id'] for job in first['jobs']}
+    if age:
+        for jid in ids:
+            jobs.jobs[jid]['submitted_at'] = time.time() - age
+        jobs.save()
+
+    second = await jobs.submit([untagged, tagged])
+    if age:
+        assert len([job['id'] for job in second['jobs']]) == 2
+    else:
+        assert second['success'] is False
+        errors = [job for job in second['jobs'] if 'error' in job]
+        assert errors == [{
+            'index': 1,
+            'error': "tag 'batch' was used in the last 10 minutes; pick a unique tag",
+        }]
+        assert set(jobs.jobs) == ids
