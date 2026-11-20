@@ -1017,3 +1017,33 @@ def test_private_home_sets_default_keychain(tmp_path):
         assert d["DefaultKeychain"][0]["DbName"].endswith("/Library/Keychains/login.keychain")
     finally:
         __import__("shutil").rmtree(root, ignore_errors=True)
+
+
+@pytest.mark.parametrize('tag', ['', 'Upper', 'bad_tag', 'a\n', 'a' * 41, None])
+async def test_submit_rejects_invalid_tag_atomically(wd, tag):
+    result = await gemini_jobs.JOBS.submit([
+        {'task': 'OK', 'workdir': wd}, {'task': 'OK', 'workdir': wd, 'tag': tag},
+    ])
+    assert result['success'] is False
+    assert result['jobs'][0]['index'] == 1
+    assert 'tag' in result['jobs'][0]['error']
+    assert not gemini_jobs.JOBS.jobs
+
+
+@pytest.mark.parametrize('second_tag', ['batch', 'other', None])
+async def test_submit_tag_metadata_and_watch(wd, monkeypatch, second_tag):
+    from delegate_wait import read_jobs
+
+    monkeypatch.setattr(gemini_jobs, 'agy_bin', lambda: '/fake/agy')
+    monkeypatch.setattr(gemini_jobs.JOBS, '_pump', lambda: None)
+    tasks = [{'task': 'OK', 'workdir': wd, 'tag': 'batch'},
+             {'task': 'OK', 'workdir': wd}]
+    if second_tag is not None:
+        tasks[1]['tag'] = second_tag
+    result = await gemini_jobs.JOBS.submit(tasks)
+    ids = [job['id'] for job in result['jobs']]
+    expected = '--tag batch --expect 2' if second_tag == 'batch' else ' '.join(ids)
+    snapshot = read_jobs(ids)
+    assert [snapshot[jid].get('tag') for jid in ids] == ['batch', second_tag]
+    assert result['watch'] == 'delegate-wait ' + expected
+    assert 'watch_hint' not in result

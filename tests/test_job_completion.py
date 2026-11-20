@@ -88,7 +88,7 @@ async def test_codex_watch_empty_and_short(fake):
     result = await server.submit_codex([T(fake[0], task='sleep=0;say=')])
     jid = result['jobs'][0]['id']
     assert result['watch'] == 'delegate-wait ' + jid
-    assert 'Monitor' in result['watch_hint']
+    assert 'watch_hint' not in result  # the tool description already tells Mario to start Monitor
     finished = (await _wait([jid], lambda jobs: jobs[0]['status'] == 'done'))[0]
     assert set(finished['warnings']) == {'empty_response', 'very_short_run'}
     persisted = json.loads(Path(server._codex_state_file()).read_text())['jobs'][jid]

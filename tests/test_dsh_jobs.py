@@ -512,3 +512,32 @@ async def test_launcher_stderr_is_surfaced_when_pid_never_appears(env, monkeypat
     assert "launcher.pid" in v["error"]
     assert "herdr server not reachable" in v["error"], v["error"]
     assert "abc123secretvalue" not in v["error"]
+
+
+@pytest.mark.parametrize('tag', ['-bad', 'Upper', 123, 'a' * 41])
+async def test_submit_rejects_invalid_tag_atomically(env, tag):
+    wd = workdir(env / 'tag-reject')
+    result = await dsh_jobs.JOBS.submit([T(wd, 'ok'), T(wd, 'ok', tag=tag)])
+    assert result['success'] is False
+    assert result['jobs'][1]['index'] == 1
+    assert 'tag' in result['jobs'][1]['error']
+    assert not dsh_jobs.JOBS.jobs
+
+
+@pytest.mark.parametrize('second_tag', ['batch', 'other', None])
+async def test_submit_tag_metadata_and_watch(env, second_tag):
+    from delegate_wait import read_jobs
+
+    wd = workdir(env / 'tag-submit')
+    tasks = [T(wd, 'ok', tag='batch'), T(wd, 'ok')]
+    if second_tag is not None:
+        tasks[1]['tag'] = second_tag
+    result = await dsh_jobs.JOBS.submit(tasks)
+    ids = [job['id'] for job in result['jobs']]
+    expected = '--tag batch --expect 2' if second_tag == 'batch' else ' '.join(ids)
+    snapshot = read_jobs(ids)
+    assert [snapshot[jid].get('tag') for jid in ids] == ['batch', second_tag]
+    for jid in ids:
+        await wait_status(dsh_jobs.JOBS, jid, {'done', 'failed'})
+    assert result['watch'] == 'delegate-wait ' + expected
+    assert 'watch_hint' not in result

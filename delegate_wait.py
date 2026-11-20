@@ -11,26 +11,33 @@ import time
 from delegate_state import enforce_isolation, TERMINAL, remote_jobs, safe_text, safe_output
 
 UNKNOWN_GRACE_S = 30
+TAG_LOOKBACK_S = 600
 
 
-def read_jobs(ids) -> dict:
+def read_jobs(ids=None, since=None) -> dict:
     out = {}
     for prefix, backend, default in [('cx-', 'CODEX', '.codex-jobs'),
                                       ('gm-', 'GEMINI', '.gemini-jobs'),
                                       ('dsh-', 'DSH', '.dsh-jobs')]:
-        wanted = {j for j in ids if j.startswith(prefix)}
-        if wanted:
+        wanted = None if ids is None else {j for j in ids if j.startswith(prefix)}
+        if wanted is None or wanted:
             base = Path(enforce_isolation(os.getenv(f'DELEGATE_{backend}_STATE_DIR') or Path.home() / default))
-            out.update(remote_jobs(base, wanted))
+            out.update(remote_jobs(base, wanted, since=since))
     return out
 
 
 def format_job(job: dict) -> str:
     field = lambda value: safe_text(value, 256)
-    preview = safe_text(job.get('final_response') or job.get('error') or '', 110)
-    return (f"{field(job['id'])} {field(str(job['status']).upper())} ({field(job.get('model') or '-')}, "
-            f"{field(format(job.get('elapsed_s', 0), '.1f'))}s) kind={field(job.get('failure_kind') or '-')} "
-            f"warnings={field(','.join(job.get('warnings') or []) or '-')} {preview}").rstrip()
+    preview = safe_text(job.get('final_response') or job.get('error') or '', 451)
+    if len(preview) > 450:
+        preview = preview[:450].rstrip() + ' [trunc]'
+    line = (f"{field(job['id'])} {field(str(job['status']).upper())} ({field(job.get('model') or '-')}, "
+            f"{field(format(job.get('elapsed_s', 0), '.1f'))}s)")
+    if job.get('failure_kind'):
+        line += f" kind={field(job['failure_kind'])}"
+    if job.get('warnings'):
+        line += f" warnings={field(','.join(job['warnings']))}"
+    return f"{line} {preview}".rstrip()
 
 
 def _seconds(value):
@@ -43,10 +50,23 @@ def _seconds(value):
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--all', action='store_true', dest='wait_all')
+    parser.add_argument('--fail-fast', action='store_true', help='with --all, print the first failure and exit')
+    parser.add_argument('--tag', help='discover jobs with this metadata tag')
+    parser.add_argument('--expect', type=int, help='minimum number of tagged jobs to discover')
     parser.add_argument('--timeout', type=_seconds)
     parser.add_argument('--json', action='store_true', dest='as_json', help='one JSON object per completion line')
-    parser.add_argument('ids', nargs='+')
+    parser.add_argument('ids', nargs='*')
     args = parser.parse_args(argv)
+    if args.tag is not None:
+        if args.ids:
+            parser.error('job ids and --tag are mutually exclusive')
+        if args.expect is None or args.expect < 1:
+            parser.error('--tag requires --expect >= 1')
+    else:
+        if args.expect is not None:
+            parser.error('--expect requires --tag')
+        if not args.ids:
+            parser.error('provide job ids or --tag')
     if any(not j.startswith(('cx-', 'gm-', 'dsh-')) for j in args.ids):
         parser.error('job ids must start with cx-, gm-, or dsh-')
     try:
@@ -57,13 +77,25 @@ def main(argv=None) -> int:
         interval = 5.0
     ids = list(dict.fromkeys(args.ids))
     started = time.monotonic()
+    since = None
+    if args.tag is not None:
+        try:
+            lookback = _seconds(os.getenv('DELEGATE_WAIT_TAG_LOOKBACK_S', TAG_LOOKBACK_S))
+        except (ValueError, argparse.ArgumentTypeError):
+            lookback = TAG_LOOKBACK_S
+        since = time.time() - lookback
     seen, done = set(), {}
 
     def emit(job):
         print(json.dumps(safe_output(job), ensure_ascii=False) if args.as_json else format_job(job), flush=True)
 
     while True:
-        jobs = read_jobs([j for j in ids if j not in done])
+        if ids:
+            jobs = read_jobs([j for j in ids if j not in done])
+        else:
+            jobs = {jid: job for jid, job in read_jobs(since=since).items() if job.get('tag') == args.tag}
+            if len(jobs) >= args.expect:
+                ids = list(jobs)
         for jid in ids:
             if jid in done:
                 continue
@@ -71,10 +103,13 @@ def main(argv=None) -> int:
             if job is not None:
                 seen.add(jid)
                 if job['status'] in TERMINAL:
+                    if args.wait_all and args.fail_fast and job['status'] != 'done':
+                        emit(job)
+                        return 1
                     done[jid] = job
                     if not args.wait_all:
                         emit(job)
-        if len(done) == len(ids):
+        if ids and len(done) == len(ids):
             if args.wait_all:
                 for jid in ids:
                     emit(done[jid])
@@ -82,12 +117,13 @@ def main(argv=None) -> int:
         elapsed = time.monotonic() - started
         if args.timeout is not None and elapsed >= args.timeout:
             return 3
-        if elapsed >= UNKNOWN_GRACE_S and any(j not in seen for j in ids):
+        unknown = not ids or any(j not in seen for j in ids)
+        if elapsed >= UNKNOWN_GRACE_S and unknown:
             return 2
         delay = interval
         if args.timeout is not None:
             delay = min(delay, max(0, args.timeout - elapsed))
-        if any(j not in seen for j in ids):
+        if unknown:
             delay = min(delay, max(0, UNKNOWN_GRACE_S - elapsed))
         time.sleep(delay)
 
