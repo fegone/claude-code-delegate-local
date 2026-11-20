@@ -14,8 +14,11 @@ import server
 FAKE = '''#!{py}
 import sys, time
 a = sys.argv[1:]
+if a == ["--version"]:
+    print("codex-cli 0.169.0")
+    sys.exit(0)
 out = a[a.index("-o") + 1]
-task = a[-1]
+task = a[-1].splitlines()[0]
 # task grammar: "sleep=<sec>;exit=<code>;say=<text>"
 kv = dict(p.split("=", 1) for p in task.split(";") if "=" in p)
 time.sleep(float(kv.get("sleep", "0")))
@@ -33,6 +36,7 @@ async def fake(tmp_path, monkeypatch):
     exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setattr(server, "CODEX_BIN", str(exe))
     monkeypatch.setattr(server, "CODEX_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("DELEGATE_CODEX_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(server, "CODEX_SESSIONS_DIR", str(tmp_path / "sessions"))
     monkeypatch.setattr(server, "CODEX_MAX_CONCURRENT", 4)
     monkeypatch.setattr(server, "CODEX_MAX_PER_PROJECT", 4)
@@ -85,7 +89,9 @@ async def test_submit_poll_done(fake):
     done = (await _wait([jid], lambda j: j[0]["status"] == "done"))[0]
     assert done["elapsed_s"] >= 0
     assert "truncated" in done["final_response"]
-    assert len(done["final_response"].split()) < 320
+    assert done["final_response"].split().count("word") == 120
+    full = (await server.poll_codex([jid], full=True))["jobs"][0]
+    assert full["final_response"].split().count("word") == 300
     # no leftover temp file in the workdir
     assert not [f for f in os.listdir(fake[0]) if f.startswith(".codex-last")]
 
@@ -206,3 +212,119 @@ async def test_delegate_to_codex_still_works(fake):
     assert r["success"] is True and r["final_response"] == "direct"
     bad = await server.delegate_to_codex(task="x", workdir=fake[0], model="nope")
     assert bad["success"] is False
+
+
+_CARD = "Your sandbox cannot open sockets: do not stop for that and do not return partial work."
+
+
+@pytest.mark.parametrize(("task", "preset", "expected"), [
+    ("sleep=0", None, True),
+    ("sleep=0;SocketS", None, False),
+    ("sleep=0;websockets", None, True),
+    ("sleep=0", "none", False),
+])
+async def test_codex_card(fake, task, preset, expected):
+    result = await server.submit_codex([T(fake[0], task=task, preset=preset)])
+    entry, = result["jobs"]
+    assert set(entry) == {"index", "id", "status"}
+    assert server._codex_rt[entry["id"]]["task"] == (
+        f"{task}\n\n{_CARD}" if expected else task
+    )
+
+
+async def test_codex_context_and_tag_persist(fake):
+    from pathlib import Path
+
+    Path(fake[0], "notes.txt").write_text("review context", encoding="utf-8")
+    result = await server.submit_codex([
+        T(fake[0], context_file="notes.txt", tag="review-1", effort="medium", why="Review changes"),
+        T(fake[1], tag="review-1"),
+    ])
+    ids = [entry["id"] for entry in result["jobs"]]
+    assert result["watch"] == "delegate-wait --tag review-1 --expect 2"
+    assert "Context file notes.txt:\nreview context" in server._codex_rt[ids[0]]["task"]
+    assert server._codex_rt[ids[0]]["task"].endswith(_CARD)
+    state = json.loads(Path(server._codex_state_file()).read_text())
+    assert state["jobs"][ids[0]]["tag"] == "review-1"
+    job = (await server.poll_codex(ids))["jobs"][0]
+    assert job["why"] == "Review changes"
+    assert job["tag"] == "review-1"
+
+    result = await server.submit_codex([T(fake[2], tag="review-1"), T(fake[3])])
+    assert result["success"] is False
+    assert result["jobs"] == [
+        {"index": 0, "error": "tag 'review-1' was used in the last 10 minutes; pick a unique tag"},
+        {"index": 1},
+    ]
+    assert set(server._codex_jobs) == set(ids)
+
+    result = await server.submit_codex([T(fake[2], tag="review-2"), T(fake[3])])
+    mixed_ids = [entry["id"] for entry in result["jobs"]]
+    assert result["watch"] == "delegate-wait " + " ".join(mixed_ids)
+
+
+async def test_codex_context_validation_is_atomic(fake):
+    from pathlib import Path
+
+    workdir = Path(fake[0])
+    (workdir / "notes.txt").write_text("x")
+    (workdir / "large.txt").write_bytes(b"x" * (65536 + 1))
+    (workdir / "link").symlink_to("notes.txt")
+    (workdir / "dir-link").symlink_to(".", target_is_directory=True)
+    (workdir / "directory").mkdir()
+    os.link(workdir / "notes.txt", workdir / "hardlink")
+    invalid = ["../w1", str(workdir / "notes.txt"), "large.txt", "link",
+               "dir-link/notes.txt", "directory", "missing", "hardlink"]
+    result = await server.submit_codex(
+        [T(fake[1])] + [T(fake[0], context_file=path) for path in invalid]
+    )
+    assert result["success"] is False
+    assert result["jobs"][0] == {"index": 0}
+    assert all("context_file" in job["error"] for job in result["jobs"][1:])
+    assert result["jobs"][-1]["error"] == "context_file no puede ser un hardlink"
+    assert not server._codex_jobs
+
+
+@pytest.mark.parametrize("why", [None, "", "  ", 123, "x" * 301])
+async def test_codex_higher_effort_requires_reason(fake, why):
+    result = await server.submit_codex([T(fake[0]), T(fake[1], effort="xhigh", why=why)])
+    assert result["success"] is False
+    assert "medium" in result["jobs"][1]["error"]
+    assert "why" in result["jobs"][1]["error"]
+    assert not server._codex_jobs
+
+
+async def test_codex_invalid_tag_is_atomic(fake):
+    result = await server.submit_codex([T(fake[0]), T(fake[1], tag="bad_tag")])
+    assert result["success"] is False
+    assert "tag" in result["jobs"][1]["error"]
+    assert not server._codex_jobs
+
+
+@pytest.mark.parametrize("status", ["failed", "timeout", "lost", "auth_failed"])
+@pytest.mark.parametrize("length", [3999, 4000, 6000])
+async def test_failure_text_caps(fake, status, length):
+    server._codex_ensure_loaded()
+    message = "é" * length
+    expected = message if length <= 4000 else message[:3992] + " [trunc]"
+    server._codex_jobs["cx-failure"] = {
+        "id": "cx-failure", "status": status, "error": message, "final_response": message,
+    }
+    for full in (False, True):
+        result = await server.poll_codex(["cx-failure"], full=full)
+        job, = result["jobs"]
+        assert job["error"] == job["final_response"] == expected
+    server._codex_save()
+    with open(server._codex_state_file()) as state:
+        stored = json.load(state)["jobs"]["cx-failure"]
+        assert stored["error"] == stored["final_response"] == expected
+
+
+def test_codex_tool_docstrings():
+    assert "Monitor" in server.submit_codex.__doc__
+    assert "downgrade" in server.submit_codex.__doc__
+    assert "why" in server.submit_codex.__doc__
+    for tool in (server.submit_codex, server.poll_codex):
+        assert "README" in tool.__doc__
+        assert "PHI/PII" in tool.__doc__
+        assert "verification" in tool.__doc__

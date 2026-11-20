@@ -15,6 +15,7 @@ License: MIT
 from __future__ import annotations
 
 from delegate_state import enforce_isolation, isolation_environment, IsolationViolation, redacted_exception, workdir_forbidden, METADATA_FIELDS, metadata as job_metadata, persist_failed, owner_alive, watch_fields, sanitize_metadata
+import delegate_state
 
 import asyncio
 import atexit
@@ -36,7 +37,7 @@ import time
 import urllib.parse
 import uuid
 from collections import deque
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -2772,6 +2773,8 @@ MAX_BATCH_SIZE = int(os.getenv("DELEGATE_MAX_BATCH_SIZE", "12"))
 async def delegate_batch(
     tasks: list[dict],
     ctx: Context | None = None,
+    *,
+    full: bool = False,
 ) -> dict:
     """
     Despacha hasta N agentes EN PARALELO en una sola llamada (asyncio.wait con latido).
@@ -2801,6 +2804,7 @@ async def delegate_batch(
                agent_name and task are required; rest use defaults.
                Hard cap MAX_BATCH_SIZE (default 12) tasks per call. For more, split into
                multiple calls or use sequential delegate_to_local_agent calls.
+        full: Return each final response in full. Defaults to a 900-character cap.
 
     Returns:
         dict with keys:
@@ -2964,6 +2968,12 @@ async def delegate_batch(
         raise
 
     results = [results_by_idx[i] for i in range(len(tasks))]
+    if not full:
+        suffix = " [trunc]"
+        for i, result in enumerate(results):
+            response = result.get("final_response")
+            if isinstance(response, str) and len(response) > 900:
+                results[i] = {**result, "final_response": response[:900 - len(suffix)] + suffix}
     elapsed = time.time() - t0
 
     successes = sum(1 for r in results if r.get("success"))
@@ -3059,13 +3069,9 @@ async def local_backend_status() -> dict:
 ## Privacy: cloud model → never use for projects with sensitive/regulated data (PHI/PII).
 ## ────────────────────────────────────────────────────────────────────────────────
 CODEX_BIN = os.environ.get("DELEGATE_CODEX_BIN", "codex")
-# Default = gpt-6.1-terra at effort low. Bench 2026-10-26: 24 runs, 4 tasks with hidden
-# tests x 3 reps, both low: Terra 6.1 17/17, 25/25, 33/34 (median), 58/59, in 244 s and
-# 27.0k output tokens; Sol 6.1 16/17, 25/25, 33/34, 58/59, in 785 s and 39.4k. Same
-# quality, 3.2x faster, 31% fewer tokens. Luna is no longer the default.
-# Escalate by hand, visibly: terra low -> sol low (multi-file refactor in a real repo, or
-# terra fails) -> sol medium (ambiguous design or diagnosis without reproduction).
-CODEX_DEFAULT_MODEL = os.environ.get("DELEGATE_CODEX_MODEL", "gpt-6.1-terra")
+# Owner decision 2026-11-20: Sol 6.2 at low by default, medium only with a written reason.
+# Historical bench 2026-10-26 (24 runs, both low): Terra 6.1 17/17, 25/25, 33/34 median, 58/59 in 244 s and 27.0k output tokens vs Sol 6.1 16/17, 25/25, 33/34, 58/59 in 785 s and 39.4k (3.2x time, 31% fewer tokens for Terra).
+CODEX_DEFAULT_MODEL = os.environ.get("DELEGATE_CODEX_MODEL", "gpt-6.2-sol")
 CODEX_DEFAULT_EFFORT = os.environ.get("DELEGATE_CODEX_EFFORT", "low")
 # 'danger-full-access' lets Codex run with no sandbox — gated behind an explicit env flag
 # so a routine dispatch can't request it.
@@ -3106,12 +3112,12 @@ async def _drain_capped(stream: asyncio.StreamReader, cap_bytes: int, on_chunk=N
 # 💰 Razona mucho por defecto: 5.475 tokens para contestar "ASTRA-OK". En trabajo
 # real come bastante más cuota que sol; no es el default de nada.
 # Catálogo actualizado el 2026-09-30 con el catálogo vivo de un ChatGPT Plus
-# (codex-cli 0.159.2). gpt-6.1-sol es el caballo de batalla actual y el default.
+# (codex-cli 0.159.2), cuando gpt-6.1-sol era el default.
 # ⚠️ Los ids gpt-6.1-* EXIGEN codex-cli >= 0.159: una CLI anterior no los conoce y
 # falla. Se comprueba antes de lanzar (ver _codex_version_error); no se auto-actualiza.
 # 2026-11-17 (Felix): 'sol' pasa a gpt-6.2-sol (probado por el plan de ChatGPT con
 # codex-cli 0.169.0). gpt-6.2-astra entra al catálogo y el alias 'astra' apunta a él (Felix, mismo día).
-# Generaciones: 6.1-terra (default, banco 2026-10-26) · 6.1-sol (escalada) · 6-astra
+# Generaciones: 6.2-sol (default) · 6.1-terra y 6.1-sol (banco 2026-10-26) · 6-astra
 # (frontier) · 6-sol (anterior) · 6-luna (rápido y barato, ya no default) · 5.6-* (viejos)
 # · 5.5/5.4 (legacy). Los ids ocultos del catálogo (reservas internas y el revisor
 # automático) no se exponen a propósito.
@@ -3123,7 +3129,7 @@ CODEX_PLAN_MODELS = {
     "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
 }
 # Alias cortos → id real del modelo. Permite delegar diciendo solo "terra"/"sol"/"astra"/"luna".
-# 'terra' vuelve (2026-10-26) y apunta a gpt-6.1-terra, el default. El viejo gpt-5.6-terra
+# 'terra' apunta a gpt-6.1-terra. El viejo gpt-5.6-terra
 # se pide por id completo o '5.6-terra'.
 CODEX_MODEL_ALIASES = {
     "terra": "gpt-6.1-terra",
@@ -3237,6 +3243,10 @@ async def delegate_to_codex(
     timeout_s: int = 1800,
     allow_over_quota: bool = False,
     ctx: Context | None = None,
+    *,
+    preset: str | None = None,
+    context_file: str | None = None,
+    why: str | None = None,
 ) -> dict:
     """
     Delega una tarea al OpenAI Codex CLI (`codex exec`), autenticado con la SUSCRIPCIÓN
@@ -3247,9 +3257,9 @@ async def delegate_to_codex(
     lo devuelve. Para lanzar varios sin bloquear: submit_codex / poll_codex / cancel_codex. Ideal para coding agéntico con GPT-6.x usando el plan del usuario.
 
     Se pueden pedir por nombre corto (alias) o id completo:
-      - 'terra'   → gpt-6.1-terra (DEFAULT, con effort 'low'; exige codex-cli >= 0.159)
+      - 'terra'   → gpt-6.1-terra (exige codex-cli >= 0.159)
       - '6.1-terra' → gpt-6.1-terra (mismo modelo, id corto)
-      - 'sol'     → gpt-6.2-sol   (escalada desde 2026-11-17; exige codex-cli >= 0.169)
+      - 'sol'     → gpt-6.2-sol   (DEFAULT, con effort 'low'; exige codex-cli >= 0.169)
       - 'astra'   → gpt-6.2-astra (frontier, desde 2026-11-17)
       - 'luna'    → gpt-6-luna    (rápido y barato; ya no es default)
       - '6-sol'   → gpt-6-sol     (generación anterior)
@@ -3264,7 +3274,7 @@ async def delegate_to_codex(
     Args:
         task: La instrucción para Codex (autónoma — incluye contexto y archivos objetivo).
         workdir: Directorio de trabajo (Codex opera aquí). Default: cwd del server.
-        model: Modelo o alias. Default 'terra' (gpt-6.1-terra). Acepta 'terra'/'sol'/'astra'/'luna'
+        model: Modelo o alias. Default 'sol' (gpt-6.2-sol). Acepta 'terra'/'sol'/'astra'/'luna'
                o el id completo. Debe resolver a uno permitido por el plan.
         effort: Esfuerzo de razonamiento (model_reasoning_effort). Default 'low'
                (DELEGATE_CODEX_EFFORT); '' = el de ~/.codex/config.toml. Valores:
@@ -3275,16 +3285,25 @@ async def delegate_to_codex(
                'max'    → máximo
         sandbox: 'read-only' | 'workspace-write' (default) | 'danger-full-access'.
         timeout_s: Tope de segundos para la corrida completa (default 1800 = 30 min).
-        allow_over_quota: si DELEGATE_CODEX_QUOTA_REFUSE_PCT está definida y la cuota la supera, se
-            rechaza; true lo fuerza. Por encima de 85% solo agrega `warning`.
+        allow_over_quota: Omite la reducción de esfuerzo y el posible rechazo por cuota.
+        preset: Usa 'none' para omitir la instrucción sobre sockets.
+        context_file: Archivo de texto relativo al workdir.
+        why: Motivo de hasta 300 caracteres, obligatorio para cualquier esfuerzo distinto de 'low'.
     """
-    err, norm = await _validate_codex_request(task, workdir, model, effort, sandbox)
+    err, norm = await _validate_codex_request(task, workdir, model, effort, sandbox, why=why)
     if err:
         return err
     model, effort, workdir_abs = norm
-    qerr, warning = _codex_quota_gate(allow_over_quota)
+    try:
+        prompt = _codex_prompt(task, workdir_abs, preset, context_file)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+    qerr, warning, downgrade = _codex_quota_gate(allow_over_quota)
     if qerr:
         return qerr
+    if downgrade and effort != "low":
+        warning = _codex_downgrade_warning(warning, f"delegate_to_codex ({task.strip()[:80]})", effort)
+        effort = "low"
     # Same cross-process limits as submit_codex: global slots + one job per checkout.
     try:
         locks = await _codex_wait_locks(workdir_abs)
@@ -3301,7 +3320,7 @@ async def delegate_to_codex(
     try:
         await _codex_stagger()
         res = await _run_codex_job(
-            task, model, effort, workdir_abs, sandbox, timeout_s,
+            prompt, model, effort, workdir_abs, sandbox, timeout_s,
             pass_fds=tuple(h.fileno() for h in locks),
         )
     except CodexLockError as e:
@@ -3344,8 +3363,65 @@ def _codex_denied_dirs(home: str) -> set:
     return out
 
 
+_CODEX_CARD = "Your sandbox cannot open sockets: do not stop for that and do not return partial work."
+_CODEX_TAG = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+_CODEX_CONTEXT_BYTES = 64 * 1024
+
+
+def _codex_context_text(workdir: str, relative: str) -> str:
+    if not isinstance(relative, str) or not relative or os.path.isabs(relative):
+        raise ValueError("context_file debe ser una ruta relativa al workdir")
+    parts = pathlib.Path(relative).parts
+    if not parts or parts[-1] == "..":
+        raise ValueError("context_file debe ser un archivo regular")
+    # Walk from the resolved workdir without following symlinks, even during concurrent edits.
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        with ExitStack() as stack:
+            root = os.open(os.path.realpath(workdir), directory_flags)
+            stack.callback(os.close, root)
+            parents = [root]
+            for part in parts[:-1]:
+                if part == "..":
+                    if len(parents) == 1:
+                        raise ValueError("context_file escapa del workdir")
+                    parents.pop()
+                else:
+                    child = os.open(part, directory_flags, dir_fd=parents[-1])
+                    stack.callback(os.close, child)
+                    parents.append(child)
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parents[-1])
+            with os.fdopen(fd, "rb") as file:
+                info = os.fstat(file.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("context_file debe ser un archivo regular")
+                if info.st_nlink > 1:
+                    raise ValueError("context_file no puede ser un hardlink")
+                if info.st_size > _CODEX_CONTEXT_BYTES:
+                    raise ValueError("context_file supera 64 KiB")
+                data = file.read(_CODEX_CONTEXT_BYTES + 1)
+                if len(data) > _CODEX_CONTEXT_BYTES:
+                    raise ValueError("context_file supera 64 KiB")
+    except (OSError, UnicodeError):
+        raise ValueError("context_file debe ser legible y no contener enlaces simbólicos") from None
+    try:
+        return data.decode("utf-8")
+    except UnicodeError:
+        raise ValueError("context_file debe contener texto UTF-8") from None
+
+
+def _codex_prompt(task: str, workdir: str, preset: str | None, context_file: str | None) -> str:
+    add_card = preset != "none" and not re.search(r"\bsockets\b", task, re.IGNORECASE)
+    if context_file is not None:
+        context = _codex_context_text(workdir, context_file)
+        task += f"\n\nContext file {context_file}:\n{context}"
+    if add_card:
+        task += f"\n\n{_CODEX_CARD}"
+    return task
+
+
 async def _validate_codex_request(
-    task: str, workdir: str, model: str, effort: str, sandbox: str,
+    task: str, workdir: str, model: str, effort: str, sandbox: str, *, why: str | None = None,
 ) -> tuple[dict | None, tuple[str, str, str]]:
     """Shared validation for delegate_to_codex and submit_codex.
     Returns (error_dict | None, (resolved_model, normalized_effort, workdir_abs))."""
@@ -3394,6 +3470,12 @@ async def _validate_codex_request(
     ver_err = await _codex_version_error(model)
     if ver_err:
         return {"success": False, "error": ver_err}, norm
+    if ((why is not None or effort != "low")
+            and (not isinstance(why, str) or not why.strip() or len(why) > 300)):
+        return {
+            "success": False,
+            "error": "effort medium y cualquier effort distinto de low requieren 'why' (1..300 caracteres)",
+        }, norm
     return None, norm
 
 
@@ -3690,15 +3772,19 @@ CODEX_MAX_CONCURRENT = int(os.getenv("DELEGATE_CODEX_MAX_CONCURRENT", "8"))
 CODEX_MAX_QUEUE = int(os.getenv("DELEGATE_CODEX_MAX_QUEUE", "32"))  # waiting (not running) jobs
 CODEX_MAX_TIMEOUT_S = 7200
 CODEX_JOBS_KEEP = 200  # finished jobs kept in memory / on disk
-CODEX_POLL_WORDS = 300
-CODEX_POLL_CHARS = 4000
+CODEX_POLL_WORDS = 120
+CODEX_POLL_CHARS = 900
+_CODEX_POLL_FULL_WORDS = 300
+_CODEX_POLL_FULL_CHARS = 4000
+_CODEX_FULL_ERROR_STATUSES = frozenset({"failed", "timeout", "lost", "auth_failed"})
 CODEX_WATCHDOG_GRACE_S = 15.0
 CODEX_LOCK_WAIT_S = float(os.getenv("DELEGATE_CODEX_LOCK_WAIT_S", "600"))  # delegate_to_codex only
 # Private state dir (0700): per-server job files, slot locks, workdir locks.
 # Optional explicit override; otherwise resolve the environment on each call.
 CODEX_STATE_DIR: str | None = None
 CODEX_SESSIONS_DIR = enforce_isolation(os.getenv("DELEGATE_CODEX_SESSIONS_DIR") or os.path.expanduser("~/.codex/sessions"))
-CODEX_QUOTA_WARN = float(os.getenv("DELEGATE_CODEX_QUOTA_WARN", "85"))
+CODEX_QUOTA_WARN = float(os.getenv("DELEGATE_CODEX_QUOTA_WARN", "65"))
+CODEX_QUOTA_DOWNGRADE = float(os.getenv("DELEGATE_CODEX_QUOTA_DOWNGRADE_PCT", "70"))
 CODEX_MAX_PER_PROJECT = int(os.getenv("DELEGATE_CODEX_MAX_PER_PROJECT", "6"))  # project = git common dir
 CODEX_STAGGER_S = float(os.getenv("DELEGATE_CODEX_STAGGER_S", "2.5"))  # min gap between launches, account-wide
 CODEX_MAX_RETRIES = 3  # per job, throttle only
@@ -3715,7 +3801,7 @@ CODEX_JOBS_FILE = ""  # legacy (shared file, pre-hardening); no longer written o
 _CODEX_TERMINAL = frozenset({"done", "failed", "cancelled", "timeout", "lost", "killed_on_restart",
                              "auth_failed"})
 _CODEX_SECRET_FREE_FIELDS = (
-    "id", "status", "model", "effort", "workdir", "sandbox", "timeout_s", "task_preview",
+    "id", "status", "model", "effort", "why", "tag", "workdir", "sandbox", "timeout_s", "task_preview",
     "submitted_at", "started_at", "finished_at", "pid", "error", "final_response",
     "out_file", "pstart", "project", "root", "queue_reason", "retry_count", "retry_at",
     "not_before", "last_activity", "exit_code", "session_id", "failure_kind",
@@ -3754,15 +3840,39 @@ def _codex_state_file() -> str:
     return str(_codex_state_dir() / f"jobs.{_codex_sid}.json")
 
 
-def _truncate_words(text: str | None, limit: int = CODEX_POLL_WORDS) -> str | None:
+def _truncate_words(text: str | None, limit: int = CODEX_POLL_WORDS,
+                    char_limit: int = CODEX_POLL_CHARS) -> str | None:
     if not text:
         return text
     words = text.split()
     if len(words) > limit:
         text = " ".join(words[:limit]) + f" … [truncated, {len(words)} words total]"
-    if len(text) > CODEX_POLL_CHARS:
-        text = text[:CODEX_POLL_CHARS] + f" … [truncated, {len(text)} chars total]"
+    if len(text) > char_limit:
+        text = text[:char_limit] + f" … [truncated, {len(text)} chars total]"
     return text
+
+
+def _codex_failure_text(text: str | None) -> str | None:
+    suffix = " [trunc]"
+    if text and len(text) > _CODEX_POLL_FULL_CHARS:
+        return text[:_CODEX_POLL_FULL_CHARS - len(suffix)] + suffix
+    return text
+
+
+def _codex_error(j: dict) -> str | None:
+    error = j.get("error")
+    return _codex_failure_text(error) if j["status"] in _CODEX_FULL_ERROR_STATUSES else error
+
+
+def _codex_response(j: dict, full: bool = False) -> str | None:
+    text = j.get("final_response")
+    if j["status"] in _CODEX_FULL_ERROR_STATUSES:
+        return _codex_failure_text(text)
+    if full:
+        if j.get("_loaded_snapshot"):
+            return text  # snapshots already use the full poll limits
+        return _truncate_words(text, _CODEX_POLL_FULL_WORDS, _CODEX_POLL_FULL_CHARS)
+    return _truncate_words(text)
 
 
 # ── process inspection (pid-reuse safe: never act on a pid alone) ───────────────────
@@ -3954,7 +4064,7 @@ def _num(v, hi: float | None = None) -> float | None:
 
 
 _CODEX_JOB_STATUSES = frozenset({"queued", "running"}) | _CODEX_TERMINAL
-_CODEX_JOB_STR_FIELDS = ("model", "effort", "workdir", "sandbox", "task_preview", "error", "out_file",
+_CODEX_JOB_STR_FIELDS = ("model", "effort", "why", "tag", "workdir", "sandbox", "task_preview", "error", "out_file",
                          "pstart", "project", "root", "queue_reason", "session_id", "failure_kind")
 _CODEX_JOB_NUM_FIELDS = ("timeout_s", "submitted_at", "started_at", "finished_at", "retry_at",
                          "not_before", "last_activity")
@@ -3983,6 +4093,7 @@ def _codex_sanitize_job(jid, j) -> dict | None:
     fr = j.get("final_response")
     out["final_response"] = fr if isinstance(fr, str) else None
     out.update(sanitize_metadata(j))
+    out["_loaded_snapshot"] = True
     return out
 
 
@@ -4277,19 +4388,25 @@ def _codex_weekly_used_percent() -> float | None:
     return None
 
 
-def _codex_quota_gate(allow_over_quota: bool) -> tuple[dict | None, str | None]:
+def _codex_quota_gate(allow_over_quota: bool) -> tuple[dict | None, str | None, bool]:
     pct = _codex_weekly_used_percent()
     if pct is None:
-        return None, None
+        return None, None, False
     if CODEX_QUOTA_REFUSE is not None and pct > CODEX_QUOTA_REFUSE and not allow_over_quota:
         return {
             "success": False, "quota_used_percent": pct,
             "error": (f"cuota semanal de Codex al {pct:g}% (> {CODEX_QUOTA_REFUSE:g}%): no se lanza nada. "
                       "Pasa allow_over_quota=true para forzarlo."),
-        }, None
+        }, None, False
+    warning = None
     if pct > CODEX_QUOTA_WARN:
-        return None, f"cuota semanal de Codex al {pct:g}% (aviso > {CODEX_QUOTA_WARN:g}%)"
-    return None, None
+        warning = f"cuota semanal de Codex al {pct:g}% (aviso > {CODEX_QUOTA_WARN:g}%)"
+    return None, warning, pct > CODEX_QUOTA_DOWNGRADE and not allow_over_quota
+
+
+def _codex_downgrade_warning(warning: str | None, job: str, effort: str) -> str:
+    detail = f"{job}: effort {effort!r} reducido a 'low' por cuota semanal"
+    return f"{warning}; {detail}" if warning else detail
 
 
 # ── state: one file per server process ────────────────────────────────────────────────
@@ -4302,13 +4419,16 @@ def _codex_save() -> None:
             _codex_jobs.pop(j["id"], None)
             _codex_rt.pop(j["id"], None)
         for j in _codex_jobs.values():
-            j.update(job_metadata(j, _truncate_words))
+            j.update(job_metadata(j, lambda text: _codex_response(j)))
+            if j["status"] in _CODEX_FULL_ERROR_STATUSES:
+                j["error"] = _codex_error(j)
+                j["final_response"] = _codex_response(j, full=True)
         data = {
             "v": 2,
             "server": {"sid": _codex_sid, "pid": os.getpid(), "saved_at": time.time(),
                        "caps": {"global": CODEX_MAX_CONCURRENT, "project": CODEX_MAX_PER_PROJECT}},
             "jobs": {
-                jid: {k: (_truncate_words(j.get(k)) if k == "final_response" else j.get(k))
+                jid: {k: (_codex_response(j, full=True) if k == "final_response" else j.get(k))
                       for k in _CODEX_SECRET_FREE_FIELDS}
                 for jid, j in _codex_jobs.items()
             },
@@ -4650,7 +4770,7 @@ def _codex_owner_alive(base: pathlib.Path, sid: str) -> bool:
     return owner_alive(base, sid)
 
 
-def _codex_remote_views(ids: list) -> dict:
+def _codex_remote_views(ids: list, full: bool = False) -> dict:
     """Jobs of OTHER servers, read-only from their state files (never adopted or modified)."""
     found: dict = {}
     try:
@@ -4684,11 +4804,11 @@ def _codex_remote_views(ids: list) -> dict:
                 continue  # malformed entry: ignored (read-only, never rewritten from here)
             if not alive and j["status"] in ("queued", "running"):
                 j["status"], j["error"] = "lost", "owner server is gone; the job can no longer progress"
-            found[jid] = _codex_job_view(j, owner)
+            found[jid] = _codex_job_view(j, owner, full=full)
     return found
 
 
-def _codex_job_view(j: dict, owner: dict | None = None) -> dict:
+def _codex_job_view(j: dict, owner: dict | None = None, *, full: bool = False) -> dict:
     now = time.time()
     status = j["status"]
     submitted = j.get("submitted_at") or now
@@ -4715,58 +4835,42 @@ def _codex_job_view(j: dict, owner: dict | None = None) -> dict:
         view["retry_count"] = j["retry_count"]
     if j.get("last_activity"):
         view["last_activity_age_s"] = round(max(now - j["last_activity"], 0), 1)
-    for k in ("exit_code", "session_id", "failure_kind"):
+    for k in ("exit_code", "session_id", "failure_kind", "why", "tag"):
         if j.get(k) is not None:
             view[k] = j[k]
     if owner is None:
         owner = {"pid": os.getpid(), "sid": _codex_sid, "alive": True}
     view["owner"] = owner
-    if j.get("error"):
-        view["error"] = j["error"]
-    if status in ("done", "failed", "timeout") and j.get("final_response"):
-        view["final_response"] = _truncate_words(j["final_response"])
-    view.update(job_metadata(j, _truncate_words))
+    if error := _codex_error(j):
+        view["error"] = error
+    response = _codex_response(j, full=full)
+    if status in _CODEX_FULL_ERROR_STATUSES | {"done"} and response:
+        view["final_response"] = response
+    meta = job_metadata(j, lambda text: response)
+    if response == j.get("final_response") and (meta.get("final_response_length") or 0) <= len(response or ""):
+        meta.pop("truncated", None)
+        meta.pop("final_response_length", None)
+    view.update(meta)
     return view
 
 
 @mcp.tool()
 async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dict:
-    """
-    Start the returned `watch` command with Monitor (or Bash run_in_background) right now:
-    it is the only way you get notified when jobs end. Never rely on remembering to poll.
+    """Submit Codex jobs asynchronously. Start the returned watch with Monitor right now.
 
-    Lanza una o varias tareas de Codex SIN esperar y devuelve los ids de inmediato; el
-    orquestador sigue trabajando y consulta con `poll_codex(ids)`. Pensado para lanzar
-    muchas tarjetas en paralelo (ver `delegate_to_codex` para una sola y bloqueante).
-
-    Cada elemento de `tasks`: {task (obligatorio), workdir='.', model='terra',
-    effort='low', sandbox='workspace-write', timeout_s=1800}. Mismas reglas y alias que
-    `delegate_to_codex`. ATÓMICO: se validan TODAS antes de lanzar ninguna; si una falla,
-    no arranca nada y la respuesta trae el error de cada elemento inválido.
-
-    Regla de operación: UN worktree por job (git worktree add). Los jobs del mismo checkout
-    se serializan; los worktrees de un repo comparten el tope por proyecto.
-
-    Límites: máximo DELEGATE_CODEX_MAX_CONCURRENT (default 8) corriendo a la vez EN TOTAL
-    entre todas las sesiones/servidores y DELEGATE_CODEX_MAX_PER_PROJECT (default 6) por
-    proyecto (git common dir), ambos con flock en ~/.codex-jobs; el resto espera en cola
-    FIFO (tope DELEGATE_CODEX_MAX_QUEUE=32, contado contra los slots REALMENTE libres).
-    UN solo job por checkout/worktree a la vez, también entre sesiones. Los lanzamientos se
-    escalonan 2.5 s. Un 429 pone un cooldown de toda la cuenta y reintenta (máx 3);
-    3 throttles en 5 min reducen la admisión a la mitad por 10 min. `refresh_token_reused`/401
-    = `auth_failed`: no se admite nada hasta `codex login`. `timeout_s` cuenta desde que
-    arranca. Los jobs mueren con el server.
-    Cuota semanal: > 85% agrega `warning`; solo rechaza si se define DELEGATE_CODEX_QUOTA_REFUSE_PCT (salvo `allow_over_quota=true`).
-    ⚠️ Mismo aviso de privacidad: modelo cloud, nunca con PHI/PII.
-
-    Returns: {"jobs": [{"index", "id", "status"} | {"index", "error"}], "max_concurrent": N,
-              "account": {...}, "warning"?}
+    Tasks are validated atomically. Each task dict requires `task` and accepts `workdir`,
+    `model` (default gpt-6.2-sol), `effort` (default low), `sandbox`, `timeout_s`,
+    `preset` ('none' skips the sockets instruction), `context_file` (relative UTF-8 file),
+    and `tag`. Any effort other than low requires a written `why` of up to 300 characters.
+    Weekly quota can trigger an effort downgrade to low or a refusal unless allow_over_quota is true.
+    Done is not verification. Check the work independently.
+    Never send PHI/PII. See README for environment variables and limits.
     """
     _codex_ensure_loaded()
     _codex_install_shutdown_hooks()
     if not isinstance(tasks, list) or not tasks:
         return {"success": False, "error": "tasks debe ser una lista no vacía"}
-    qerr, warning = _codex_quota_gate(allow_over_quota)
+    qerr, warning, downgrade = _codex_quota_gate(allow_over_quota)
     if qerr:
         return qerr
     # Phase 1: validate everything. Nothing is started unless every element is valid.
@@ -4786,16 +4890,36 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
             errors.append({"index": i, "error": f"timeout_s inválido (1..{CODEX_MAX_TIMEOUT_S})"})
             continue
         sandbox = t.get("sandbox", "workspace-write")
+        why = t.get("why")
+        tag = t.get("tag")
+        if "tag" in t and (not isinstance(tag, str) or not _CODEX_TAG.fullmatch(tag)):
+            errors.append({"index": i, "error": "tag inválido: usa [a-z0-9][a-z0-9-]{0,39}"})
+            continue
         err, (model, effort, workdir_abs) = await _validate_codex_request(
             task, t.get("workdir", "."), t.get("model", CODEX_DEFAULT_MODEL),
-            t.get("effort", CODEX_DEFAULT_EFFORT), sandbox,
+            t.get("effort", CODEX_DEFAULT_EFFORT), sandbox, why=why,
         )
         if err:
+            err.pop("success", None)
             errors.append({"index": i, **err})
             continue
-        planned.append({"index": i, "task": task, "timeout_s": timeout_s, "sandbox": sandbox,
-                        "model": model, "effort": effort, "workdir_abs": workdir_abs,
+        try:
+            prompt = _codex_prompt(task, workdir_abs, t.get("preset"), t.get("context_file"))
+        except ValueError as e:
+            errors.append({"index": i, "error": str(e)})
+            continue
+        planned.append({"index": i, "task": prompt, "why": why, "tag": tag,
+                        "timeout_s": timeout_s, "sandbox": sandbox, "model": model,
+                        "effort": effort, "workdir_abs": workdir_abs,
                         "ident": _codex_identity(workdir_abs)})
+    # Check each distinct tag after async validation, before publishing any jobs.
+    recent_tags = {tag for tag in {p["tag"] for p in planned} if tag
+                   and delegate_state.tag_recently_used(tag)}
+    for p in planned:
+        tag = p["tag"]
+        if tag in recent_tags:
+            errors.append({"index": p["index"],
+                           "error": f"tag '{tag}' was used in the last 10 minutes; pick a unique tag"})
     # Admission (fail closed): caps/storage must be sound and the account must not be in
     # auth_failure. Then RESERVE real slots for the new jobs; whatever cannot get one waits
     # in the queue, and the queue bound is checked against that real count (a slot taken by
@@ -4834,8 +4958,13 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
     jobs_out: list[dict] = []
     for p, locks in zip(planned, reserved):
         jid = "cx-" + uuid.uuid4().hex[:12]
+        effort = p["effort"]
+        if downgrade and effort != "low":
+            warning = _codex_downgrade_warning(warning, jid, effort)
+            effort = "low"
         _codex_jobs[jid] = {
-            "id": jid, "status": "queued", "model": p["model"], "effort": p["effort"],
+            "id": jid, "status": "queued", "model": p["model"], "effort": effort,
+            "why": p["why"], "tag": p["tag"],
             "workdir": os.path.realpath(p["workdir_abs"]), "sandbox": p["sandbox"],
             "timeout_s": p["timeout_s"], "task_preview": p["task"].strip()[:80],
             "submitted_at": time.time(), "started_at": None, "finished_at": None,
@@ -4850,45 +4979,42 @@ async def submit_codex(tasks: list[dict], allow_over_quota: bool = False) -> dic
         jobs_out.append({"index": p["index"], "id": jid})
     _codex_pump()
     for entry in jobs_out:
-        entry["status"] = _codex_jobs[entry["id"]]["status"]
+        job = _codex_jobs[entry["id"]]
+        entry["status"] = job["status"]
+        if error := _codex_error(job):
+            entry["error"] = error
+    ids = [e["id"] for e in jobs_out]
+    tag = planned[0]["tag"]
+    watch = watch_fields(ids, tag=tag) if tag and all(p["tag"] == tag for p in planned) else watch_fields(ids)
     out = {"jobs": jobs_out, "max_concurrent": CODEX_MAX_CONCURRENT, "account": _codex_account_view(),
-           **watch_fields(e["id"] for e in jobs_out)}
+           **watch}
     if warning:
         out["warning"] = warning
     return out
 
 
 @mcp.tool()
-async def poll_codex(ids: list[str]) -> dict:
-    """
-    Estado de jobs lanzados con `submit_codex`, también los de OTROS servidores vivos (se leen
-    de sus archivos de estado, solo lectura). Por job: status
-    (queued | running | done | failed | cancelled | timeout | auth_failed | lost | unknown),
-    elapsed_s y, si terminó, `final_response` recortada a ~300 palabras. Extras cuando aplican:
-    `queue_reason` + `queued_s` (por qué espera y desde cuándo: global_cap, adaptive_cap,
-    workspace_busy, waiting_for_slot, throttle_cooldown, auth_failed), `retry_count` /
-    `retry_in_s`, `last_activity_age_s`, `exit_code`, `session_id`, `failure_kind`
-    (auth | quota | throttle | infra | other) y `owner` {pid, sid, alive}. `account` resume
-    el estado compartido (ok | cooldown | auth_failed) y los topes efectivos.
-    `lost` = el server dueño murió con el job en cola/corriendo: el resultado se desconoce
-    (revisa el workdir/git a mano). `auth_failed` = corre `codex login`.
-    `done` solo significa que la CLI de Codex salió con código 0; NO es verificación: verifica
-    el trabajo tú.
+async def poll_codex(ids: list[str], full: bool = False) -> dict:
+    """Report Codex job status, including jobs owned by other servers.
 
-    Args:
-        ids: ids devueltos por submit_codex.
+    Pass full=True for the previous response limits. Failure text is capped at 4000 characters.
+    Done is not verification. Check the work independently. Never send PHI/PII.
+    See README for environment variables and limits.
     """
     _codex_ensure_loaded()
     if not isinstance(ids, list):
         return {"success": False, "error": "ids debe ser una lista"}
-    remote = _codex_remote_views([i for i in ids if isinstance(i, str) and i not in _codex_jobs])
+    remote = _codex_remote_views(
+        [i for i in ids if isinstance(i, str) and i not in _codex_jobs], full=full,
+    )
     out = []
     for jid in ids:
         j = _codex_jobs.get(jid) if isinstance(jid, str) else None
         if j:
-            out.append(_codex_job_view(j))
+            out.append(_codex_job_view(j, full=full))
         else:
-            out.append(remote.get(jid) or {"id": jid, "status": "unknown"})
+            out.append((remote.get(jid) if isinstance(jid, str) else None)
+                       or {"id": jid, "status": "unknown"})
     return {"jobs": out, "account": _codex_account_view()}
 
 

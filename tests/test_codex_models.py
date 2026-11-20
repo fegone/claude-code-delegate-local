@@ -14,7 +14,7 @@ def test_short_aliases_resolve_to_current_catalog():
     assert r("astra") == "gpt-6.2-astra"
     assert r("luna") == "gpt-6-luna"
     assert r("6-luna") == "gpt-6-luna"
-    assert r("terra") == "gpt-6.1-terra"  # terra returns 2026-10-26 as the default
+    assert r("terra") == "gpt-6.1-terra"
     assert r("6.1-terra") == "gpt-6.1-terra"
     assert r("5.6-terra") == "gpt-5.6-terra"
     assert r("5.6-sol") == "gpt-5.6-sol"
@@ -27,12 +27,12 @@ def test_every_alias_target_is_allowed_and_hidden_ids_are_not():
         assert hidden not in server.CODEX_PLAN_MODELS
 
 
-def test_default_model_is_terra_low():
-    assert server.CODEX_DEFAULT_MODEL in ("gpt-6.1-terra", server.os.environ.get("DELEGATE_CODEX_MODEL"))
-    assert server.CODEX_DEFAULT_EFFORT in ("low", server.os.environ.get("DELEGATE_CODEX_EFFORT"))
+def test_default_model_is_sol_low():
+    assert server.CODEX_DEFAULT_MODEL == server.os.getenv("DELEGATE_CODEX_MODEL", "gpt-6.2-sol")
+    assert server.CODEX_DEFAULT_EFFORT == os.getenv("DELEGATE_CODEX_EFFORT", "low")
 
 
-def test_terra_is_allowed_by_plan_and_default_passes_model_validation(monkeypatch):
+def test_terra_is_allowed_by_plan_and_passes_model_validation(monkeypatch):
     assert "gpt-6.1-terra" in server.CODEX_PLAN_MODELS
     assert server._resolve_codex_model("terra") == "gpt-6.1-terra"
 
