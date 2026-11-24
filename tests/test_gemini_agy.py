@@ -227,7 +227,7 @@ async def test_submit_neon_defaults_to_medium(wd, monkeypatch):
 def test_invalid_family_rejected(wd, bad):
     err, _ = gemini_jobs.validate("t", wd, "medium", 30, family=bad)
     assert err and "family inválido" in err["error"]
-    assert "Solo se admiten 'gemini', 'sonnet', 'argon', 'hydrogen' y 'neon'" in err["error"]
+    assert "Solo se admiten 'gemini', 'sonnet', 'argon', 'hydrogen', 'neon' y 'carbon'" in err["error"]
 
 
 def test_opus_and_gpt_oss_rejected(wd):
@@ -1078,3 +1078,24 @@ async def test_submit_tag_reuse_across_calls(wd, monkeypatch, age):
             'error': "tag 'batch' was used in the last 10 minutes; pick a unique tag",
         }]
         assert set(jobs.jobs) == ids
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+@pytest.mark.parametrize("family", ["carbon", "Carbon"])
+def test_carbon_maps_to_model(wd, effort, family):
+    assert gemini_jobs.model_for(effort, "carbon") == f"gemini-4-carbon-{effort}"
+    err, norm = gemini_jobs.validate("t", wd, effort, 30, family=family)
+    assert err is None
+    assert norm["family"] == "carbon"
+    assert norm["model"] == f"gemini-4-carbon-{effort}"
+
+
+def test_carbon_bad_effort_rejected(wd):
+    err, _ = gemini_jobs.validate("t", wd, "xhigh", 30, family="carbon")
+    assert err and "effort inválido" in err["error"] and "gemini-4-carbon-*" in err["error"]
+
+
+def test_only_carbon_models_exposed():
+    assert set(gemini_jobs.FAMILY_MODELS["carbon"]) == {
+        f"gemini-4-carbon-{effort}" for effort in ("low", "medium", "high")
+    }

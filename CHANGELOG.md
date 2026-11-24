@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (2026-11-24)
+- **Gemini (agy) `family="carbon"`.** `delegate_to_gemini` and `submit_gemini` accept carbon with `gemini-4-carbon-{low|medium|high}` (Felix asked for the new Antigravity model; `agy models` lists exactly those three).
+
 ### Changed (2026-11-20, token audit by Fable 5.2 and Neon)
 - **Codex defaults to `gpt-6.2-sol` low.** Any effort above low needs a `why` (1-300 chars), checked after every workdir guard. Above `DELEGATE_CODEX_QUOTA_DOWNGRADE_PCT` (default 70) medium and higher run as low unless `allow_over_quota`; the quota warning starts at 65 %.
 - **Shorter results.** `poll_codex` 120 words / 900 chars (`full=True` for 300 / 4000); failed jobs keep their error up to 4000 chars; `delegate_batch` items capped at 900 (`full=True`). `submit_*` no longer return `watch_hint`.

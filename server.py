@@ -5070,13 +5070,14 @@ async def delegate_to_gemini(
     para varios en paralelo usa submit_gemini / poll_gemini / cancel_gemini.
 
     family -> familia de modelos: "gemini" (default, gemini-3.8-flash-*), "sonnet" (claude-sonnet-5-5-*),
-    "argon" (gemini-4-argon-*), "hydrogen" (gemini-4-hydrogen-*) o "neon" (gemini-4-neon-*).
+    "argon" (gemini-4-argon-*), "hydrogen" (gemini-4-hydrogen-*), "neon" (gemini-4-neon-*) o "carbon" (gemini-4-carbon-*).
     effort -> modelo:
       - Con family="gemini": gemini-3.8-flash-{low,medium,high} (default medium).
       - Con family="sonnet": claude-sonnet-5-5-{low,medium,high}.
       - Con family="argon": gemini-4-argon-{low,medium,high}.
       - Con family="hydrogen": gemini-4-hydrogen-{low,medium,high}.
       - Con family="neon": gemini-4-neon-{low,medium,high}.
+      - Con family="carbon": gemini-4-carbon-{low,medium,high}.
     Cualquier otro valor de family o effort se rechaza (no se exponen claude-opus-* ni gpt-oss-*).
 
     🔁 CUOTA (Felix 2026-10-15): si agy se queda sin cuota (tope de 5 h, semanal, 429, capacidad), el
@@ -5103,7 +5104,7 @@ async def delegate_to_gemini(
         workdir: directorio de trabajo ('/' y $HOME se rechazan).
         effort: low | medium | high.
         timeout_s: tope de pared (default 900, máx 7200); se mata todo el grupo de procesos.
-        family: "gemini" (default) | "sonnet" | "argon" | "hydrogen" | "neon".
+        family: "gemini" (default) | "sonnet" | "argon" | "hydrogen" | "neon" | "carbon".
 
     Returns: {success, status, response, conversation_id, usage, duration_s, exit_code, model,
               effort, elapsed_s} o {success: False, error}.
@@ -5120,7 +5121,7 @@ async def submit_gemini(tasks: list[dict]) -> dict:
     Lanza una o varias tareas de Gemini (agy) SIN esperar; devuelve ids de inmediato y se
     consultan con `poll_gemini(ids)`. Cada elemento: {task, workdir='.', effort='medium',
     timeout_s=900, family='gemini'}. family admite "gemini" (default, gemini-3.8-flash-*),
-    "sonnet" (claude-sonnet-5-5-*), "argon" (gemini-4-argon-*), "hydrogen" (gemini-4-hydrogen-*) o "neon" (gemini-4-neon-*).
+    "sonnet" (claude-sonnet-5-5-*), "argon" (gemini-4-argon-*), "hydrogen" (gemini-4-hydrogen-*), "neon" (gemini-4-neon-*) o "carbon" (gemini-4-carbon-*).
     Mismas reglas que `delegate_to_gemini`. ATÓMICO: se validan todas antes de lanzar ninguna. Tope DELEGATE_GEMINI_MAX_CONCURRENT (default 4) corriendo y
     DELEGATE_GEMINI_MAX_QUEUE (32) en cola; un job por workdir a la vez. Los jobs mueren con el
     server. Misma puerta (DELEGATE_GEMINI_ALLOW_DANGER=1) y sandbox que delegate_to_gemini.
